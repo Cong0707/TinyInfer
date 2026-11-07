@@ -633,7 +633,9 @@ class Engine:
 
             self.tp = Shard(_dist.get_rank(), self.tp_ranks)
             print(f"[tinyinfer] tensor parallel rank {self.tp.rank}/{self.tp.world}", flush=True)
-        self.embed_on_cpu = bool(getattr(self.hw_plan, "embed_on_cpu", False)) or device == "cpu"
+        # CUDA graph 捕获期禁止 D2H，而 embed_on_cpu 那条路每 token 都要
+        # ids.cpu()。embed 表只有 1.3GB，显存剩 4GB，直接放 GPU。
+        self.embed_on_cpu = False
         if __import__("os").environ.get("TI_EMBED_GPU") == "1":
             self.embed_on_cpu = False
         # embed / head / norm are 100MB-1.3GB allocations: route them through the
