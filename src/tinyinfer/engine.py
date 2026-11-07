@@ -2554,9 +2554,16 @@ class Engine:
             try:
                 if start_pos >= 0 and chunk is None:
                     hit = self._graph_run(ids, start_pos)
-                    if hit is not None:
-                        return hit
-                    self._graph_try_capture(ids, start_pos)
+                    if hit is None:
+                        self._graph_try_capture(ids, start_pos)
+                        hit = self._graph_run(ids, start_pos)
+                    if hit is None:
+                        g = getattr(self, "_graph", None)
+                        raise RuntimeError(
+                            f"decode without graph: start_pos={start_pos} "
+                            f"graph_pos={getattr(self, '_graph_start_pos', None)} "
+                            f"has_graph={g is not None}")
+                    return hit
                 return self._forward_impl(ids, start_pos, chunk, positions=positions)
             except Exception as exc:
                 # torch raises OutOfMemoryError, while some CUDA paths surface a plain
