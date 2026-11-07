@@ -423,6 +423,9 @@ class MoE:
                     sl.table_sync()
                     tab = sl._slot_tab
                     sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
+                if __import__("os").environ.get("TI_GPUDBG") == "1":
+                    print(f"[miss] L{self.layer_id} miss={_miss} by_key={len(sl._by_key)} "
+                          f"has={[sl.has(self.layer_id, e) for e in _miss]}", flush=True)
                 if bool((sids < 0).any().item()):
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
