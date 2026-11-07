@@ -2679,15 +2679,13 @@ class VramSlotCache:
         """把一个（未 pin 的）专家从槽位里踢掉，把槽位还回池子。
 
         release() 只减引用、把 state 打回 STAGED，槽位仍然占着 —— prefill 的
-        6 个 token 会用到 1440 个不同的 (layer, expert)，而池子只有 1359 个，
-        必须真的回收。pinned 的不动。
+        6 个 token 会用到 1440 个不同的 (layer, expert)，池子只有 1359 个，
+        必须真的回收。pinned 的不动。refs 不检查：调用点已经确认算完了。
         """
         key = (layer, expert)
         with self._lock:
             idx = self._by_key.get(key)
             if idx is None or key in self._pinned:
-                return False
-            if self._refs[idx] > 0:
                 return False
             self._evict_locked(idx)
             return True
