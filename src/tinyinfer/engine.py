@@ -2507,7 +2507,7 @@ class Engine:
         """
         for attempt in range(3):
             try:
-                if start_pos > 0 and chunk is None:
+                if start_pos >= 0 and chunk is None:
                     hit = self._graph_run(ids, start_pos)
                     if hit is not None:
                         return hit
