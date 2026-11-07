@@ -472,6 +472,17 @@ class TinyModel:
             if block.engram is not None and hashes is not None:
                 h = block.engram.forward(h, hashes[block.engram.hash_index])
             h, pre_mix = block.forward(h, start_pos, pre_mix)
+            # prefill 多行时每层会用 rows*topk 个槽位，40 层叠起来超过 1359；
+            # 算完这层就把它占的槽位放掉（decode 是单行，不会触发）。
+            if h.size(1) > 1:
+                _store = getattr(block.ffn, "_expert_store", None)
+                if _store is not None and getattr(_store, "slots", None) is not None:
+                    _sl = _store.slots
+                    for _e in getattr(block.ffn, "_last_ids", []):
+                        try:
+                            _sl.release(block.ffn.layer_id, int(_e))
+                        except Exception:
+                            pass
         from .hc import hc_split_sinkhorn  # noqa: F401  (kept importable for users)
         h = (pre_mix.unsqueeze(-1) * h.float()).sum(dim=2).to(h.dtype)
         h = rms_norm(h, self.out_norm, self.cfg.rms_norm_eps)
