@@ -361,7 +361,11 @@ class MLACompressedAttention:
         freqs = self.freqs_cis[start_pos:start_pos + s]
 
         def _lin(w, x_):
-            return w.forward(x_) if hasattr(w, "forward") else F.linear(x_, w)
+    if hasattr(w, "forward"):
+        return w.forward(x_)
+    if __import__("os").environ.get("TI_LINDBG") == "1":
+        print(f"[lin] F.linear {tuple(w.shape)} {w.dtype}", flush=True)
+    return F.linear(x_, w)
 
         # wq_a 和 wkv 吃的是同一个 h，量化一次给两个用。原来每个 fp8_linear 内部
         # 各跑一遍 act_quant（每层七次，每次一个 launch 加一趟全局往返），换来的
