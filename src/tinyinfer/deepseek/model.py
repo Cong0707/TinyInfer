@@ -474,7 +474,7 @@ class TinyModel:
             h, pre_mix = block.forward(h, start_pos, pre_mix)
             # prefill 多行时每层会用 rows*topk 个槽位，40 层叠起来超过 1359；
             # 算完这层就把它占的槽位放掉（decode 是单行，不会触发）。
-            if h.size(1) > 1:
+            if not getattr(block.ffn, "_all_pinned", False):
                 _store = getattr(block.ffn, "_expert_store", None)
                 if _store is not None and getattr(_store, "slots", None) is not None:
                     _sl = _store.slots
