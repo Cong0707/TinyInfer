@@ -130,6 +130,15 @@ def fp8_linear_dual(aq: torch.Tensor, asc: torch.Tensor, w1: torch.Tensor, s1: t
     """
     from .kernels import native
 
+    # 多行（prefill）时 kernel 只认一行激活，逐行调用同一条路（prefill 只发生一次）。
+    if aq.dim() == 2 and aq.size(0) > 1:
+        ys1, ys2 = [], []
+        for _r in range(aq.size(0)):
+            _y1, _y2 = fp8_linear_dual(aq[_r:_r + 1], asc[_r:_r + 1],
+                                       w1, s1, w2, s2)
+            ys1.append(_y1)
+            ys2.append(_y2)
+        return torch.cat(ys1, dim=0), torch.cat(ys2, dim=0)
     n1, k = int(w1.shape[0]), int(w1.shape[1])
     n2 = int(w2.shape[0])
     y1 = torch.empty(n1, device=aq.device, dtype=torch.bfloat16)
