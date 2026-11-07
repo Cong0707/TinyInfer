@@ -1,5 +1,4 @@
 """MoE with fp4 routed experts and one fp8 shared expert, loaded straight from HF shards.
-        self._drain_req()
 
 Reference implementations (consult when fixing this file):
   * DeepInfer  deepinfer/model_executor/models/v4_modules/mlp.py  (DeepseekMoE:
@@ -336,65 +335,6 @@ class MoE:
             self._scratch_buf = buf
         return buf
 
-    def _ensure_req(self):
-        """GPU 侧缺专家请求队列（device）+ 它的 pinned 镜像。"""
-        if getattr(self, "_req_q", None) is not None:
-            return self._req_q
-        from ..kernels import native
-        cap = 8
-        self._req_q = torch.zeros(1 + 2 * cap, dtype=torch.int32,
-                                  device=getattr(self.gate.weight, "device", "cuda"))
-        self._req_host = torch.zeros(1 + 2 * cap, dtype=torch.int32, pin_memory=True)
-        self._req_cap = cap
-        self._req_fn = native.kernel("moe_req", "moe_req_probe")
-        self._req_pending = False
-        return self._req_q
-
-    def _drain_req(self):
-        """在 forward 开头调用：处理上一拍 GPU 报上来的缺专家请求。
-
-        读的是 pinned 镜像，而它的 D2H 是在上一次 forward 里异步发起的 —— 中间隔了
-        几十层 GPU 工作，早已完成，所以这里读它不构成停顿。
-        """
-        if not getattr(self, "_req_pending", False):
-            return
-        self._req_pending = False
-        host = getattr(self, "_req_host", None)
-        if host is None:
-            return
-        cap = int(self._req_cap)
-        n = int(host[0])
-        if n <= 0:
-            return
-        store = getattr(self, "_expert_store", None)
-        if store is None:
-            return
-        for i in range(min(n, cap)):
-            layer = int(host[1 + i])
-            expert = int(host[1 + cap + i])
-            try:
-                store.fetch(layer, [expert])
-            except Exception:
-                pass
-
-    def _ts_offsets(self, layer: int):
-        """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
-        cache = getattr(self, "_ts_off_cache", None)
-        if cache is None:
-            cache = self._ts_off_cache = {}
-        hit = cache.get(layer)
-        if hit is not None:
-            return hit
-        idx = getattr(getattr(self, "_expert_store", None), "index", None)
-        if idx is None:
-            raise RuntimeError("MoE: expert_store.index 不可用")
-        t = idx.expert_blob(layer, 0).tensors
-        hit = cache[layer] = (
-            t["w1.weight"].dest_offset, t["w1.scale"].dest_offset,
-            t["w3.weight"].dest_offset, t["w3.scale"].dest_offset,
-            t["w2.weight"].dest_offset, t["w2.scale"].dest_offset)
-        return hit
-
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
                  max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
                  plan_fn=None):
@@ -568,52 +508,6 @@ class MoE:
         xf = x.view(-1, self.cfg.dim)
         _t1 = _tp.perf_counter() if _prof else 0.0
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
-        # ---- 纯 GPU 路径：整层不碰 CPU ----
-        # 槽位映射在 device 表里（pin_hot_experts 结束后一次性刷好），路由 ids 和权重本来
-        # 就在 GPU 上。这里只从 xf / indices / weights / 槽位表出发，不引用本函数后面
-        # 才定义的任何变量 —— 否则又是「挪一行、崩一处」的连锁。
-        y = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
-        if xf.is_cuda and xf.size(0) == 1:
-            _sl2 = getattr(getattr(self, '_expert_store', None), 'slots', None)
-            _tab2 = getattr(_sl2, '_slot_tab', None) if _sl2 is not None else None
-            _ar2 = getattr(_sl2, '_arena', None) if _sl2 is not None else None
-            if _tab2 is not None and _ar2 and len(_ar2) == 1:
-                from . import moe_gemv as _mg2
-                from .fp4_native import quantize_act as _qa2
-                _aq2, _asc2 = _qa2(xf, xf.size(-1))
-                _sids2 = _tab2[self.layer_id].index_select(0, indices.view(-1))
-                _wv2 = weights[0]
-                _ne2 = int(indices.numel())
-                _nmid2 = int(self.cfg.moe_inter_dim)
-                _bb2 = int(_sl2.blob_bytes)
-                _off = self._ts_offsets(self.layer_id)
-                _scr2 = self._scratch(_ne2 * (_nmid2 + (_nmid2 >> 5)), _ar2[0].device)
-                _fa2 = _MOE_FUSED.get('act')
-                if _fa2 is None:
-                    from ..kernels import native as _nat3
-                    _fa2 = _nat3.BoundLaunch(
-                        _nat3.kernel('moe_fused', 'moe_fused_act'),
-                        ((_nmid2 + 31) // 32, _ne2), (512,), 'TTTTTOOiiiiiiiif')
-                    _MOE_FUSED['act'] = _fa2
-                _fa2(_aq2.reshape(-1), _asc2.reshape(-1), _ar2[0], _sids2, _wv2,
-                     _scr2[:_ne2 * _nmid2], _scr2[_ne2 * _nmid2:],
-                     _ne2, _nmid2, int(self.cfg.dim), _bb2,
-                     _off[0], _off[1], _off[2], _off[3],
-                     float(self.swiglu_limit), stream=None)
-                _fd2 = _MOE_FUSED.get('down')
-                if _fd2 is None:
-                    from ..kernels import native as _nat4
-                    _fd2 = _nat4.BoundLaunch(
-                        _nat4.kernel('moe_fused', 'moe_fused_down'),
-                        ((int(self.cfg.dim) + 15) // 16,), (512,), 'TTTTOiiiiii')
-                    _MOE_FUSED['down'] = _fd2
-                _fd2(_scr2[:_ne2 * _nmid2].view(torch.float8_e4m3fn),
-                     _scr2[_ne2 * _nmid2:], _ar2[0], _sids2, y,
-                     _ne2, int(self.cfg.dim), _nmid2, _bb2,
-                     _off[4], _off[5], stream=None)
-                served.extend([int(v) for v in indices.view(-1).tolist()])
-        return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
-                return
         if _prof:
             self._parts["gate"] += _tp.perf_counter() - _t1
         # 复用一块累加 buffer：每层新建 + 清零一个 [1, dim] fp32 是 20KB 的 memset
@@ -628,24 +522,72 @@ class MoE:
         y = _yb
         _t2 = _tp.perf_counter() if _prof else 0.0
         import os as _os
-        # 路由完全留在 GPU 上：indices/weights 本来就在显存，槽位编号由 device 表
-        # 索引得到（见下面的纯 GPU 分支）。原来这里每层一次
-        # indices.reshape(-1).tolist() —— 一次 D2H，CPU 停下来等 GPU 排空，
-        # 流水线断一次，之后的重叠要重新累积。实测后就是那 37ms 空隙的主要来源。
-        active: list[int] = []
-        # 慢路径（b>1、无槽位表、或纯 GPU 分支没走成）才把路由展开回 CPU。
-        # 正常 decode 在纯 GPU 分支就已经 return，这一行不会执行。
-        if not active:
+        if getattr(self, "_static_decode", False):
+            # 静态 decode：整段不碰 CPU。路由结果留在显存里，用上一层的 active 作为
+            # 专家集合（pin 住热点后每层路由高度稳定），这样这一段就没有任何
+            # D2H 同步，整个 forward 可以被 CUDA graph 捕获。
+            # 一旦捕获成功，40 层的路由判断全部在 GPU 内部完成，CPU 一次都不参与
+            # —— 这是唯一能真正取消 CPU 的路（tolist 那次同步是 3.3ms/层、
+            # 130ms/token，是 decode 一半的时间）。
+            active = list(self._static_active)
+            _route = list(active)
+        else:
+            # One small D2H instead of a bincount over 384 classes: decode routes <= 8
+            # distinct experts, so the kernel plus its 384-element sync (3.3ms per layer,
+            # 130ms per token) buys nothing over fetching the 6 routed ids directly.
             _route = [int(v) for v in indices.reshape(-1).tolist()]
             active = sorted(set(_route))
+            if _prof:
+                self._parts["bincount"] += _tp.perf_counter() - _t2
+        # Expert parallelism: with several tensor-parallel ranks a rank serves only the
+        # experts it owns, and the partial outputs are summed at the end (DeepSeek's
+        # deployment shards experts rather than splitting each expert's matrices).
+        _world = int(getattr(self, "ep_world", 1) or 1)
+        _rank = int(getattr(self, "ep_rank", 0) or 0)
+        if _world > 1:
+            # Ownership comes from the route table when there is one (contiguous blocks
+            # proportional to each card's free VRAM), and falls back to the historic
+            # modulo split only for the legacy distributed path. The distinction
+            # matters: modulo scatters each rank's expert blobs across the whole file,
+            # so every rank's reads are strided where contiguous blocks are sequential.
+            # NOT _route: that name already holds the routed expert ids pulled off the
+            # device at line ~437, and the decode path below enumerates it to build
+            # _groups. Reusing it here shadowed the id list with an ExpertRoute and made
+            # every ep_world>1 decode die at "TypeError: 'NoneType' object is not
+            # iterable" -- which is why expert parallelism has never actually run.
+            _epr = getattr(self, "_ep_route", None)
+            if _epr is not None:
+                active = [i for i in active if _epr.rank_of(i) == _rank]
+            else:
+                active = [i for i in active if (i % _world) == _rank]
+        _rc = self._route_counts
+        for _a in active:
+            _rc[_a] = _rc.get(_a, 0) + 1
+        self._last_ids = list(active)  # already the unique routed set (one host sync total)
         target = xf.device
-        _single_token = xf.size(0) == 1
+        # Decode (one token) reads each expert's packed fp4 tiles directly through the
+        # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
+        # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
+        # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
+        # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
+        # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
         _fp4_env = _os0.environ.get("TI_MOE_FP4")
+        _single_token = xf.size(0) == 1
         use_fp4_kernel = target.type == "cuda" and (
             _fp4_env == "1" or (_single_token and _fp4_env != "0")
         )
+        # _expert_cache 存的是 Expert 对象（fp4 视图 + 少量 torch 包装），不是 bf16 副本，
+        # 所以它的容量不该绑在 _max_bf16 上。quant 模式下 engine 传
+        # max_bf16_experts=0（bf16 副本确实不该留），但这个 0 同时把 Expert 视图缓存
+        # 也关掉了 —— 于是每个专家每次 forward 都重新 _expert_from_rec + tensors_on，
+        # 实测一步 2160 次重建、2.1 秒。视图缓存只要按专家数量给个上限即可。
+        limit = self._max_bf16 if self._max_bf16 > 0 else 4096
+
+        # one activation quantisation for every routed expert of this layer: the
+        # quantiser does not depend on the expert, and per-expert (per-row) quantising
+        # repeated it 6x per token / 48x at prefill
         _aq = _asc = None
-        if use_fp4_kernel:
+        if use_fp4_kernel and active:
             # NOTE: do NOT swap this to fp4_native.quantize_act. Measured: the end-to-end
             # decode output changes ([989,43,...] -> [95991,...]) even though the native
             # act_quant is bit-identical to the reference on every synthetic shape tested.
@@ -677,47 +619,6 @@ class MoE:
                     _tb.print_exc()
                 _aq = _asc = None
 
-
-        _rc = self._route_counts
-        for _a in active:
-            _rc[_a] = _rc.get(_a, 0) + 1
-        self._last_ids = list(active)  # already the unique routed set (one host sync total)
-        # Decode (one token) reads each expert's packed fp4 tiles directly through the
-        # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
-        # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
-        # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
-        # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
-        # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
-
-        _world = int(getattr(self, "ep_world", 1) or 1)
-        _rank = int(getattr(self, "ep_rank", 0) or 0)
-        if _world > 1:
-            # Ownership comes from the route table when there is one (contiguous blocks
-            # proportional to each card's free VRAM), and falls back to the historic
-            # modulo split only for the legacy distributed path. The distinction
-            # matters: modulo scatters each rank's expert blobs across the whole file,
-            # so every rank's reads are strided where contiguous blocks are sequential.
-            # NOT _route: that name already holds the routed expert ids pulled off the
-            # device at line ~437, and the decode path below enumerates it to build
-            # _groups. Reusing it here shadowed the id list with an ExpertRoute and made
-            # every ep_world>1 decode die at "TypeError: 'NoneType' object is not
-            # iterable" -- which is why expert parallelism has never actually run.
-            _epr = getattr(self, "_ep_route", None)
-            if _epr is not None:
-                active = [i for i in active if _epr.rank_of(i) == _rank]
-            else:
-                active = [i for i in active if (i % _world) == _rank]
-
-        # _expert_cache 存的是 Expert 对象（fp4 视图 + 少量 torch 包装），不是 bf16 副本，
-        # 所以它的容量不该绑在 _max_bf16 上。quant 模式下 engine 传
-        # max_bf16_experts=0（bf16 副本确实不该留），但这个 0 同时把 Expert 视图缓存
-        # 也关掉了 —— 于是每个专家每次 forward 都重新 _expert_from_rec + tensors_on，
-        # 实测一步 2160 次重建、2.1 秒。视图缓存只要按专家数量给个上限即可。
-        limit = self._max_bf16 if self._max_bf16 > 0 else 4096
-
-        # one activation quantisation for every routed expert of this layer: the
-        # quantiser does not depend on the expert, and per-expert (per-row) quantising
-        # repeated it 6x per token / 48x at prefill
         # per-expert (token, slot) selection computed once and reused by both passes
         sels: dict[int, tuple] = {}
         _single = xf.size(0) == 1
@@ -779,11 +680,6 @@ class MoE:
         # tier.official_gemv=True forces this path. False (the default) means "decide by
         # shape", which is what every tier did before the field was wired -- reading False
         # as "disable" turned the fused path off for tiers that never asked either way.
-        # 慢路径用的路由展开（b>1、没有槽位表、或 fp4 kernel 不可用时才会走到）。
-        # 纯 GPU 路径在上面已经 return，正常 decode 不会经过这里。
-        _route = [int(v) for v in indices.reshape(-1).tolist()]
-        active = sorted(set(_route))
-
         _force_fused = bool(getattr(self, "_official_gemv", False))
         _fused = False
         # Batched decode (M>1) has to reach the same number as M=1 or two sequences in one
