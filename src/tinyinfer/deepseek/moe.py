@@ -572,6 +572,7 @@ class MoE:
         # 槽位映射在 device 表里（pin_hot_experts 结束后一次性刷好），路由 ids 和权重本来
         # 就在 GPU 上。这里只从 xf / indices / weights / 槽位表出发，不引用本函数后面
         # 才定义的任何变量 —— 否则又是「挪一行、崩一处」的连锁。
+        y = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
         if xf.is_cuda and xf.size(0) == 1:
             _sl2 = getattr(getattr(self, '_expert_store', None), 'slots', None)
             _tab2 = getattr(_sl2, '_slot_tab', None) if _sl2 is not None else None
@@ -611,6 +612,7 @@ class MoE:
                      _ne2, int(self.cfg.dim), _nmid2, _bb2,
                      _off[4], _off[5], stream=None)
                 served.extend([int(v) for v in indices.view(-1).tolist()])
+        return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
                 return
         if _prof:
             self._parts["gate"] += _tp.perf_counter() - _t1
