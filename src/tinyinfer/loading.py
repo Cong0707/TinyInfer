@@ -2528,6 +2528,8 @@ class VramSlotCache:
             if self._torch.cuda.is_current_stream_capturing():
                 return
             _p = self._tab_stage = self._torch.empty(_h.shape, dtype=_h.dtype, pin_memory=True)
+        _p.copy_(_h)
+        tab.copy_(_p.to(tab.device, non_blocking=True))
 
     def _evict_locked(self, idx: int) -> None:
         key = self._key[idx]
