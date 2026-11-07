@@ -863,7 +863,10 @@ class MoE:
             _stale = getattr(self, "_slots_last", None)
             if _stale:
                 _slr = getattr(getattr(self, "_expert_store", None), "slots", None)
-                if _slr is not None:
+                # 只有在池子用掉大半时才回收本层旧槽位。decode 稳态只要 40x6=240
+                # 个，L20 的 1359 装得下 —— 每步都回收就是每步重读，实测把 6.6
+                # tok/s 打成 1.0。池子紧张（小卡 / 长 prefill 累积）时才让位。
+                if _slr is not None and len(_slr._by_key) > int(_slr.slots * 3 // 4):
                     for _se in _stale:
                         if _se in _keep:
                             continue
