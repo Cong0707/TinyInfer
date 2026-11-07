@@ -369,10 +369,13 @@ class MoE:
         self._miss_cnt_dev.zero_()
         self._miss_ln(indices.view(-1), sids, int(n_exp),
                       self._miss_ids_dev, self._miss_cnt_dev, int(self._miss_cap))
-        self._miss_cnt_host.copy_(self._miss_cnt_dev, non_blocking=True)
-        self._miss_ids_host.copy_(self._miss_ids_dev, non_blocking=True)
-        torch.cuda.synchronize()
-        return int(self._miss_cnt_host[0])
+        # 只等这一个计数，不做全设备同步：torch.cuda.synchronize() 连 copy stream
+        # 上在飞的 DMA 一起等，每层一次会把 GPU 饿到 18% 利用率。
+        _cnt = int(self._miss_cnt_dev.item())
+        if _cnt > 0:
+            # 只有真有缺失时才把 id 拉回来（正常 decode 大多数层这一步都不发生）
+            self._miss_ids_host[:_cnt].copy_(self._miss_ids_dev[:_cnt], non_blocking=False)
+        return _cnt
 
     def _ts_offsets(self, layer: int):
         """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
