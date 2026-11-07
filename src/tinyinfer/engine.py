@@ -2449,6 +2449,10 @@ class Engine:
                 _tbl = getattr(_att, "freqs_cis", None)
                 if _tbl is not None:
                     refresh_cos_sin(_tbl, start_pos, int(ids.shape[1]))
+                # 窗口索引用的位置 buffer：图外写值，图内读同一块地址。
+                from . import nn as _nnmod
+                if getattr(_nnmod, "_POS_BUF", None) is not None:
+                    _nnmod._POS_BUF.fill_(int(start_pos))
         except Exception:
             pass
         g["in"].copy_(ids)
