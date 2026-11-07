@@ -364,6 +364,7 @@ class MoE:
                 and torch.cuda.is_current_stream_capturing()):
             print(f"[capt] L{self.layer_id}", flush=True)
         if not xf.is_cuda:
+            raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
         # prefill 多行：按 3 行一批算。整批 6 行要 1440 个 (layer, expert) 槽位，
         # 池子只有 1359；3 行一批是 720，装得下。
         if xf.size(0) > 3:
