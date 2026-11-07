@@ -1,4 +1,4 @@
-// kv_norm_rope_quant —— MLA 每 token 的 KV 侧准备：把 kv_norm / apply_rope /
+﻿// kv_norm_rope_quant —— MLA 每 token 的 KV 侧准备：把 kv_norm / apply_rope /
 // act_quant(inplace) 三步加一次 cache 写入压成一个 kernel（wkv 的 GEMV 仍在外面）。
 //
 // 原来每层每 token 跑四步，本文件复现其中三步的算术：
@@ -32,6 +32,9 @@
 //                   （运行时配置，不能写死：deepseek 的 config 默认 1e-20，别的模型 1e-6）
 //
 // 启动：grid = (1, 1, 1)，block = (128, 1, 1)。线程映射写死 128，传错直接不做。
+//
+// 编码：本文件保存为 UTF-8 with BOM。中文 Windows 的 MSVC 把无 BOM 的 UTF-8 按 cp936
+// 解，中文注释/字符串会吃字节，实测直接 57 个语法错误；带 BOM 后 nvcc -arch=sm_89 干净编过。
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>

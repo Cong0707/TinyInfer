@@ -18,6 +18,10 @@ from ..rope_cache import get_table, table_key
 from ..weights import ShardStore
 
 
+# kv_norm_rope_quant 的 launcher 缓存（几何固定：grid=1, block=128）
+_KV_PREP: dict = {}
+
+
 class MLACompressedAttention:
     """MLA with compressed KV. Row-parallel split support mirrors MLAWindowAttention."""
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False,
