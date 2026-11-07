@@ -380,10 +380,10 @@ class MoE:
             scr = self._scratch(n_exp * (nmid + (nmid >> 5)), arena[0].device)
             y = getattr(self, "_gpu_y_buf", None)
             if y is None or y.shape != xf.shape or y.device != xf.device:
-y = torch.empty(xf.shape, dtype=torch.float32, device=xf.device)
+                y = torch.empty(xf.shape, dtype=torch.float32, device=xf.device)
                 self._gpu_y_buf = y
             else:
-y = y  # accumulate=0，kernel 自己覆盖写，不需要清零
+                pass
 
             fa = _MOE_FUSED.get("act")
             if fa is None:
