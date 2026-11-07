@@ -114,6 +114,8 @@ extern "C" __global__ void hc_post_bf(const __nv_bfloat16* __restrict__ x,      
 #include <cuda_bf16.h>
 
 #define HC_BLOCK 256
+// hc_mult 固定为 4（与 hc_split.cu 的 HC 一致），kernel 里用编译期常量展开。
+#define HC 4
 
 extern "C" __global__ void hc_mixes_bf(const __nv_bfloat16* __restrict__ x,  // [M, K]
                                        const float* __restrict__ fn,        // [J, K]
