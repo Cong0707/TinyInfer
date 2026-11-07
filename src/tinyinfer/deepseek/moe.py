@@ -361,6 +361,7 @@ class MoE:
         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
         """
         if not (xf.is_cuda and xf.size(0) == 1):
+            self._gpu_fail = "line 364"
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
@@ -371,10 +372,12 @@ class MoE:
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
         if not arena or len(arena) != 1:
+            self._gpu_fail = "line 375"
             return None
         if tab is None:
             # 表是懒建的。warmup 阶段还没有路由统计，先建全 -1，miss 分支会填。
             tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
+            self._gpu_fail = "line 380"
             return None
         try:
             from .fp4_native import quantize_act
@@ -613,4 +616,5 @@ class MoE:
         # eager / serve 路径已整段删除：MoE 只有纯 GPU 这一条路。
         raise RuntimeError(
             f"MoE layer {self.layer_id}: pure-GPU path unavailable "
+            f"[{getattr(self, '_gpu_fail', '?')}] "
             f"(cuda={xf.is_cuda} rows={xf.size(0)})")
