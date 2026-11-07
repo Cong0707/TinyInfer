@@ -2511,7 +2511,15 @@ class VramSlotCache:
             for (layer, expert), idx in self._by_key.items():
                 if layer < host.shape[0] and expert < host.shape[1]:
                     host[layer, expert] = idx
-        tab.copy_(self._torch.from_numpy(host).to(tab.device))
+        # host 是 pageable 的 numpy，.to(device) 走默认 stream 的 H2D，而读这张表
+        # 的 kernel 在 compute stream 上 —— 两者之间没有同步，表可能还没落地就被读了。
+        # 复制到 pinned 再用当前 stream 拷贝，保证顺序。
+        _h = self._torch.from_numpy(host)
+        _p = getattr(self, "_tab_stage", None)
+        if _p is None or _p.shape != _h.shape:
+            _p = self._tab_stage = self._torch.empty(_h.shape, dtype=_h.dtype, pin_memory=True)
+        _p.copy_(_h)
+        tab.copy_(_p.to(tab.device, non_blocking=True))
 
     def _evict_locked(self, idx: int) -> None:
         key = self._key[idx]
