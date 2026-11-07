@@ -612,7 +612,19 @@ class MLACompressedAttention:
             # kernel 又要求两段拼成一段连续的下标空间 —— 只能靠这一次拷贝。
             # 换成「预分配 + 两次 slice 写入」反而变成两个 launch（窗口一次、压缩一次），
             # 数值一样但 launch 更多，所以不做。
-            kv_all = torch.cat([kv_w, compress_kv], dim=1)
+            # 预分配一块 buffer，两段 slice 写进去。cat 在 graph 捕获期会新建 tensor，
+            # 而这块是常驻的，捕获期只有两次写（合法）。代价是多一个 launch。
+            _kb = getattr(self, "_kv_all_buf", None)
+            _w_n = kv_w.size(1)
+            _c_n = compress_kv.size(1)
+            if (_kb is None or _kb.shape[0] != kv_w.size(0)
+                    or _kb.shape[1] != _w_n + _c_n):
+                _kb = torch.empty(kv_w.size(0), _w_n + _c_n, kv_w.size(2),
+                                  dtype=kv_w.dtype, device=kv_w.device)
+                self._kv_all_buf = _kb
+            _kb[:, :_w_n].copy_(kv_w)
+            _kb[:, _w_n:].copy_(compress_kv)
+            kv_all = _kb
             # 下标拼接（含早期 token 的 -1 右补）按「同一份输入」跨层复用，见 _idxs_all。
             # 同一 decode step 里窗口模板是同一块存储的视图、top-k 在 30 个非
             # index_source 层之间还是同一个 rt.topk_idxs 对象 —— 原来这 38 层各自
