@@ -110,10 +110,6 @@ def window_idxs_ring(start_pos: int, seqlen: int, old_len: int, window: int, dev
 
 
     base = start_pos if torch.is_tensor(start_pos) else torch.tensor(start_pos, device=device)
-        else:
-            if not torch.cuda.is_current_stream_capturing():
-                _POS_BUF.fill_(int(start_pos))
-            base = _POS_BUF
     gpos = (base + torch.arange(seqlen, device=device))[:, None] - back[None, :]
     idx = gpos % window
     valid = gpos >= 0
