@@ -408,7 +408,6 @@ class MoE:
             if __import__("os").environ.get("TI_GPUDBG") == "1":
                 print(f"[idx] L{self.layer_id} max={int(indices.max())} "
                       f"shape={tuple(indices.shape)}", flush=True)
-            sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
             self._last_ids = [int(v) for v in indices.view(-1).tolist()]
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             if (not getattr(self, "_all_pinned", False)
@@ -443,6 +442,7 @@ class MoE:
                     sl.table_sync()
                     torch.cuda.synchronize()  # 表落地后才能被 kernel 读到
                     tab = sl._slot_tab
+                    # 重建一次表（table_sync 用 pinned 中转 + synchronize 已在上面）
                     sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
                 if __import__("os").environ.get("TI_GPUDBG") == "1":
                     print(f"[miss] L{self.layer_id} miss={_miss} by_key={len(sl._by_key)} "
