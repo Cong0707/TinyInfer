@@ -648,19 +648,6 @@ class MoE:
                 served.extend(list(ids_batch))
                 return
 
-        _rc = self._route_counts
-        for _a in active:
-            _rc[_a] = _rc.get(_a, 0) + 1
-        self._last_ids = list(active)  # already the unique routed set (one host sync total)
-        target = xf.device
-        # Decode (one token) reads each expert's packed fp4 tiles directly through the
-        # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
-        # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
-        # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
-        # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
-        # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
-        _fp4_env = _os0.environ.get("TI_MOE_FP4")
-        _single_token = xf.size(0) == 1
         use_fp4_kernel = target.type == "cuda" and (
             _fp4_env == "1" or (_single_token and _fp4_env != "0")
         )
@@ -675,7 +662,7 @@ class MoE:
         # quantiser does not depend on the expert, and per-expert (per-row) quantising
         # repeated it 6x per token / 48x at prefill
         _aq = _asc = None
-        if use_fp4_kernel and active:
+        if use_fp4_kernel:
             # NOTE: do NOT swap this to fp4_native.quantize_act. Measured: the end-to-end
             # decode output changes ([989,43,...] -> [95991,...]) even though the native
             # act_quant is bit-identical to the reference on every synthetic shape tested.
@@ -707,6 +694,19 @@ class MoE:
                     _tb.print_exc()
                 _aq = _asc = None
 
+        _rc = self._route_counts
+        for _a in active:
+            _rc[_a] = _rc.get(_a, 0) + 1
+        self._last_ids = list(active)  # already the unique routed set (one host sync total)
+        target = xf.device
+        # Decode (one token) reads each expert's packed fp4 tiles directly through the
+        # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
+        # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
+        # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
+        # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
+        # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
+        _fp4_env = _os0.environ.get("TI_MOE_FP4")
+        _single_token = xf.size(0) == 1
         # per-expert (token, slot) selection computed once and reused by both passes
         sels: dict[int, tuple] = {}
         _single = xf.size(0) == 1
