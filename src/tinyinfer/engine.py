@@ -2102,7 +2102,8 @@ class Engine:
         h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
         if __import__("os").environ.get("TI_GPUDBG") == "1":
             print("[trace] embed done", flush=True)
-        h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
+        # expand：0 拷贝、无 kernel（原来 repeat 在 graph 捕获期会新建 tensor）
+        h = h.unsqueeze(2).expand(-1, -1, self.cfg.hc_mult, -1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
         if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
