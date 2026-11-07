@@ -795,7 +795,6 @@ class MoE:
                     # 读是免费的。标记非 0 就退到下面那条带 fetch 的路径，不会漏专家。
                     if (_fused and getattr(getattr(getattr(self, '_expert_store', None),
                                                'slots', None), '_slot_tab', None) is not None)
-                    ):
                         _sl = getattr(getattr(self, '_expert_store', None), 'slots', None)
                         _tab_all = getattr(_sl, '_slot_tab', None)
                         _arena0 = getattr(_sl, '_arena', None) if _sl is not None else None
