@@ -405,6 +405,7 @@ class MoE:
             fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
                arena[0], sids, y,
                n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], 0, stream=None)
+            return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
         except Exception as _exc:
             if __import__("os").environ.get("TI_GPUDBG") == "1":
                 import traceback as _tb
