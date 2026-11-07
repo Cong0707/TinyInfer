@@ -2391,6 +2391,11 @@ class Engine:
         # unavailable"），而它每次尝试都会 snapshot 整个 KV、跑一次完整 forward、
         # 再 synchronize。关掉之后 torch 也不会在每次 op 里去查
         # cudaStreamIsCapturing（实测每层 8 次）。
+        # 暂时关死：捕获期我们的 scratch / y_buf / KV 环形槽都不在 graph 的
+        # 内存池里，捕获时对它们做的 DtoD 落到非法地址，会打出粘性
+        # CUDA_ERROR_ILLEGAL_ADDRESS 把整个 context 弄坏（不是捕获失败那么轻）。
+        # 要开必须先把这些 buffer 全部改成「捕获前预分配、捕获期只写不分配」。
+        return False
         if not getattr(self.tier, "cuda_graph", False):
             return False
         if self.device == "cpu" or ids.shape[1] != 1:
