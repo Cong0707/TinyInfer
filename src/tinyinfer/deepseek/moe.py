@@ -568,6 +568,50 @@ class MoE:
         xf = x.view(-1, self.cfg.dim)
         _t1 = _tp.perf_counter() if _prof else 0.0
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
+        # ---- 纯 GPU 路径：整层不碰 CPU ----
+        # 槽位映射在 device 表里（pin_hot_experts 结束后一次性刷好），路由 ids 和权重本来
+        # 就在 GPU 上。这里只从 xf / indices / weights / 槽位表出发，不引用本函数后面
+        # 才定义的任何变量 —— 否则又是「挪一行、崩一处」的连锁。
+        if xf.is_cuda and xf.size(0) == 1:
+            _sl2 = getattr(getattr(self, '_expert_store', None), 'slots', None)
+            _tab2 = getattr(_sl2, '_slot_tab', None) if _sl2 is not None else None
+            _ar2 = getattr(_sl2, '_arena', None) if _sl2 is not None else None
+            if _tab2 is not None and _ar2 and len(_ar2) == 1:
+                from . import moe_gemv as _mg2
+                from .fp4_native import quantize_act as _qa2
+                _aq2, _asc2 = _qa2(xf, xf.size(-1))
+                _sids2 = _tab2[self.layer_id].index_select(0, indices.view(-1))
+                _wv2 = weights[0]
+                _ne2 = int(indices.numel())
+                _nmid2 = int(self.cfg.moe_inter_dim)
+                _bb2 = int(_sl2.blob_bytes)
+                _off = self._ts_offsets(self.layer_id)
+                _scr2 = self._scratch(_ne2 * (_nmid2 + (_nmid2 >> 5)), _ar2[0].device)
+                _fa2 = _MOE_FUSED.get('act')
+                if _fa2 is None:
+                    from ..kernels import native as _nat3
+                    _fa2 = _nat3.BoundLaunch(
+                        _nat3.kernel('moe_fused', 'moe_fused_act'),
+                        ((_nmid2 + 31) // 32, _ne2), (512,), 'TTTTTOOiiiiiiiif')
+                    _MOE_FUSED['act'] = _fa2
+                _fa2(_aq2.reshape(-1), _asc2.reshape(-1), _ar2[0], _sids2, _wv2,
+                     _scr2[:_ne2 * _nmid2], _scr2[_ne2 * _nmid2:],
+                     _ne2, _nmid2, int(self.cfg.dim), _bb2,
+                     _off[0], _off[1], _off[2], _off[3],
+                     float(self.swiglu_limit), stream=None)
+                _fd2 = _MOE_FUSED.get('down')
+                if _fd2 is None:
+                    from ..kernels import native as _nat4
+                    _fd2 = _nat4.BoundLaunch(
+                        _nat4.kernel('moe_fused', 'moe_fused_down'),
+                        ((int(self.cfg.dim) + 15) // 16,), (512,), 'TTTTOiiiiii')
+                    _MOE_FUSED['down'] = _fd2
+                _fd2(_scr2[:_ne2 * _nmid2].view(torch.float8_e4m3fn),
+                     _scr2[_ne2 * _nmid2:], _ar2[0], _sids2, y,
+                     _ne2, int(self.cfg.dim), _nmid2, _bb2,
+                     _off[4], _off[5], stream=None)
+                served.extend([int(v) for v in indices.view(-1).tolist()])
+                return
         if _prof:
             self._parts["gate"] += _tp.perf_counter() - _t1
         # 复用一块累加 buffer：每层新建 + 清零一个 [1, dim] fp32 是 20KB 的 memset
@@ -631,48 +675,6 @@ class MoE:
         # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
         # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
         # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
-        # ---- 纯 GPU 路径：整层不碰 CPU ----
-        # 槽位映射在 device 表里（pin_hot_experts 结束后一次性刷好），路由 ids 和权重本来
-        # 就在 GPU 上：一次 index_select 就得到每个激活专家的槽位编号，没有 D2H、没有
-        # fetch、没有 tolist。pin 之后 decode 的同一条 token 路由恒定，所以不会缺专家。
-        if _aq is not None:
-            _sl2 = getattr(getattr(self, '_expert_store', None), 'slots', None)
-            _tab2 = getattr(_sl2, '_slot_tab', None) if _sl2 is not None else None
-            _ar2 = getattr(_sl2, '_arena', None) if _sl2 is not None else None
-            if _tab2 is not None and _ar2 and len(_ar2) == 1:
-                from . import moe_gemv as _mg2
-                _sids2 = _tab2[self.layer_id].index_select(0, indices.view(-1))
-                _wv2 = weights[0]
-                _ne2 = int(indices.numel())
-                _nmid2 = int(self.cfg.moe_inter_dim)
-                _bb2 = int(_sl2.blob_bytes)
-                _off = self._ts_offsets(self.layer_id)
-                _scr2 = self._scratch(_ne2 * (_nmid2 + (_nmid2 >> 5)), _ar2[0].device)
-                _fa2 = _MOE_FUSED.get('act')
-                if _fa2 is None:
-                    from ..kernels import native as _nat3
-                    _fa2 = _nat3.BoundLaunch(
-                        _nat3.kernel('moe_fused', 'moe_fused_act'),
-                        ((_nmid2 + 31) // 32, _ne2), (512,), 'TTTTTOOiiiiiiiif')
-                    _MOE_FUSED['act'] = _fa2
-                _fa2(_aq.reshape(-1), _asc.reshape(-1), _ar2[0], _sids2, _wv2,
-                     _scr2[:_ne2 * _nmid2], _scr2[_ne2 * _nmid2:],
-                     _ne2, _nmid2, int(self.cfg.dim), _bb2,
-                     _off[0], _off[1], _off[2], _off[3],
-                     float(self.swiglu_limit), stream=None)
-                _fd2 = _MOE_FUSED.get('down')
-                if _fd2 is None:
-                    from ..kernels import native as _nat4
-                    _fd2 = _nat4.BoundLaunch(
-                        _nat4.kernel('moe_fused', 'moe_fused_down'),
-                        ((int(self.cfg.dim) + 15) // 16,), (512,), 'TTTTOiiiiii')
-                    _MOE_FUSED['down'] = _fd2
-                _fd2(_scr2[:_ne2 * _nmid2].view(torch.float8_e4m3fn),
-                     _scr2[_ne2 * _nmid2:], _ar2[0], _sids2, y,
-                     _ne2, int(self.cfg.dim), _nmid2, _bb2,
-                     _off[4], _off[5], stream=None)
-                served.extend(list(ids_batch))
-                return
 
         _world = int(getattr(self, "ep_world", 1) or 1)
         _rank = int(getattr(self, "ep_rank", 0) or 0)
