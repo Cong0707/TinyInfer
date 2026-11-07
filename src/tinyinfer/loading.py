@@ -2519,11 +2519,11 @@ class VramSlotCache:
         # 的 kernel 在 compute stream 上 —— 两者之间没有同步，表可能还没落地就被读了。
         # 复制到 pinned 再用当前 stream 拷贝，保证顺序。
         _h = self._torch.from_numpy(host)
-        _p = getattr(self, "_tab_stage", None)
+        _p = getattr(self, "_tab_stage", None)  # 预分配：捕获期不能新建 pinned
         if _p is None or _p.shape != _h.shape:
+            if self._torch.cuda.is_current_stream_capturing():
+                return
             _p = self._tab_stage = self._torch.empty(_h.shape, dtype=_h.dtype, pin_memory=True)
-        _p.copy_(_h)
-        tab.copy_(_p.to(tab.device, non_blocking=True))
 
     def _evict_locked(self, idx: int) -> None:
         key = self._key[idx]
