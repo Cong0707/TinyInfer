@@ -1,2 +1,5 @@
 .git-rewrite/
 src/tinyinfer/kernels/build/
+# python bytecode
+__pycache__/
+*.pyc
