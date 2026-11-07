@@ -380,10 +380,10 @@ class MoE:
             scr = self._scratch(n_exp * (nmid + (nmid >> 5)), arena[0].device)
             y = getattr(self, "_gpu_y_buf", None)
             if y is None or y.shape != xf.shape or y.device != xf.device:
-y = torch.empty(xf.shape, dtype=torch.float32, device=xf.device)
+                y = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
                 self._gpu_y_buf = y
             else:
-y = y  # accumulate=0，kernel 自己覆盖写，不需要清零
+                y.zero_()
 
             fa = _MOE_FUSED.get("act")
             if fa is None:
@@ -399,11 +399,11 @@ y = y  # accumulate=0，kernel 自己覆盖写，不需要清零
             if fd is None:
                 fd = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_down"),
                                         ((int(self.cfg.dim) + 15) // 16,), (512,),
-                                        "TTTTOiiiiiii")
+                                        "TTTTOiiiiii")
                 _MOE_FUSED["down"] = fd
             fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
                arena[0], sids, y,
-               n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], 0, stream=None)
+               n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], stream=None)
             return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
         except Exception as _exc:
             if __import__("os").environ.get("TI_GPUDBG") == "1":
