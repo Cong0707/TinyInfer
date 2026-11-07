@@ -855,7 +855,25 @@ class MoE:
         if not torch.cuda.is_current_stream_capturing():
             self._last_ids = sorted({int(v) for v in indices.view(-1).tolist()})
         # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
+        _lid = getattr(self, "_last_ids", None)
         _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
+        # 本层算完了，把引用还回池子：release() 只把 refs 减到 0、state 打回
+        # STAGED，数据仍然留着（下一步路由到同一个专家就是命中）。只有池子
+        # 真的要用这一格时才会被覆盖，而覆盖前 loading 的 DMA 会 wait 下面
+        # 记的这个事件 —— kernel 是异步 launch 的。表不清：专家还住着。
+        if (_lid and not torch.cuda.is_current_stream_capturing()):
+            _slr = getattr(getattr(self, "_expert_store", None), "slots", None)
+            if _slr is not None:
+                _evr = None
+                for _se in _lid:
+                    _sir = _slr._by_key.get((self.layer_id, _se))
+                    if _sir is None:
+                        continue
+                    if _evr is None:
+                        _evr = torch.cuda.Event()
+                        _evr.record(torch.cuda.current_stream())
+                    _slr._event[_sir] = _evr
+                    _slr.release(self.layer_id, _se)
         if _gpu_only is not None:
             # official model.py:905 `y += self.shared_experts(x)` —— 每个 token 都过一遍
             # shared expert，它和 routed 部分是相加关系。之前这条累加在纯 GPU 路径里

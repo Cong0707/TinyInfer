@@ -2539,6 +2539,15 @@ class VramSlotCache:
     def _evict_locked(self, idx: int) -> None:
         key = self._key[idx]
         if key is not None:
+            # 槽位一被收走，device 上的槽位表必须同时置 -1：否则下一层路由到
+            # 同一个专家时会从这一格读到「现在住在这儿的别人的权重」，不报错，
+            # 数值是错的。
+            _tab = getattr(self, "_slot_tab", None)
+            if _tab is not None:
+                try:
+                    _tab[int(key[0]), int(key[1])] = -1
+                except Exception:
+                    pass
             self._by_key.pop(key, None)
             self._gen += 1
             self._pinned.discard(key)
