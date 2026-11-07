@@ -2104,12 +2104,9 @@ class Engine:
             print("[trace] embed done", flush=True)
         # 预分配一块 [b,s,hc,dim] 的 buffer 并用广播 copy 写入：repeat 在捕获期
         # 会新建 tensor，而这块 buffer 是常驻的，捕获期只有一次写（Graph 里合法）。
-        _hb = getattr(self, "_h_buf", None)
-        if _hb is None or _hb.shape[0] != h.shape[0] or _hb.shape[1] != h.shape[1]:
-            _hb = torch.empty(h.shape[0], h.shape[1], self.cfg.hc_mult, h.shape[2],
                               dtype=h.dtype, device=h.device)
             self._h_buf = _hb
-        _hb.copy_(h.unsqueeze(2))
+        h = h.unsqueeze(2).expand(-1, -1, self.cfg.hc_mult, -1)
         h = _hb
         if __import__("os").environ.get("TI_GPUDBG") == "1":
             print("[trace] repeat done", flush=True)
