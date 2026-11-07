@@ -334,7 +334,7 @@ def _hc_pre_cuda(x: torch.Tensor, pre_mix: torch.Tensor):
     xr = x.reshape(rows, hc, d).contiguous()
     pr = pre_mix.reshape(rows, hc).float().contiguous()
     out = torch.empty((rows, d), dtype=x.dtype, device=x.device)
-    native.launch(_HC_PRE_FN, (rows,), (256,), [xr, pr, out, rows, hc, d], 0)
+    native.launch(_HC_PRE_FN, (rows,), (256,), [xr, pr, out, rows, hc, d])
     return out.view(b, s, d)
 
 

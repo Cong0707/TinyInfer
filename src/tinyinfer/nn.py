@@ -279,7 +279,7 @@ def _apply_rope_cuda(x: torch.Tensor, freqs_cis: torch.Tensor,
     grid = ((pairs + blk - 1) // blk,)
     from .kernels import native
     native.launch(_rope_kernel(), grid, (blk,),
-                  [x, fr, heads, hstride, rot, 1 if inverse else 0], 0)
+                  [x, fr, heads, hstride, rot, 1 if inverse else 0])
     return x
 
 

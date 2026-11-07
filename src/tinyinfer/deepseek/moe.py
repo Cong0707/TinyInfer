@@ -128,7 +128,7 @@ def _swiglu2(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor
     n = int(g.numel())
     out = torch.empty(n, dtype=torch.bfloat16, device=gate.device)
     native.launch(_SWIGLU2, ((n + 255) // 256,), (256,),
-                  [g, u, out, n, float(limit)], 0)
+                  [g, u, out, n, float(limit)])
     return out.view(gate.shape)
 
 

@@ -114,7 +114,7 @@ def gate_up(aq: torch.Tensor, asc: torch.Tensor, arena: torch.Tensor,
     w1_off, s1_off, w3_off, s3_off = (int(o) for o in offs)
     native.launch(_kernel("moe_gemv6"), ((n_rows + 15) // 16, n_exp, 2), (512,),
                   [aq, _e8m0_bytes(asc), arena, slots, out, n_rows, k_dim, n_exp,
-                   0, 0, int(blob_bytes), w1_off, s1_off, w3_off, s3_off], 0)
+                   0, 0, int(blob_bytes), w1_off, s1_off, w3_off, s3_off])
     return out
 
 
@@ -180,7 +180,7 @@ def down(aq: torch.Tensor, asc: torch.Tensor, arena: torch.Tensor,
     native.launch(_kernel("moe_gemv6"), ((n_rows + 15) // 16, n_exp, 1), (512,),
                   [aq, _e8m0_bytes(asc), arena, slots, out, n_rows, k_dim, n_exp,
                    k_dim, k_dim // 32, int(blob_bytes), int(w_off), int(s_off),
-                   int(w_off), int(s_off)], 0)
+                   int(w_off), int(s_off)])
     return out
 
 
@@ -189,4 +189,4 @@ def acc(src: torch.Tensor, y: torch.Tensor, n_exp: int) -> None:
     n = y.numel()
     stride_e = src.stride(0)
     native.launch(_kernel("moe_acc6"), ((n + 255) // 256, 1, 1), (256,),
-                  [src, y, n, n_exp, stride_e], 0)
+                  [src, y, n, n_exp, stride_e])
