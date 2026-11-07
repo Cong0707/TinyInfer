@@ -30,16 +30,25 @@ _CS_CACHE: dict = {}
 
 
 def _packed_cos_sin(table: torch.Tensor, start_pos: int, s: int) -> torch.Tensor:
-    key = (str(table.device), int(table.data_ptr()), int(start_pos), int(s))
-    hit = _CS_CACHE.get(key)
-    if hit is None:
-        if len(_CS_CACHE) > 64:
-            _CS_CACHE.clear()
-        freqs = table[start_pos:start_pos + s]
-        hit = torch.cat([freqs.real, freqs.imag], dim=-1).reshape(-1).float().contiguous()
-        _CS_CACHE[key] = hit
-    return hit
+    """把 [start_pos, start_pos+s) 的 cos/sin 打成一块连续 fp32。
 
+    关键：写进**固定的** buffer 而不是每步 new 一个 tensor。decode 要跑 CUDA
+    graph，图里引用的 freqs 必须是同一个地址 —— 每步换 tensor 等于每步换图。
+    所以这里 memcpy 进 _CS_BUF[(device, numel)]，调用方拿到的永远同一块。
+    """
+    key = (str(table.device), int(table.data_ptr()), int(s))
+    buf = _CS_BUF.get(key)
+    if buf is None:
+        freqs0 = table[start_pos:start_pos + s]
+        buf = torch.empty(freqs0.numel() * 2, dtype=torch.float32, device=table.device)
+        _CS_BUF[key] = buf
+    freqs = table[start_pos:start_pos + s]
+    buf[:freqs.numel()].copy_(freqs.real.reshape(-1))
+    buf[freqs.numel():].copy_(freqs.imag.reshape(-1))
+    return buf
+
+
+_CS_BUF: dict = {}
 
 class MLACompressedAttention:
     """MLA with compressed KV. Row-parallel split support mirrors MLAWindowAttention."""

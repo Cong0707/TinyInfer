@@ -2434,7 +2434,8 @@ class Engine:
 
     def _graph_run(self, ids: torch.Tensor, start_pos: int):
         g = getattr(self, "_graph", None)
-        if g is None or start_pos != getattr(self, "_graph_start_pos", -1):
+        if g is None:
+            return None
             return None
         out = g["out"]
         if out.shape[0] != ids.shape[0]:
