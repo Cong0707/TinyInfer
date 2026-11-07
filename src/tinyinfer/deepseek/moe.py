@@ -631,6 +631,11 @@ class MoE:
         # indices.reshape(-1).tolist() —— 一次 D2H，CPU 停下来等 GPU 排空，
         # 流水线断一次，之后的重叠要重新累积。实测后就是那 37ms 空隙的主要来源。
         active: list[int] = []
+        # 慢路径（b>1、无槽位表、或纯 GPU 分支没走成）才把路由展开回 CPU。
+        # 正常 decode 在纯 GPU 分支就已经 return，这一行不会执行。
+        if not active:
+            _route = [int(v) for v in indices.reshape(-1).tolist()]
+            active = sorted(set(_route))
         target = xf.device
         _single_token = xf.size(0) == 1
         _fp4_env = _os0.environ.get("TI_MOE_FP4")
