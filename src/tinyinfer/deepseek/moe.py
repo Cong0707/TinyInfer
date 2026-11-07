@@ -365,18 +365,8 @@ class MoE:
             print(f"[capt] L{self.layer_id}", flush=True)
         if not xf.is_cuda:
             raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
-        if xf.size(0) != 1:
-            # prefill 的多行：逐行走同一条纯 GPU 路径，拼回结果。
-            # 慢（每行各读一遍权重），但 prefill 只发生一次，且不许有第二条路径。
-            _rows = []
-            for _r in range(xf.size(0)):
-                _one = self._forward_gpu_only(x[:, _r:_r + 1], xf[_r:_r + 1],
-                                              indices[_r:_r + 1], weights[_r:_r + 1])
-                if _one is None:
-                    raise RuntimeError(f"MoE layer {self.layer_id}: row {_r} unavailable "
-                                     f"[{getattr(self, '_gpu_fail', '?')}]")
-                _rows.append(_one)
-            return torch.cat(_rows, dim=1)   # x 是 [b, s, d]，按 s 拼
+        # prefill 的多行：一次算完。kernel 带行维（blockIdx.z / blockIdx.y），
+        # 激活按 [row, expert] 铺开，逐行算会把每行的专家都塞进槽位、撑爆 1359 个槽。
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
@@ -440,7 +430,7 @@ class MoE:
                 if bool((sids < 0).any().item()):
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
-            n_exp = int(indices.numel())
+            n_exp = int(indices.numel())   # 多行时 = rows * topk
             nmid = int(self.cfg.moe_inter_dim)
             blob = int(sl.blob_bytes)
             off = self._ts_offsets(self.layer_id)
