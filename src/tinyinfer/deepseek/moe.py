@@ -365,8 +365,18 @@ class MoE:
             print(f"[capt] L{self.layer_id}", flush=True)
         if not xf.is_cuda:
             raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
-        # prefill 多行：走同一条 GPU 路径（kernel 带行维，n_exp = rows*topk）。
-        # 逐行会撑爆槽位，所以一次算，算完由调用方释放。
+        # prefill 多行：按 2 行一批算（kernel 带行维）。整批 6 行会让
+        # 40 层 x 36 个专家驻留、撑爆 1359 个槽；2 行一批是 40x12=480。
+        if xf.size(0) > 2:
+            _outs = []
+            for _s0 in range(0, xf.size(0), 2):
+                _s1 = min(_s0 + 2, xf.size(0))
+                _o = self._forward_gpu_only(x[:, _s0:_s1], xf[_s0:_s1],
+                                            indices[_s0:_s1], weights[_s0:_s1])
+                if _o is None:
+                    raise RuntimeError(f"MoE layer {self.layer_id}: rows {_s0}-{_s1} unavailable")
+                _outs.append(_o)
+            return torch.cat(_outs, dim=1)
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
             try:
