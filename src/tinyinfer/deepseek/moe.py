@@ -630,7 +630,7 @@ class MoE:
         # 索引得到（见下面的纯 GPU 分支）。原来这里每层一次
         # indices.reshape(-1).tolist() —— 一次 D2H，CPU 停下来等 GPU 排空，
         # 流水线断一次，之后的重叠要重新累积。实测后就是那 37ms 空隙的主要来源。
-        active = None
+        active: list[int] = []
         target = xf.device
         _single_token = xf.size(0) == 1
         _fp4_env = _os0.environ.get("TI_MOE_FP4")
