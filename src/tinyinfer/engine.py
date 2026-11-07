@@ -2552,7 +2552,7 @@ class Engine:
         """
         for attempt in range(3):
             try:
-                if start_pos >= 0 and chunk is None:
+                if start_pos >= 0 and chunk is None and (getattr(self, "_graph", None) is not None or start_pos > 0):
                     hit = self._graph_run(ids, start_pos)
                     if hit is None:
                         self._graph_try_capture(ids, start_pos)
