@@ -2640,7 +2640,14 @@ class VramSlotCache:
             self._cond.notify_all()
 
     def event(self, slot: int):
-        """The DMA event for a slot (None once its data is resident)."""
+        """The DMA event for a slot (None once its data is resident).
+
+        原来这里无条件返回 self._event[slot]，而 publish() 从不清它 —— 于是槽位早已
+        STAGED（数据落位）之后，调用方仍然每层对同一批专家各 wait 一次已经完成的
+        事件。实测每层 6 次 cudaStreamWaitEvent、每 token 240 次，全是空等。
+        """
+        if self._state[slot] == self.STAGED:
+            return None
         return self._event[slot]
 
     def wait_event(self, slot: int) -> None:
