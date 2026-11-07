@@ -50,7 +50,8 @@ extern "C" __global__ void head_gemv(const float* __restrict__ h,
                 acc += hf * wf;
             }
         } else {
-            for (int k = k0; k < k_dim; ++k) acc += hb[k] * row[k];
+            for (int k = k0; k < k_dim; ++k)
+                acc += bf16_to_f(__bfloat16_as_ushort(hb[k])) * bf16_to_f(__bfloat16_as_ushort(row[k]));
         }
     }
     // warp reduce
