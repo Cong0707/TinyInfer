@@ -405,7 +405,11 @@ class MoE:
                arena[0], sids, y,
                n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], stream=None)
             return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
-        except Exception:
+        except Exception as _exc:
+            if __import__("os").environ.get("TI_GPUDBG") == "1":
+                import traceback as _tb
+                print(f"[gpufail] {_exc!r}", flush=True)
+                _tb.print_exc()
             return None
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
