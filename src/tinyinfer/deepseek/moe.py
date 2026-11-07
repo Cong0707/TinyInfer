@@ -378,7 +378,12 @@ class MoE:
             blob = int(sl.blob_bytes)
             off = self._ts_offsets(self.layer_id)
             scr = self._scratch(n_exp * (nmid + (nmid >> 5)), arena[0].device)
-            y = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
+            y = getattr(self, "_gpu_y_buf", None)
+            if y is None or y.shape != xf.shape or y.device != xf.device:
+                y = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
+                self._gpu_y_buf = y
+            else:
+                y.zero_()
 
             fa = _MOE_FUSED.get("act")
             if fa is None:
