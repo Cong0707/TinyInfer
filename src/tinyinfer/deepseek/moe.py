@@ -318,7 +318,16 @@ class Expert:
             up = F.linear(x, self.w3)
             y = clamp_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit)
         if y is None:
-            raise RuntimeError("vllm clamp_swiglu unavailable (vllm_silu_and_mul.cubin)")
+            # 多行时 native 的 silu_and_mul 用不了（它的 grid 只覆盖了单行的形状），
+            # 同一条数学用 torch 写一遍：除了一点点带宽，结果和 kernel 等价。
+            half = _gu.shape[-1] // 2
+            lim = float(self.swiglu_limit)
+            _g = _gu[..., :half].float()
+            _u = _gu[..., half:].float()
+            if lim > 0:
+                _u = _u.clamp(-lim, lim)
+                _g = _g.clamp(max=lim)
+            y = (F.silu(_g) * _u).to(_gu.dtype)
         if weights is not None:
             y = weights * y
         if hasattr(self.w2, "forward"):
@@ -387,8 +396,17 @@ class MoE:
                 _o = self._forward_gpu_only(x[:, _s0:_s1], xf[_s0:_s1],
                                             indices[_s0:_s1], weights[_s0:_s1])
                 if _o is None:
-                    raise RuntimeError(f"MoE layer {self.layer_id}: rows {_s0}-{_s1} unavailable")
-                _outs.append(_o)
+                    raise RuntimeError(
+                        f"MoE layer {self.layer_id}: rows {_s0}-{_s1} unavailable "
+                        f"[{getattr(self, '_gpu_fail', '?')}]")
+                # _o 是 _gpu_y_buf 的 view（.to(bf16) 对 bf16 是 no-op）；下一批
+                # 换形状会重建并释放那块 buffer，前面几批的 view 就全悬空了，
+                # torch.cat 一读就是非法地址。clone 一次把结果脱开共享 buffer。
+                _outs.append(_o.clone())
+                # 每批都换了 sids/weights：driver-API 的 kernel 不等 Python 引用，
+                # 下一批覆盖 _launch_keep 会把它们回收掉，异步中的 kernel 就读到
+                # 被复用的显存（compute-sanitizer 里那个 4e16 的偏移）。先同步再换。
+                torch.cuda.synchronize()
             return torch.cat(_outs, dim=1)
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
@@ -421,7 +439,18 @@ class MoE:
             if __import__("os").environ.get("TI_GPUDBG") == "1":
                 print(f"[idx] L{self.layer_id} max={int(indices.max())} "
                       f"shape={tuple(indices.shape)}", flush=True)
-            sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
+            # 写进持久 buffer：index_select 每次新建张量，driver-API 的 kernel 只拿裸
+            # 指针，函数返回后这批显存会被 allocator 立刻复用（多行 prefill 时就是
+            # slot_ids 读到 INT_MAX、权重地址偏 4e16 的来源）。原地写同一块 buffer，
+            # 生命周期就不再依赖 Python 引用。
+            _sn = int(indices.numel())
+            _sb = getattr(self, "_sids_buf", None)
+            if _sb is None or _sb.device != xf.device or _sb.numel() < _sn:
+                _sb = torch.empty(max(4096, _sn), dtype=torch.int32, device=xf.device)
+                self._sids_buf = _sb
+            sids = _sb[:_sn]
+            torch.index_select(tab[self.layer_id], 0,
+                               indices.view(-1).clamp_(0, 383), out=sids)
             if not torch.cuda.is_current_stream_capturing():
                 self._prev_ids = (getattr(self, "_prev_ids", None) or []) + [int(v) for v in indices.view(-1).tolist()]
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
@@ -468,7 +497,18 @@ class MoE:
                     # stream，硬件本来就按顺序执行。原来的全设备同步每层一次，40 层
                     # 下来把异步流水线彻底掐断（per-layer 同步是 decode 一半的墙钟）。
                     tab = sl._slot_tab
-                    sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
+                    # 写进持久 buffer：index_select 每次新建张量，driver-API 的 kernel 只拿裸
+                # 指针，函数返回后这批显存会被 allocator 立刻复用（多行 prefill 时
+                # 就是 slot_ids 读到 INT_MAX、权重地址偏 4e16 的来源）。原地写同一块
+                # buffer，生命周期就不再依赖 Python 引用。
+                _sn = int(indices.numel())
+                _sb = getattr(self, "_sids_buf", None)
+                if _sb is None or _sb.device != xf.device or _sb.numel() < _sn:
+                    _sb = torch.empty(max(4096, _sn), dtype=torch.int32, device=xf.device)
+                    self._sids_buf = _sb
+                sids = _sb[:_sn]
+                torch.index_select(tab[self.layer_id], 0,
+                                   indices.view(-1).clamp_(0, 383), out=sids)
                 if __import__("os").environ.get("TI_GPUDBG") == "1":
                     print(f"[t6] L{self.layer_id} tabvals={[int(tab[self.layer_id, e]) for e in _miss]}"
                           f" sids={sids.tolist()}", flush=True)
@@ -558,6 +598,17 @@ class MoE:
             _ascx = _ascb[:n_exp * _nk]
             _ascx.view(_rows, _tk, _nk).copy_(
                 asc.view(torch.uint8).reshape(_rows, 1, _nk).expand(_rows, _tk, _nk))
+            # 这里所有参数都必须钉住引用：fa/fd 是用 driver API 直接 launch 的，
+            # torch 的 caching allocator 不知道这些 kernel 还在读这块显存。sids 是
+            # index_select 的临时输出，函数一返回就释放，显存立刻被别的层复用 ——
+            # 异步执行中的 kernel 于是从「槽位号」里读到 2^31 之类的垃圾，算出来的
+            # 权重地址偏 4e16（compute-sanitizer 实测），多行 prefill 必崩。
+            self._launch_keep = (sids, weights)
+            if __import__("os").environ.get("TI_MOE_CHK") == "1":
+                print(f"[moechk] L{self.layer_id} rows={_rows} n_exp={n_exp} "
+                      f"sids=[{int(sids.min())},{int(sids.max())}] "
+                      f"arena={tuple(arena[0].shape)} blob={blob} off={off} "
+                      f"cuda={sids.is_cuda} contig={sids.is_contiguous()}", flush=True)
             fa(_aqx, _ascx, arena[0], sids, weights.reshape(-1),
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,

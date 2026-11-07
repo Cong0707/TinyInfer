@@ -9,7 +9,17 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+from collections import deque
 from pathlib import Path
+
+# cuLaunchKernel takes raw pointers, so the CUDA caching allocator has no idea these
+# kernels are still reading a tensor. A temporary argument (a gate output, an
+# index_select result) is released the moment Python drops it, and the block is handed
+# straight back out -- an async kernel then reads someone else's data. Observed as
+# slot_ids=INT_MAX inside moe_fused_act, i.e. weight addresses off by 4e16.
+# Holding the last N launches' arguments keeps every in-flight argument alive; the cost
+# is only Python references (the tensors would be freed a few microseconds later anyway).
+_KEEP: deque | None = deque(maxlen=2048)
 
 _DIR = Path(__file__).with_name("build")
 _MODULES: dict[str, int] = {}
@@ -208,7 +218,10 @@ class BoundLaunch:
                                    stream, ptrs, None)
         if rc != 0:
             raise RuntimeError(f"cuLaunchKernel failed: {rc}")
-        # holders must outlive cuLaunchKernel, which copies the argument block
+        # holders must outlive cuLaunchKernel, which copies the argument block; the
+        # deque keeps the *tensors* alive until the kernel has actually retired.
+        if _KEEP is not None:
+            _KEEP.append(tuple(args))
         return None
 
 
