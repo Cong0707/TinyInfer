@@ -21,6 +21,24 @@ from ..weights import ShardStore
 # kv_norm_rope_quant 的 launcher 缓存（几何固定：grid=1, block=128）
 _KV_PREP: dict = {}
 
+# _cs（kernel 要的 cos‖sin 打包向量）按 (表地址, 起点, 长度) 缓存。
+# 一次 decode step 里所有压缩层拿到的都是同一张 freqs 表的同一行，原来每层
+# 都重做一次 real/imag 的 CatArrayBatchedCopy（外加 3 个 host 侧 aten 调用）；
+# 输入只有 (表, start_pos, s)，而 cat 是纯函数 —— 命中缓存与重算逐位相同。
+_CS_CACHE: dict = {}
+
+
+def _packed_cos_sin(table: torch.Tensor, start_pos: int, s: int) -> torch.Tensor:
+    key = (str(table.device), int(table.data_ptr()), int(start_pos), int(s))
+    hit = _CS_CACHE.get(key)
+    if hit is None:
+        if len(_CS_CACHE) > 64:
+            _CS_CACHE.clear()
+        freqs = table[start_pos:start_pos + s]
+        hit = torch.cat([freqs.real, freqs.imag], dim=-1).reshape(-1).float().contiguous()
+        _CS_CACHE[key] = hit
+    return hit
+
 
 class MLACompressedAttention:
     """MLA with compressed KV. Row-parallel split support mirrors MLAWindowAttention."""
@@ -168,6 +186,10 @@ class MLACompressedAttention:
         self.rt.index_k = None
         self.rt.topk_idxs = None
         self.rt.candidates = None
+        # 跨层复用的 per-step 中间量：换序列时必须丢掉，否则上一条序列的
+        # positions/top-k 会被当成同一步的输入（见 _grp0_for/_latent_freqs/_idxs_all）。
+        for _slot in ("_grp0_hit", "_fr_hit", "_idxs_hit", "_winrow_hit"):
+            setattr(self.rt, _slot, None)
 
     def to(self, device):
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
@@ -221,6 +243,101 @@ class MLACompressedAttention:
         self.wo_b = shard_grouped(self.wo_b, tp, self.o_groups, axis="in")
         self.tp_world = tp.world
         self.tp_rank = tp.rank
+
+    # ---- 跨层复用的 per-step 中间量 ----
+    # 下面几个方法缓存的东西都是「同一次 forward 里所有压缩层共用的中间量」。
+    # 槽位挂在 self.rt 上：chunk-major 执行时那是进程级单例，同一步的 38 个压缩层
+    # 看到的是同一个对象；layer-major 时每个 kv_source 组一个实例。命中条件里都带着
+    # 输入的身份/地址，所以命中时算的与重算的逐位相同（这些量都是纯函数）。
+
+    def _grp0_for(self, positions: torch.Tensor, start_pos: int, s: int, b: int) -> torch.Tensor:
+        """positions // ratio（每行的压缩组号）。原来每层重算一次整数除法。
+
+        一个 forward 里所有层拿到的是同一个 positions 张量，且没有任何一层写它，
+        所以同一 (张量, start_pos, s, b, ratio) 下重算与复用逐位相同。
+        key 里带 numel/start_pos/s/b/ratio：换一步（哪怕张量被复用）就重建。
+        """
+        rt = self.rt
+        key = (int(positions.data_ptr()), int(positions.numel()), int(start_pos), int(s),
+               int(b), int(self.ratio))
+        hit = getattr(rt, "_grp0_hit", None)
+        if hit is not None and hit[0] == key and hit[1] is positions:
+            return hit[2]
+        out = (positions // self.ratio).to(torch.long)
+        rt._grp0_hit = (key, positions, out)   # 持引用：地址在缓存期间不会被回收
+        return out
+
+    def _latent_freqs(self, grp0: torch.Tensor, ng: int, b: int, device) -> torch.Tensor:
+        """latent 的 rope 表行 [b, ng, dim]。原来每层 arange+add+mul+gather 四个 kernel。
+
+        输入只有 (grp0, ng, b, ratio, self.freqs_cis)，全是只读；gather 是纯函数，
+        所以复用与重算逐位相同。grp0 本身也是 _grp0_for 的缓存对象，层间是同一个。
+        """
+        rt = self.rt
+        key = (int(grp0.data_ptr()), int(grp0.numel()), int(ng), int(b), int(self.ratio))
+        hit = getattr(rt, "_fr_hit", None)
+        if hit is not None and hit[0] == key and hit[1] is grp0:
+            return hit[2]
+        grp = grp0.unsqueeze(1) + torch.arange(ng, device=device).unsqueeze(0)
+        fr = self.freqs_cis[(grp * self.ratio).reshape(-1)].reshape(b, ng, -1)
+        rt._fr_hit = (key, grp0, fr)
+        return fr
+
+    def _win_idxs_per_row(self, positions: torch.Tensor, s: int, n_old: int, device):
+        """batch>1 时每行的窗口槽位模板。原来每层都在 Python 里逐行重建。
+
+        window_idxs_per_row 对每一行跑 arange/-/>=/&/full_like/where/int 一长串
+        kernel（一行 ~7 个 launch），而同一 forward 里 37 个压缩层拿到的是同一个
+        positions、同一个 n_old —— 逐层重算是纯重复。输入全只读，函数是确定性的，
+        命中缓存与重算逐位相同。
+        """
+        rt = self.rt
+        key = (int(positions.data_ptr()), int(positions.numel()), int(s), int(n_old),
+               int(self.window), str(device))
+        hit = getattr(rt, "_winrow_hit", None)
+        if hit is not None and hit[0] == key and hit[1] is positions:
+            return hit[2]
+        from ..nn import window_idxs_per_row
+        out = window_idxs_per_row(positions, s, n_old, self.window, device)
+        rt._winrow_hit = (key, positions, out)   # 持引用：地址在缓存期间不会被回收
+        return out
+
+    def _idxs_all(self, win_idxs: torch.Tensor, compress_idxs: torch.Tensor,
+                  b: int, s: int) -> torch.Tensor:
+        """[window 槽位 | 压缩槽位] 的拼接结果，按同一份输入复用。
+
+        一个 decode step 里，窗口槽位模板是同一块存储的视图，top-k 在 30 个
+        非 index_source 层之间是同一个 rt.topk_idxs 对象 —— 原来每层都把这两段
+        各拼一次（早期 token 还要先 torch.full 一维 -1 再 cat 一次）。
+        命中条件 = 同一 win 存储地址 + 同一 compress 张量对象 + 同形状，此时
+        输入与重算完全一致，cat 是纯函数，所以输出逐位相同。
+        缓存里同时持有 win 张量的引用：这样它的存储在整个缓存期间不会被回收，
+        地址就不可能被另一个内容不同的张量复用（地址相同 ⇒ 同一块只读模板）。
+        """
+        rt = self.rt
+        _k = int(self.cfg.index_topk)
+        off = int(win_idxs.size(-1))
+        t = int(compress_idxs.size(-1))
+        if t > _k:                      # indexer 的 topk ≤ index_topk，这里只做兜底
+            return torch.cat([win_idxs, compress_idxs], dim=-1)
+        key = (int(win_idxs.data_ptr()), int(win_idxs.numel()), int(b), int(s), off, _k, t)
+        hit = getattr(rt, "_idxs_hit", None)
+        if hit is not None and hit[0] == key and hit[2] is compress_idxs:
+            return hit[3]
+        _win = win_idxs
+        _src = compress_idxs
+        if t < _k:
+            # 右补到 index_topk：序列早期 t = min(index_topk, end_pos // ratio) 比
+            # index_topk 小，而 layer-major 预填时两层会拿不同宽度（8 vs 7 列）把
+            # cat 撑爆。-1 是 kernel 的空槽标记，补位不进入任何数值，只让 kernel
+            # 的宽度恒定。
+            _pad = torch.full((*compress_idxs.shape[:-1], _k - t), -1,
+                              dtype=compress_idxs.dtype, device=compress_idxs.device)
+            compress_idxs = torch.cat([compress_idxs, _pad], dim=-1)
+        out = torch.cat([win_idxs, compress_idxs], dim=-1)
+        # 记下未补位的原始 top-k 张量：下次按对象身份比较；_win 只是钉住存储地址
+        rt._idxs_hit = (key, _win, _src, out)
+        return out
 
     def forward(self, x: torch.Tensor, start_pos: int = 0,
                 positions: torch.Tensor | None = None) -> torch.Tensor:
@@ -292,7 +409,11 @@ class MLACompressedAttention:
                 self._decode_win_idxs = None
             # kernel 要的是 cos‖sin（前 rot/2 个 cos、后 rot/2 个 sin），不是交错的
             # (cos0,sin0,cos1,sin1,...)。给错了就是 rope 区 64 维里错 63 维。
-            _cs = torch.cat([freqs.real, freqs.imag], dim=-1).reshape(-1).float().contiguous()
+            # 打包结果只由 (freqs 表, start_pos, s) 决定，而同一 decode step 里 38 个
+            # 压缩层用的是同一张表、同一个位置 —— 原来每层各做一次 cat（一个
+            # CatArrayBatchedCopy launch 加几次 host 侧 aten 调度），现在一次 step 一次。
+            # 数值不变：cat 是纯函数，命中缓存返回的就是同样那 64 个数。
+            _cs = _packed_cos_sin(self.freqs_cis, start_pos, s)
             _kvfn = _KV_PREP.get("fn")
             if _kvfn is None:
                 from ..kernels import native as _nat
@@ -344,8 +465,8 @@ class MLACompressedAttention:
             win_idxs = self._decode_win_idxs
         else:
             if positions is not None and positions.numel() == b and b > 1:
-                from ..nn import window_idxs_per_row
-                win_idxs = window_idxs_per_row(positions, s, n_old, self.window, x.device)
+                # 同一步里所有层算的是同一份每行窗位，改走跨层缓存（见 _win_idxs_per_row）
+                win_idxs = self._win_idxs_per_row(positions, s, n_old, x.device)
             else:
                 from ..nn import window_idxs_ring_cached
                 win_idxs = window_idxs_ring_cached(start_pos, s, self.window,
@@ -370,7 +491,10 @@ class MLACompressedAttention:
         # at different depths overwrite each other's compressed history -- measured as
         # row A drifting 16.18 against the same prompt run alone.
         if positions is not None and positions.numel() == b:
-            _grp0 = (positions // self.ratio).to(torch.long)
+            # 每行压缩组号。同一 forward 里所有层看到的是同一个 positions 张量、
+            # 且没有一层写它，所以这一格除法可以跨层复用（见 _grp0_for）。
+            # 数值不变：同一输入、同一整数除法，结果逐位相同。
+            _grp0 = self._grp0_for(positions, start_pos, s, b)
         else:
             _grp0 = None
         if latent is not None:
@@ -386,30 +510,32 @@ class MLACompressedAttention:
                 # group 0 and another at group 40).
                 _ng = int(latent.size(1))
                 if _grp0 is not None:
-                    _grp = _grp0.unsqueeze(1) + torch.arange(
-                        _ng, device=latent.device).unsqueeze(0)
-                    fr = self.freqs_cis[(_grp * self.ratio).reshape(-1)].reshape(
-                        b, _ng, -1)
+                    # 原来这里是 arange(1) + add(1) + mul(1) + index_select(1) 四个
+                    # kernel，每层都算一遍；输入 (grp0, ng, b, ratio, 表) 在同一步里
+                    # 对所有层相同，改走 _latent_freqs 的单槽缓存。数值不变：
+                    # gather 是纯函数，命中时拿到的行与重算的完全相同。
+                    fr = self._latent_freqs(_grp0, _ng, b, latent.device)
                 elif start_pos == 0:
                     fr = self.freqs_cis[:_ng * self.ratio : self.ratio]
                 else:
                     _g0 = start_pos // self.ratio
                     _grp = torch.arange(_g0, _g0 + _ng, device=latent.device)
                     fr = self.freqs_cis[_grp * self.ratio]
-                # the reference keeps the pre-RoPE latent for the indexer (its KProject runs
-                # on the compressor output before rotation) and only the rotated copy goes
-                # into the shared cache -- rotating in place fed the indexer rotated keys
-                stored = latent.clone()
+                # 旋转+fp4 往返直接做在 latent 上，不再 clone。数值原因：这次 forward
+                # 里 latent 在旋转之后只被当作「旋转+量化后的结果」使用（写共享 cache、
+                # 交给 indexer —— 索引器拿到的本来就是旋转后的张量），旋转前的值没有
+                # 读者。clone 只是一次逐字节的 DtoD 拷贝，原张量上做的原地旋转/量化
+                # 与在副本上做的完全同一组运算，得到的字节也完全相同，所以省掉这次
+                # 拷贝不改变任何数值。
                 if fr.dim() == 3:
                     # per-row table [b, ng, d]: rotate each row on its own, because a
                     # single [ng, d] table cannot describe two rows at different depths
-                    for _r in range(stored.size(0)):
-                        _apply_rope(stored[_r:_r + 1, ..., -self.rope_dim:],
+                    for _r in range(latent.size(0)):
+                        _apply_rope(latent[_r:_r + 1, ..., -self.rope_dim:],
                                     fr[_r:_r + 1].reshape(fr.size(1), -1))
                 else:
-                    _apply_rope(stored[..., -self.rope_dim:], fr)
-                fp4_act_quant(stored, 16, True, scale_dtype=torch.float8_e4m3fn)
-                latent = stored
+                    _apply_rope(latent[..., -self.rope_dim:], fr)
+                fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
             # Per-row group index. With a shared start the batch would store every row at
             # the same group offset, so two sequences of different length overwrite each
             # other's compressed history -- that is what made the second one degrade the
@@ -480,19 +606,19 @@ class MLACompressedAttention:
                   f"|{0.0 if _ik is None else float(_ik.float().abs().sum()):.6f} "
                   f"cand={None if _cd is None else float(_cd.sum()):.1f}", flush=True)
         if compress_idxs is not None and compress_idxs.size(-1) > 0:
+            # kv_all 的 cat 留在这里：window 缓冲是每层自己的环形 cache（内容逐层不同），
+            # 而 compress 段是跨层共享那一块的切片（内存上不挨着本层的 window），
+            # kernel 又要求两段拼成一段连续的下标空间 —— 只能靠这一次拷贝。
+            # 换成「预分配 + 两次 slice 写入」反而变成两个 launch（窗口一次、压缩一次），
+            # 数值一样但 launch 更多，所以不做。
             kv_all = torch.cat([kv_w, compress_kv], dim=1)
-            # Right-pad the compressed slots to the configured top-k. Near the start of a
-            # sequence t = min(index_topk, end_pos // ratio) is smaller than top_k, and two
-            # layers in one layer-major pass then hand the sparse kernel different widths
-            # (8 vs 7 columns) -- the layer-major prefill used to die on that cat(). -1 is
-            # the kernel's empty-slot marker, so padding changes no value and makes the
-            # kernel shape constant.
-            _k = int(self.cfg.index_topk)
-            if compress_idxs.size(-1) < _k:
-                _pad = torch.full((*compress_idxs.shape[:-1], _k - compress_idxs.size(-1)),
-                                  -1, dtype=compress_idxs.dtype, device=compress_idxs.device)
-                compress_idxs = torch.cat([compress_idxs, _pad], dim=-1)
-            idxs_all = torch.cat([win_idxs, compress_idxs], dim=-1)
+            # 下标拼接（含早期 token 的 -1 右补）按「同一份输入」跨层复用，见 _idxs_all。
+            # 同一 decode step 里窗口模板是同一块存储的视图、top-k 在 30 个非
+            # index_source 层之间还是同一个 rt.topk_idxs 对象 —— 原来这 38 层各自
+            # 重新算一遍 cat（早期 token 还要加一次 torch.full + cat），现在最多
+            # 每个 index_source 一次。数值不变：cat 和补 -1 都是纯函数，
+            # 命中时输入与重算完全一致，-1 依然只走 kernel 的空槽分支。
+            idxs_all = self._idxs_all(win_idxs, compress_idxs, b, s)
         else:
             kv_all, idxs_all = kv_w, win_idxs
 
