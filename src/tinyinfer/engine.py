@@ -1229,7 +1229,23 @@ class Engine:
             counts = getattr(ffn, "_route_counts", None) if ffn is not None else None
             if not counts:
                 continue
-            for _expert, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:per_layer]:
+            _top = [e for e, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:per_layer]]
+            # pin() 只固定「已经在槽位里」的专家（key in _by_key），而 prefill 收尾
+            # 会把每层用过的槽位全部 evict 掉 —— 所以直接 pin 永远返回 False、
+            # pinned=0，槽位表和图捕获条件跟着一起失效。先把热点搬进槽位再固定。
+            _miss = [e for e in _top if not slots.has(lid, e)]
+            if _miss:
+                try:
+                    self.expert_store.fetch(lid, _miss)
+                except Exception:
+                    pass
+                for _e in _miss:
+                    if not slots.has(lid, _e):
+                        try:
+                            slots.acquire(lid, _e)
+                        except Exception:
+                            pass
+            for _expert in _top:
                 if slots.pin(lid, _expert):
                     pinned += 1
         # 把所有 pin 的结果一次性刷进 device 侧的槽位表（table_sync 内部是主机侧
@@ -1242,10 +1258,15 @@ class Engine:
                     getattr(slots, "_index", None), "n_experts", 0) or 384))
                 slots.table_sync()
                 self._slot_tab_ready = True
-                for _b in self._blocks.values():
-                    _ffn = getattr(_b, "ffn", None)
-                    if _ffn is not None:
-                        _ffn._all_pinned = True
+                # 默认不设 _all_pinned：pin 只覆盖 prefill 期的 top-34，采样解码仍会
+                # 路由到没 pin 的专家，那时表里是 -1，直通 kernel 就是非法地址，
+                # miss 分支要继续兜底。TI_ALL_PINNED=1 强制走全命中路径，用来量
+                # 「没有每层 D2H」时到底能跑多快。
+                if __import__("os").environ.get("TI_ALL_PINNED") == "1":
+                    for _b in self._blocks.values():
+                        _ffn = getattr(_b, "ffn", None)
+                        if _ffn is not None:
+                            _ffn._all_pinned = True
             except Exception:
                 self._slot_tab_ready = False
         return pinned

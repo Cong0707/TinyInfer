@@ -463,7 +463,10 @@ class MoE:
                         print(f"[ts] L{self.layer_id} miss={_miss} "
                               f"byslot={[int(sl._by_key.get((self.layer_id, e), -1)) for e in _miss]}",
                               flush=True)
-                    torch.cuda.synchronize()  # 表落地后才能被 kernel 读到
+                    # 不要 torch.cuda.synchronize()：table_set 是这张 GPU 表上的
+                    # 赋值（同一 stream 上的 kernel），下面的 index_select 也在同一
+                    # stream，硬件本来就按顺序执行。原来的全设备同步每层一次，40 层
+                    # 下来把异步流水线彻底掐断（per-layer 同步是 decode 一半的墙钟）。
                     tab = sl._slot_tab
                     sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
                 if __import__("os").environ.get("TI_GPUDBG") == "1":
@@ -488,9 +491,12 @@ class MoE:
                           f"tabvals={[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
-            # prefill（未 pin）：本层用到的槽位引用清零，LRU 才能覆盖它们；decode（已 pin）不动。
+            # 只有「多行 prefill 分批」才需要腾槽位：那样一批就要 18 个专家，不还回去
+            # 会把池子占满。逐 token 的 prefill 和 decode 每步每层只要 6 个，还回去
+            # 等于让下一步全部 miss —— 那是每 token 重读 4.5GB、0.7 tok/s 的来源。
             if (not getattr(self, "_all_pinned", False)
-                    and not torch.cuda.is_current_stream_capturing()):
+                    and not torch.cuda.is_current_stream_capturing()
+                    and xf.size(0) > 3):
                 _sl1 = getattr(getattr(self, "_expert_store", None), "slots", None)
                 if _sl1 is not None:
                     _tab1 = getattr(_sl1, "_slot_tab", None)
@@ -559,13 +565,15 @@ class MoE:
 
             fd = _MOE_FUSED.get("down")
             if fd is None:
+                # grid 的 y 维度是「行」：kernel 里 row_d = blockIdx.y，
+                # 每行只累加自己那 topk 个专家。原来只有一维，多行时只算第 0 行。
                 fd = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_down"),
-                                        ((int(self.cfg.dim) + 15) // 16,), (512,),
-                                        "TTTTOiiiiiii")
+                                        ((int(self.cfg.dim) + 15) // 16, _rows), (512,),
+                                        "TTTTOiiiiiiii")
                 _MOE_FUSED["down"] = fd
             fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
                arena[0], sids, y,
-               n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], 0, stream=None)
+               n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], 0, _rows, stream=None)
             return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
         except Exception as _exc:
             if __import__("os").environ.get("TI_GPUDBG") == "1":

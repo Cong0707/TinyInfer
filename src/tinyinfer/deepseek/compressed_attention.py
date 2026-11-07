@@ -667,6 +667,12 @@ class MLACompressedAttention:
         else:
             kv_all, idxs_all = kv_w, win_idxs
 
+        if __import__("os").environ.get("TI_DEBUG_ATTN") == "1":
+            print(f"[attn{self.layer_id}] s={s} kv_all={tuple(kv_all.shape)} "
+                  f"idxs={tuple(idxs_all.shape)} idxmin={int(idxs_all.min())} "
+                  f"idxmax={int(idxs_all.max())} q={tuple(q.shape)} "
+                  f"comp={None if compress_kv is None else tuple(compress_kv.shape)} "
+                  f"clen={compress_len}", flush=True)
         if _pt is not None:
             _t3 = __import__("time").perf_counter()
         o = sparse_attn_dispatch(q, kv_all, self.sink, idxs_all, self.scale)
