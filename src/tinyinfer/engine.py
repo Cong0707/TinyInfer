@@ -2102,22 +2102,9 @@ class Engine:
         h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
         if __import__("os").environ.get("TI_GPUDBG") == "1":
             print("[trace] embed done", flush=True)
-        # 预分配一块 [b,s,hc,dim] 的 buffer 并用广播 copy 写入：repeat 在捕获期
-        # 会新建 tensor，而这块 buffer 是常驻的，捕获期只有一次写（Graph 里合法）。
-                              dtype=h.dtype, device=h.device)
-            self._h_buf = _hb
-        h = h.unsqueeze(2).expand(-1, -1, self.cfg.hc_mult, -1)
-        h = _hb
-        if __import__("os").environ.get("TI_GPUDBG") == "1":
-            print("[trace] repeat done", flush=True)
-        _pm = getattr(self, "_premix_buf", None)
-        if _pm is None or _pm.shape[0] != h.size(0) or _pm.shape[1] != h.size(1):
-            _pm = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
-            _pm[:, :, 0] = 1.0
-            self._premix_buf = _pm
-        pre_mix = _pm
-        if __import__("os").environ.get("TI_GPUDBG") == "1":
-            print("[trace] premix done", flush=True)
+        h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
+        pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
+        pre_mix[:, :, 0] = 1.0
         if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
             print("[capt] pre_mix done", flush=True)
         hash_ids = None
