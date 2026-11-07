@@ -418,6 +418,8 @@ class MoE:
                                 zip(indices.view(-1).tolist(), sids.tolist()) if int(sid) < 0})
                 if _miss:
                     self._expert_store.fetch(self.layer_id, _miss)
+                    # table_sync 内部是主机侧攒数组 + 一次 copy_，重建后再索引一次
+                    tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
                     sl.table_sync()
                     tab = sl._slot_tab
                     sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
