@@ -480,7 +480,7 @@ class TinyModel:
                     _sl = _store.slots
                     for _e in getattr(block.ffn, "_last_ids", []):
                         try:
-                            _sl.release(block.ffn.layer_id, int(_e))
+                            _sl.drop(block.ffn.layer_id, int(_e))
                         except Exception:
                             pass
         from .hc import hc_split_sinkhorn  # noqa: F401  (kept importable for users)

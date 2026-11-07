@@ -2675,6 +2675,23 @@ class VramSlotCache:
                 self._state[idx] = self.STAGED
             self._cond.notify_all()
 
+    def drop(self, layer: int, expert: int) -> bool:
+        """把一个（未 pin 的）专家从槽位里踢掉，把槽位还回池子。
+
+        release() 只减引用、把 state 打回 STAGED，槽位仍然占着 —— prefill 的
+        6 个 token 会用到 1440 个不同的 (layer, expert)，而池子只有 1359 个，
+        必须真的回收。pinned 的不动。
+        """
+        key = (layer, expert)
+        with self._lock:
+            idx = self._by_key.get(key)
+            if idx is None or key in self._pinned:
+                return False
+            if self._refs[idx] > 0:
+                return False
+            self._evict_locked(idx)
+            return True
+
     def has(self, layer: int, expert: int) -> bool:
         with self._lock:
             return (layer, expert) in self._by_key
