@@ -422,9 +422,19 @@ class HCBlockMixin:
                 # grid 从 (M,) 改成 (J, M)：decode 时 M=1，原来整层只有一个 block
                 # 在一块 SM 上跑 J*K 的乘加，实测 11.6ms/token。
                 if bfs:
-                    _launch(_kern("hc_mixes_bf_j"), (j_dim, b * s), (256,),
-                            [x2.contiguous(), fn32, out, b * s, k_dim, j_dim,
-                             float(self.hc_eps)])
+                    # mixes 和 split/sinkhorn 合成一个：24 个系数的中间结果不再写回全局。
+                    # 每层两次、40 层，省 160 次 launch/token。
+                    _pre = torch.empty((b * s, self.hc_mult), dtype=torch.float32, device=x.device)
+                    _post = torch.empty_like(_pre)
+                    _comb = torch.empty((b * s, self.hc_mult * self.hc_mult),
+                                        dtype=torch.float32, device=x.device)
+                    _launch(_kern("hc_mixes_split_sinkhorn"), (j_dim, b * s), (256,),
+                            [x2.contiguous(), fn32, hc_scale.float().reshape(-1),
+                             hc_base.float().reshape(-1), _pre, _post, _comb,
+                             b * s, k_dim, j_dim, float(self.hc_eps),
+                             int(self.hc_sinkhorn_iters)])
+                    return (_pre.view(b, s, self.hc_mult), _post.view(b, s, self.hc_mult),
+                            _comb.view(b, s, self.hc_mult, self.hc_mult))
                 else:
                     # fp32 通道（非 bf16 的 tier）仍走原 kernel：并行版只写了 bf16，
                     # 把 fp32 降成 bf16 再算会改精度，那不是优化而是换算法。

@@ -249,3 +249,129 @@ extern "C" __global__ void hc_mixes_bf_j(const __nv_bfloat16* __restrict__ x,  /
         out[(long long)m * J + j] = t * s_norm;
     }
 }
+
+// hc_mixes 与 hc_split_sinkhorn 合成一个 kernel。
+//
+// 原来是一次 hc_mixes_bf_j 把 24 个系数写回全局，紧接着 hc_split_sinkhorn 再读
+// 回来做 sigmoid/softmax/Sinkhorn。中间那趟全局往返 + 一次 launch，在 decode
+// （n=1）里完全没必要：24 个 float 就是这个 kernel 自己算出来的。
+// 每一层调用两次（attention 一次、FFN 一次），40 层就是 160 次 launch/token。
+extern "C" __global__ void hc_mixes_split_sinkhorn(
+    const __nv_bfloat16* __restrict__ x,   // [M, K]
+    const float* __restrict__ fn,          // [J, K]
+    const float* __restrict__ scale,       // [3]
+    const float* __restrict__ base,        // [J]
+    float* __restrict__ pre,               // [M, HC]
+    float* __restrict__ post,              // [M, HC]
+    float* __restrict__ comb,              // [M, HC*HC]
+    int M, int K, int J, float eps, int iters) {
+    // 一个 block 负责一个 (m, j)：j 是 24 个系数中的一个，norm 每块重算。
+    const int m = blockIdx.y;
+    const int j = blockIdx.x;
+    if (m >= M || j >= J) return;
+    const __nv_bfloat16* xm = x + (long long)m * K;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_warp[HC_BLOCK / 32];
+    __shared__ float s_norm;
+    __shared__ float s_mix[24];
+
+    float part = 0.f;
+    for (int k = tid; k < K; k += HC_BLOCK) {
+        const float v = __bfloat162float(xm[k]);
+        part += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffffu, part, off);
+    if ((tid & 31) == 0) s_warp[tid >> 5] = part;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+        for (int w = 0; w < HC_BLOCK / 32; ++w) t += s_warp[w];
+        s_norm = rsqrtf(t / (float)K + eps);
+    }
+    __syncthreads();
+
+    float acc = 0.f;
+    for (int k = tid; k < K; k += HC_BLOCK) {
+        acc += __bfloat162float(xm[k]) * fn[(long long)j * K + k];
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    __syncthreads();
+    if ((tid & 31) == 0) s_warp[tid >> 5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+        for (int w = 0; w < HC_BLOCK / 32; ++w) t += s_warp[w];
+        s_mix[j] = t * s_norm;
+    }
+    __syncthreads();
+    if (tid != 0 || j != 0) return;
+
+    // ---- 以下与 hc_split_sinkhorn 的算术完全一致（同序、同 rounding）----
+    float* pp = pre + (long long)m * HC;
+    float* po = post + (long long)m * HC;
+    float* pc = comb + (long long)m * (HC * HC);
+    const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+#pragma unroll
+    for (int q = 0; q < HC; ++q) {
+        const float t = __fmul_rn(s_mix[q], s0);
+        const float xx = __fadd_rn(t, base[q]);
+        pp[q] = __fadd_rn(1.f / (1.f + expf(-xx)), eps);
+    }
+#pragma unroll
+    for (int q = 0; q < HC; ++q) {
+        const float t = __fmul_rn(s_mix[HC + q], s1);
+        const float xx = __fadd_rn(t, base[HC + q]);
+        po[q] = __fmul_rn(2.f, 1.f / (1.f + expf(-xx)));
+    }
+    float v[HC * HC];
+#pragma unroll
+    for (int q = 0; q < HC * HC; ++q) {
+        const float t = __fmul_rn(s_mix[2 * HC + q], s2);
+        v[q] = __fadd_rn(t, base[2 * HC + q]);
+    }
+#pragma unroll
+    for (int r = 0; r < HC; ++r) {
+        const float mx = fmaxf(fmaxf(v[r * HC], v[r * HC + 1]),
+                               fmaxf(v[r * HC + 2], v[r * HC + 3]));
+        float sum = 0.f;
+#pragma unroll
+        for (int q = 0; q < HC; ++q) {
+            v[r * HC + q] = expf(v[r * HC + q] - mx);
+            sum += v[r * HC + q];
+        }
+#pragma unroll
+        for (int q = 0; q < HC; ++q) v[r * HC + q] = v[r * HC + q] / sum + eps;
+    }
+#pragma unroll
+    for (int q = 0; q < HC; ++q) {
+        float sum = 0.f;
+#pragma unroll
+        for (int r = 0; r < HC; ++r) sum += v[r * HC + q];
+        sum += eps;
+#pragma unroll
+        for (int r = 0; r < HC; ++r) v[r * HC + q] /= sum;
+    }
+    for (int it = 1; it < iters; ++it) {
+#pragma unroll
+        for (int r = 0; r < HC; ++r) {
+            float sum = 0.f;
+#pragma unroll
+            for (int q = 0; q < HC; ++q) sum += v[r * HC + q];
+            sum += eps;
+#pragma unroll
+            for (int q = 0; q < HC; ++q) v[r * HC + q] /= sum;
+        }
+#pragma unroll
+        for (int q = 0; q < HC; ++q) {
+            float sum = 0.f;
+#pragma unroll
+            for (int r = 0; r < HC; ++r) sum += v[r * HC + q];
+            sum += eps;
+#pragma unroll
+            for (int r = 0; r < HC; ++r) v[r * HC + q] /= sum;
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < HC * HC; ++q) pc[q] = v[q];
+}
