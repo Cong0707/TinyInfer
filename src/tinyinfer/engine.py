@@ -2099,6 +2099,8 @@ class Engine:
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
+        if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
+            print("[capt] pre_mix done", flush=True)
         hash_ids = None
         if (self.hashes is not None
                 and not torch.cuda.is_current_stream_capturing()):
@@ -2329,6 +2331,8 @@ class Engine:
             h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
             pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
             pre_mix[:, :, 0] = 1.0
+        if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
+            print("[capt] pre_mix done", flush=True)
             hash_ids = None
             if self.hashes is not None:
                 hash_ids = self.hashes(chunk_ids.reshape(-1).tolist(), off)
