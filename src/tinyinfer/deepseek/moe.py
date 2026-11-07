@@ -132,6 +132,9 @@ def _swiglu2(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor
     return out.view(gate.shape)
 
 
+_MOE_FUSED: dict = {}
+
+
 class Expert:
     """One SwiGLU FFN; routed experts are fp4, the shared expert is fp8."""
 
