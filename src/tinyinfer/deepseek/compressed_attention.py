@@ -475,7 +475,10 @@ class MLACompressedAttention:
         if _kv_prepped:
             pass                       # kv_norm_rope_quant 已经写进槽位
         elif s == 1:
-            buf[:, start_pos % self.window] = kv[:, 0]
+            # 用 index_copy_ + device 下标写，而不是 buf[:, start_pos % window] = ...
+            # 后者是 Python 整数索引，图里位置会被钉死成捕获时的 start_pos。
+            _pos = torch.tensor([start_pos % self.window], dtype=torch.long, device=kv.device)
+            buf.index_copy_(1, _pos, kv[:, :1])
         else:
             if s > self.window:
                 _kv = kv[:, s - self.window:]
