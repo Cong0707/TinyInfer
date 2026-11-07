@@ -392,8 +392,6 @@ class MoE:
                 fa = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_act"),
                                         ((nmid + 31) // 32, 1), (512,), "TTTTTOOiiiiiiiif")
                 _MOE_FUSED["act"] = fa
-            if __import__("os").environ.get("TI_GPUDBG") == "1":
-                print(f"[capt] L{self.layer_id} act sids={sids.tolist()[:8]}", flush=True)
             fa(aq.reshape(-1), asc.reshape(-1), arena[0], sids, weights[0],
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
@@ -406,8 +404,6 @@ class MoE:
                                         "TTTTOiiiiiii")
                 _MOE_FUSED["down"] = fd
             fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
-            if __import__("os").environ.get("TI_GPUDBG") == "1":
-                print(f"[capt] L{self.layer_id} done", flush=True)
                arena[0], sids, y,
                n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], 0, stream=None)
             return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
@@ -447,6 +443,10 @@ class MoE:
         # 3 projections x 40 layers = 120 launches per decode step that always happen.
         # Splitting its output dimension across cards divides those reads by the number of
         # cards with no reduction (the slices are disjoint).
+        self.shared = Expert(
+            _mk("shared_experts.w1", cache_shared_bf16),
+            _mk("shared_experts.w2", cache_shared_bf16),
+            _mk("shared_experts.w3", cache_shared_bf16),
             cfg.swiglu_limit,
         )
         self._store = store
