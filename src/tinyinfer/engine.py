@@ -2444,8 +2444,8 @@ class Engine:
         # 位置相关的 cos/sin 在每步 replay 前重写（图内不会重跑 Python 写入）
         try:
             from .deepseek.compressed_attention import refresh_cos_sin
-            _blk = getattr(self, "model", None)
-            _blocks = getattr(_blk, "blocks", None) or []
+            _blocks = list(getattr(self, "_blocks", {}).values())
+            if _blocks:
             if _blocks:
                 _att = getattr(_blocks[0], "attn", None)
                 _tbl = getattr(_att, "freqs_cis", None)
