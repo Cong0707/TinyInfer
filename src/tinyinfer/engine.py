@@ -1240,6 +1240,10 @@ class Engine:
                     getattr(slots, "_index", None), "n_experts", 0) or 384))
                 slots.table_sync()
                 self._slot_tab_ready = True
+                for _b in self._blocks.values():
+                    _ffn = getattr(_b, "ffn", None)
+                    if _ffn is not None:
+                        _ffn._all_pinned = True
             except Exception:
                 self._slot_tab_ready = False
         return pinned
