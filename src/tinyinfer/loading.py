@@ -2496,6 +2496,10 @@ class VramSlotCache:
 
     def table_sync(self) -> None:
         """把 Python 侧的 key->slot 一次性同步到 device 表。
+        # 捕获期禁止 H2D；pin 之后表内容固定，捕获时不需要重刷。
+        if (self._torch is not None and self._torch.cuda.is_available()
+                and self._torch.cuda.is_current_stream_capturing()):
+            return
 
         不要逐条 tab[layer, expert] = idx —— 那是每次一个 GPU 写 kernel，240 条
         就是 240 个 kernel，比它省下的那些还多。这里在主机侧攒一个 numpy 数组，
