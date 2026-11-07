@@ -667,7 +667,7 @@ class MLACompressedAttention:
                 if _fn is None:
                     _fn = _natb.BoundLaunch(
                         _natb.kernel("bt_gemv", "bt_gemv_bf16"),
-                        ((_r + 7) // 8, _g), (256,), "TTTOiii")
+                        ((_r + 7) // 8, _g), (256,), "TTTiii")
                     _BTGEMV[_key] = _fn
                 _fn(_xb.view(-1), wo_a.reshape(-1).contiguous(), _yb.view(-1), _g, _r, _d)
                 o = _yb.view(1, 1, _g, _r)
