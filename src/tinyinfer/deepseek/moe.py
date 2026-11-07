@@ -606,6 +606,7 @@ class MoE:
             else:
                 active = [i for i in active if (i % _world) == _rank]
 
+        target = xf.device
         use_fp4_kernel = target.type == "cuda" and (
             _fp4_env == "1" or (_single_token and _fp4_env != "0")
         )
@@ -699,7 +700,6 @@ class MoE:
         for _a in active:
             _rc[_a] = _rc.get(_a, 0) + 1
         self._last_ids = list(active)  # already the unique routed set (one host sync total)
-        target = xf.device
         # Decode (one token) reads each expert's packed fp4 tiles directly through the
         # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
         # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
