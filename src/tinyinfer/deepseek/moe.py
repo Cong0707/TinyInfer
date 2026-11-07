@@ -847,6 +847,11 @@ class MoE:
         xf = x.view(-1, self.cfg.dim)
         _t1 = _tp.perf_counter() if _prof else 0.0
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
+        # top-k 的 indices 是切片（order[..., :topk]）或者融合 kernel 的输出，未必
+        # 连续；下面到处是 indices.view(-1)，非连续会直接抛 "view size is not
+        # compatible with input tensor's size and stride"。这一次整理很便宜。
+        if not indices.is_contiguous():
+            indices = indices.contiguous()
         # 只记「本层这一步路由到哪几个专家」（引擎统计路由频率要用）。
         # 槽位怎么回收不归这里管：池子是「空槽优先 + 环形游标覆盖」，
         # 不存在需要专门去释放的对象，也就没有「忘了释放」这种 bug。
