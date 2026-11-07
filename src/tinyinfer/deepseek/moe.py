@@ -424,6 +424,18 @@ class MoE:
             sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
             if not torch.cuda.is_current_stream_capturing():
                 self._prev_ids = (getattr(self, "_prev_ids", None) or []) + [int(v) for v in indices.view(-1).tolist()]
+            # prefill（未 pin）时每一层都是新专家，refs 只会加不会减；直接把本层
+            # 要用的槽位引用清零，让 LRU 下次能覆盖它们。decode（已 pin）不走这里。
+            if (not getattr(self, "_all_pinned", False)
+                    and not torch.cuda.is_current_stream_capturing()):
+                _sl1 = getattr(self, "_expert_store", None)
+                _sl1 = getattr(_sl1, "slots", None) if _sl1 is not None else None
+                if _sl1 is not None:
+                    for _ii in sids.tolist():
+                        if int(_ii) >= 0:
+                            _sl1._refs[int(_ii)] = 0
+                            if _sl1._state[int(_ii)] == _sl1.IN_USE:
+                                _sl1._state[int(_ii)] = _sl1.STAGED
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()
