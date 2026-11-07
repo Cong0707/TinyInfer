@@ -2100,7 +2100,8 @@ class Engine:
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
         hash_ids = None
-        if self.hashes is not None:
+        if (self.hashes is not None
+                and not torch.cuda.is_current_stream_capturing()):
             _h0 = __import__("time").perf_counter() if _tt0 is not None else None
             # tolist() 是 D2H，CUDA graph 捕获期间禁止；捕获时跳过哈希（图的 key 是固定
             # 的 ids/start_pos，本来也不需要它）
