@@ -1,0 +1,125 @@
+﻿E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(1): warning C4819: ���ļ����������ڵ�ǰ����ҳ(936)�б�ʾ���ַ����뽫���ļ�����Ϊ Unicode ��ʽ�Է�ֹ���ݶ�ʧ
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(64): warning #902-D: type qualifier ignored
+      const float* __restrict scale,   
+      ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(64): warning #1569-D: specifiers after comma between declarations are nonstandard
+      const float* __restrict scale,   
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(65): warning #902-D: type qualifier ignored
+      const float* __restrict base,    
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(65): warning #1569-D: specifiers after comma between declarations are nonstandard
+      const float* __restrict base,    
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(66): warning #1569-D: specifiers after comma between declarations are nonstandard
+      float* __restrict pre,           
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(67): warning #1569-D: specifiers after comma between declarations are nonstandard
+      float* __restrict post,          
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(68): warning #1569-D: specifiers after comma between declarations are nonstandard
+      float* __restrict comb,          
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(69): warning #1569-D: specifiers after comma between declarations are nonstandard
+      int n, float eps, int iters) {
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(69): warning #1569-D: specifiers after comma between declarations are nonstandard
+      int n, float eps, int iters) {
+             ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(69): warning #1569-D: specifiers after comma between declarations are nonstandard
+      int n, float eps, int iters) {
+                        ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(69): error: expected a ";"
+      int n, float eps, int iters) {
+                                 ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(77): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(83): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(90): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(96): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(99): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(102): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(107): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(111): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(114): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(117): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(121): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(124): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(127): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(130): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(133): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(136): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(140): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(141): warning #12-D: parsing restarts here after previous syntax error
+      for (int j = 0; j < 4 * 4; ++j) pc[j] = v[j];
+                                                  ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_split.cu(142): error: expected a declaration
+  }
+  ^
+
+2 errors detected in the compilation of "E:/Develop/Deepseek/tinyinfer/src/tinyinfer/kernels/cuda/hc_split.cu".
+hc_split.cu

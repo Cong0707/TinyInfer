@@ -1,0 +1,31 @@
+﻿E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(1): warning C4819: ���ļ����������ڵ�ǰ����ҳ(936)�б�ʾ���ַ����뽫���ļ�����Ϊ Unicode ��ʽ�Է�ֹ���ݶ�ʧ
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(7): error: identifier "__nv_bfloat16" is undefined
+      const __nv_bfloat16* __restrict x,    
+            ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(9): error: identifier "__nv_bfloat16" is undefined
+      __nv_bfloat16* __restrict out,        
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(13): error: identifier "__nv_bfloat16" is undefined
+      const __nv_bfloat16* xr = x + (long long)row * hc * d;
+            ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(15): error: identifier "__nv_bfloat16" is undefined
+      __nv_bfloat16* orow = out + (long long)row * d;
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(15): error: identifier "orow" is undefined
+      __nv_bfloat16* orow = out + (long long)row * d;
+                     ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(19): error: identifier "__bfloat162float" is undefined
+              acc += pr[h] * __bfloat162float(xr[(long long)h * d + i]);
+                             ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc_pre.cu(21): error: identifier "__float2bfloat16" is undefined
+          orow[i] = __float2bfloat16(acc);
+                    ^
+
+7 errors detected in the compilation of "E:/Develop/Deepseek/tinyinfer/src/tinyinfer/kernels/cuda/hc_pre.cu".
+hc_pre.cu

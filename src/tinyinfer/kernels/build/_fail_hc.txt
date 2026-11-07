@@ -1,0 +1,205 @@
+﻿E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(1): warning C4819: ���ļ����������ڵ�ǰ����ҳ(936)�б�ʾ���ַ����뽫���ļ�����Ϊ Unicode ��ʽ�Է�ֹ���ݶ�ʧ
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(130): warning #177-D: variable "s_x" was declared but never referenced
+      __declspec(__shared__) float s_x[256];
+                                   ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(209): warning #1569-D: specifiers after comma between declarations are nonstandard
+                                           float* __restrict out,             
+                                           ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(210): warning #1569-D: specifiers after comma between declarations are nonstandard
+                                           int M, int K, int J, float eps) {
+                                           ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(210): warning #1569-D: specifiers after comma between declarations are nonstandard
+                                           int M, int K, int J, float eps) {
+                                                  ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(210): warning #1569-D: specifiers after comma between declarations are nonstandard
+                                           int M, int K, int J, float eps) {
+                                                         ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(210): warning #1569-D: specifiers after comma between declarations are nonstandard
+                                           int M, int K, int J, float eps) {
+                                                                ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(210): error: expected a ";"
+                                           int M, int K, int J, float eps) {
+                                                                         ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(231): warning #12-D: parsing restarts here after previous syntax error
+          for (int w = 0; w < 256 / 32; ++w) t += s_warp[w];
+                                                           ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(232): error: this declaration has no storage class or type specifier
+          s_norm = rsqrtf(t / (float)K + eps);
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(232): error: identifier "t" is undefined
+          s_norm = rsqrtf(t / (float)K + eps);
+                          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(233): error: expected a declaration
+      }
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(237): error: expected a declaration
+      for (int k = tid; k < K; k += 256) {
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(240): warning #12-D: parsing restarts here after previous syntax error
+      for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+                                                                                           ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(241): error: explicit type is missing ("int" assumed)
+      __syncthreads();
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(241): error: cannot overload functions distinguished by return type alone
+      __syncthreads();
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(242): error: expected a declaration
+      if ((tid & 31) == 0) s_warp[tid >> 5] = acc;
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(243): error: explicit type is missing ("int" assumed)
+      __syncthreads();
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(243): error: cannot overload functions distinguished by return type alone
+      __syncthreads();
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(244): error: expected a declaration
+      if (tid == 0) {
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(282): warning #12-D: parsing restarts here after previous syntax error
+          for (int w = 0; w < 24; ++w) t += s_warp[w];
+                                                     ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(283): error: this declaration has no storage class or type specifier
+          s_norm = rsqrtf(t / (float)K + eps);
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(283): error: variable "s_norm" has already been defined (previous definition at line 232)
+          s_norm = rsqrtf(t / (float)K + eps);
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(284): error: expected a declaration
+      }
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(289): error: expected a declaration
+      if (warp < J) {
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(298): warning #12-D: parsing restarts here after previous syntax error
+      __syncthreads();
+                     ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(299): error: expected a declaration
+      if (tid != 0) return;
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(301): error: identifier "pre" is undefined
+      float* pp = pre + (long long)m * HC;
+                  ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(301): error: identifier "m" is undefined
+      float* pp = pre + (long long)m * HC;
+                                   ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(301): error: identifier "HC" is undefined
+      float* pp = pre + (long long)m * HC;
+                                       ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(302): error: identifier "post" is undefined
+      float* po = post + (long long)m * HC;
+                  ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(303): error: identifier "comb" is undefined
+      float* pc = comb + (long long)m * (HC * HC);
+                  ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(304): error: identifier "scale" is undefined
+      const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+                       ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(306): error: expected a declaration
+      for (int q = 0; q < HC; ++q) {
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(317): warning #12-D: parsing restarts here after previous syntax error
+      float v[HC * HC];
+                      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(319): error: expected a declaration
+      for (int q = 0; q < HC * HC; ++q) {
+      ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(328): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(333): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(339): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(342): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(346): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(349): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(352): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(355): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(358): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(361): warning #607-D: this pragma must immediately precede a statement
+  #pragma unroll
+          ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(366): warning #12-D: parsing restarts here after previous syntax error
+      for (int q = 0; q < HC * HC; ++q) pc[q] = v[q];
+                                                    ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(367): error: expected a declaration
+  }
+  ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(304): warning #177-D: variable "s0" was declared but never referenced
+      const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+                  ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(304): warning #177-D: variable "s1" was declared but never referenced
+      const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+                                 ^
+
+E:\Develop\Deepseek\tinyinfer\src\tinyinfer\kernels\cuda\hc.cu(304): warning #177-D: variable "s2" was declared but never referenced
+      const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+                                                ^
+
+25 errors detected in the compilation of "E:/Develop/Deepseek/tinyinfer/src/tinyinfer/kernels/cuda/hc.cu".
+hc.cu

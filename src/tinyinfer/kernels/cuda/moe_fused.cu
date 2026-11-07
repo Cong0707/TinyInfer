@@ -320,7 +320,9 @@ extern "C" __global__ void moe_fused_decode(
     // 对应 moe_gemv6(down, 平面 0) + moe_acc6 两次 launch。
     // acc 的初值与加法顺序与 moe_acc6 完全相同：float acc = dst[i]; for e: acc += ...
     for (int n = blockIdx.x * nwarp + warp; n < n_down_rows; n += gridDim.x * nwarp) {
-        float acc = __bfloat162float(y[n]);            // moe_acc6 的 "acc = dst[i]"
+    // accumulate=0：本 token 第一遍，直接覆盖写（省掉调用方每层一次 y.zero_()
+    // 的 memset）。accumulate=1 时保持原有「读旧值再加」的语义。
+    float acc = accumulate ? __bfloat162float(y[n]) : 0.f;
         for (int e = 0; e < n_exp; ++e) {
             const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
             const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
@@ -435,7 +437,7 @@ extern "C" __global__ void moe_fused_down(
     const int* __restrict__ slot_ids,           // [n_exp]
     __nv_bfloat16* __restrict__ y,              // [n_down_rows] bf16，原地 +=（同 moe_acc6）
     int n_exp, int n_down_rows, int k_mid, int blob_bytes,
-    int w2_off, int s2_off)
+    int w2_off, int s2_off, int accumulate)
 {
     __shared__ float lut[16];
     const int tid = threadIdx.x;
