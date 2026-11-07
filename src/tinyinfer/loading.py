@@ -3269,7 +3269,10 @@ class ExpertStore:
                             _slot_have.add(_e)
                     except Exception:
                         pass
-            misses = [e for e in experts if not _have.get(e) and e not in _slot_have]
+            # 只要不在槽位里就要装（哪怕 RAM 里有）：RAM 命中只是「不用读盘」，
+            # 不等于「已经在显存里」。原来的条件是「RAM 没有 且 槽位没有」，于是
+            # RAM 全命中时一个槽位都不分配，表里全是 -1。
+            misses = [e for e in experts if e not in _slot_have]
             if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
                 print(f"[fetch] layer0 experts={experts} misses={misses}", flush=True)
             if misses:
