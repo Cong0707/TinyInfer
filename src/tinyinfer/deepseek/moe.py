@@ -344,6 +344,36 @@ class MoE:
             self._scratch_buf = buf
         return buf
 
+    def _miss_scan(self, sids, indices, n_exp) -> int:
+        """GPU 自己扫「哪些专家不在显存里」，只回传缺失的 id。
+
+        slot_ids 本来就在 device 上，判断本来就属于 device 侧；原来为了这个判断把
+        整条 sids 拉回主机（每层一次全设备同步），信息传了却只用一个布尔。
+        这里用一个 scan kernel 把缺失项写进固定 buffer，主机只读回计数和那几个 id，
+        然后照 id 去搬 —— 判断在产生信息的地方完成。
+        """
+        import torch as _t
+
+        if getattr(self, "_miss_ids_dev", None) is None:
+            _cap = 512
+            self._miss_ids_dev = _t.zeros(_cap, dtype=_t.int32, device=sids.device)
+            self._miss_cnt_dev = _t.zeros(1, dtype=_t.int32, device=sids.device)
+            self._miss_ids_host = _t.zeros(_cap, dtype=_t.int32, pin_memory=True)
+            self._miss_cnt_host = _t.zeros(1, dtype=_t.int32, pin_memory=True)
+            self._miss_cap = _cap
+            from ..kernels import native
+
+            self._miss_ln = native.BoundLaunch(
+                native.kernel("moe_fused", "moe_miss_scan"),
+                ((_cap + 63) // 64,), (64,), "TTiTTi")
+        self._miss_cnt_dev.zero_()
+        self._miss_ln(indices.view(-1), sids, int(n_exp),
+                      self._miss_ids_dev, self._miss_cnt_dev, int(self._miss_cap))
+        self._miss_cnt_host.copy_(self._miss_cnt_dev, non_blocking=True)
+        self._miss_ids_host.copy_(self._miss_ids_dev, non_blocking=True)
+        torch.cuda.synchronize()
+        return int(self._miss_cnt_host[0])
+
     def _ts_offsets(self, layer: int):
         """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
         cache = getattr(self, "_ts_off_cache", None)
@@ -453,11 +483,14 @@ class MoE:
             if not torch.cuda.is_current_stream_capturing():
                 self._prev_ids = (getattr(self, "_prev_ids", None) or []) + [int(v) for v in indices.view(-1).tolist()]
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
+            # 「有没有缺」由 GPU 判断（moe_miss_scan 在 device 上扫 slot_ids），CPU 只
+            # 拿回缺的那几个专家 id 去搬 —— 不再把整条 sids/indices 拉回来自己比。
+            _nmiss = 0
             if (not getattr(self, "_all_pinned", False)
-                    and not torch.cuda.is_current_stream_capturing()
-                    and bool((sids < 0).any().item())):
-                _miss = sorted({int(v) for v, sid in
-                                zip(indices.view(-1).tolist(), sids.tolist()) if int(sid) < 0})
+                    and not torch.cuda.is_current_stream_capturing()):
+                _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
+            if _nmiss:
+                _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
                 if _miss:
                     _recs = self._expert_store.fetch(self.layer_id, _miss)
                     if __import__("os").environ.get("TI_GPUDBG") == "1":

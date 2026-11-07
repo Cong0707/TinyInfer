@@ -472,3 +472,23 @@ extern "C" __global__ void moe_fused_down(
     }
     if (lane == 0) y[row_d * n_down_rows + n] = __float2bfloat16(acc);                 // fp32 写回，不再舍入
 }
+
+// ---------------------------------------------------------------------------
+// 路由缺失扫描：由 GPU 自己判断哪些专家不在显存里，只把「缺的那几个」递出来。
+// CPU 不再为了判断而把整条 sids 拉回去 —— 它读到的就是缺失的专家 id，
+// 直接按 id 去内存/磁盘搬。判断留在产生信息的地方。
+// ---------------------------------------------------------------------------
+extern "C" __global__ void moe_miss_scan(
+    const long long* __restrict__ experts,   // [n_exp] 本步路由到的专家 id
+    const int* __restrict__ slot_ids,        // [n_exp] 对应槽位号，-1 = 不在显存
+    int n_exp,
+    int* __restrict__ miss_ids,              // [max_miss] 缺失的专家 id
+    int* __restrict__ miss_count,            // [1] 缺失个数
+    int max_miss)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_exp && slot_ids[i] < 0) {
+        const int pos = atomicAdd(miss_count, 1);
+        if (pos < max_miss) miss_ids[pos] = (int)experts[i];
+    }
+}
