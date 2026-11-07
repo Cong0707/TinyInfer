@@ -2395,7 +2395,6 @@ class Engine:
         # 内存池里，捕获时对它们做的 DtoD 落到非法地址，会打出粘性
         # CUDA_ERROR_ILLEGAL_ADDRESS 把整个 context 弄坏（不是捕获失败那么轻）。
         # 要开必须先把这些 buffer 全部改成「捕获前预分配、捕获期只写不分配」。
-        return False
         if not getattr(self.tier, "cuda_graph", False):
             return False
         if self.device == "cpu" or ids.shape[1] != 1:
