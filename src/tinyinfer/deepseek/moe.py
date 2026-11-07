@@ -373,6 +373,19 @@ class MoE:
 
             aq, asc = quantize_act(xf, xf.size(-1))
             sids = tab[self.layer_id].index_select(0, indices.view(-1))
+            # miss 时自己补：缺的专家当场 fetch 进槽位，然后重建 sids。
+            # 不再是「另一条路径」，同一条路上把缺的填上。
+            if bool((sids < 0).any().item()):
+                _miss = [int(v) for v, sid in zip(indices.view(-1).tolist(),
+                                                   sids.tolist()) if int(sid) < 0]
+                if _miss:
+                    self._expert_store.fetch(self.layer_id, sorted(set(_miss)))
+                    sl.table_sync()
+                    tab = sl._slot_tab
+                    sids = tab[self.layer_id].index_select(0, indices.view(-1))
+                if bool((sids < 0).any().item()):
+                    raise RuntimeError(
+                        f"MoE layer {self.layer_id}: experts {_miss} still not resident")
             n_exp = int(indices.numel())
             nmid = int(self.cfg.moe_inter_dim)
             blob = int(sl.blob_bytes)
