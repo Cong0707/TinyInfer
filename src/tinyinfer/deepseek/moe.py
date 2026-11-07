@@ -382,6 +382,24 @@ class MoE:
             self._miss_ids_host[:_cnt].copy_(self._miss_ids_dev[:_cnt], non_blocking=False)
         return _cnt
 
+    def _tier_manager(self):
+        """本层的分级管理器（一层一个，持有显存/内存/磁盘的判断）。"""
+        mgr = getattr(self, "_mgr", None)
+        if mgr is not None:
+            return mgr
+        from ..expert_tiers import ExpertTierManager
+
+        st = self._expert_store
+        mgr = ExpertTierManager(
+            st,
+            n_layers=int(getattr(self.cfg, "n_layers", 40)),
+            n_experts=int(getattr(self.cfg, "n_routed_experts", 384) or 384),
+            device=str(getattr(self, "device", "cuda")),
+            warm=False,   # 预热由 Engine 统一起一条线程，不是每层一条
+        )
+        self._mgr = mgr
+        return mgr
+
     def _load_experts(self, layer: int, experts):
         """槽位池的取字节回调：内存里有就给内存里的，没有才让 CPU 去盘上读。
 
@@ -535,22 +553,14 @@ class MoE:
                       f"sids={sids.tolist()} tab={[int(tab[self.layer_id, int(e)]) for e in indices.view(-1).tolist()]}",
                       flush=True)
             if _nmiss:
+                # GPU 已经把缺失表写好了（moe_miss_scan），CPU 只管照单备货：
+                # 显存里有就直接用，没有就看内存，内存也没有才让磁盘供。
+                # 备货的决策全在 ExpertTierManager 里，这一层不碰 _by_key/表。
                 _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
                 if _miss:
-                    # 槽位池负责：挑格子（空槽优先，否则按游标覆盖最老的）、把字节
-                    # 搬进去、把槽位号写进表。这里只交出「缺的是谁」和「字节从哪取」——
-                    # 以前这些散在本函数里（acquire + 手工 table_set + 手工清表），
-                    # 漏一处就是「表指向别人的权重」这种不报错的错。
-                    _en_miss, _en_placed = sl.ensure(self.layer_id, _miss, self._load_experts)
-                    if _en_placed < _en_miss and not getattr(self, "_ensure_warned", False):
-                        self._ensure_warned = True
-                        print(f"[ensure] L{self.layer_id} miss={_en_miss} placed={_en_placed} "
-                              f"slot_free={len(getattr(sl, '_free', []))} "
-                              f"byslot={[sl._by_key.get((self.layer_id, e), -1) for e in _miss]}",
-                              flush=True)
-                    # GPU 等数据：CPU 只负责把搬运命令发出去，不等它落地。
-                    sl.wait_ready([sl._by_key[(self.layer_id, _e)] for _e in _miss
-                                   if (self.layer_id, _e) in sl._by_key])
+                    _mgr = self._tier_manager()
+                    _mgr.need(self.layer_id, _miss)
+                    _mgr.ready(self.layer_id, _miss)
                     tab = sl._slot_tab
                     # 写进持久 buffer：index_select 每次新建张量，driver-API 的 kernel 只拿裸
                 # 指针，函数返回后这批显存会被 allocator 立刻复用（多行 prefill 时
