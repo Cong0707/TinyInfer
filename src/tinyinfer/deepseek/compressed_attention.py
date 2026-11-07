@@ -362,9 +362,9 @@ class MLACompressedAttention:
 
         def _lin(w, x_):
             if hasattr(w, "forward"):
-            return w.forward(x_)
+                return w.forward(x_)
             if __import__("os").environ.get("TI_LINDBG") == "1":
-            print(f"[lin] F.linear {tuple(w.shape)} {w.dtype}", flush=True)
+                print(f"[lin] F.linear {tuple(w.shape)} {w.dtype}", flush=True)
             return F.linear(x_, w)
 
         # wq_a 和 wkv 吃的是同一个 h，量化一次给两个用。原来每个 fp8_linear 内部
