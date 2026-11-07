@@ -2482,7 +2482,7 @@ class Engine:
             if __import__("os").environ.get("TI_GRAPHDBG") == "1":
                 import traceback as _tb
                 _tb.print_exc()
-            print(f"[tinyinfer] CUDA graph unavailable ({exc!r}); eager decode", flush=True)
+                raise RuntimeError(f"decode CUDA graph failed ({exc!r}); no eager fallback") from exc
 
 
     def warm_graph_catalog(self) -> None:
