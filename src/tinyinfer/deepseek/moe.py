@@ -363,8 +363,19 @@ class MoE:
         if (__import__("os").environ.get("TI_GPUDBG") == "1"
                 and torch.cuda.is_current_stream_capturing()):
             print(f"[capt] L{self.layer_id}", flush=True)
-        if not (xf.is_cuda and xf.size(0) == 1):
-            self._gpu_fail = "line 364"
+        if not xf.is_cuda:
+            raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
+        if xf.size(0) != 1:
+            # prefill 的多行：逐行走同一条纯 GPU 路径，拼回结果。
+            # 慢（每行各读一遍权重），但 prefill 只发生一次，且不许有第二条路径。
+            _rows = []
+            for _r in range(xf.size(0)):
+                _one = self._forward_gpu_only(x[_r:_r + 1], xf[_r:_r + 1],
+                                              indices[_r:_r + 1], weights[_r:_r + 1])
+                if _one is None:
+                    raise RuntimeError(f"MoE layer {self.layer_id}: row {_r} unavailable")
+                _rows.append(_one)
+            return torch.cat(_rows, dim=0)
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
