@@ -1,4 +1,4 @@
-// 手写 decode kernel（无 torch 头文件：nvcc -cubin，由 native.py 经 driver API 加载）。
+﻿// 手写 decode kernel（无 torch 头文件：nvcc -cubin，由 native.py 经 driver API 加载）。
 //
 // moe_fused_decode：把 decode 时一层 routed MoE 的四个 launch 收成一个。
 // 原来的四段（见 kernels/cuda/moe_gemv6.cu 与 kernels/cuda/moe_act.cu 的头注释）：
@@ -433,7 +433,7 @@ extern "C" __global__ void moe_fused_down(
     const unsigned char* __restrict__ asc2,     // [n_exp, k_mid/32] e8m0
     const unsigned char* __restrict__ arena,    // 槽位大 buffer
     const int* __restrict__ slot_ids,           // [n_exp]
-    __nv_bfloat16* __restrict__ y,              // [n_down_rows] bf16，原地 +=（同 moe_acc6）
+    float* __restrict__ y,                      // [n_down_rows] fp32，原地 +=（同 moe_acc6）
     int n_exp, int n_down_rows, int k_mid, int blob_bytes,
     int w2_off, int s2_off)
 {
@@ -449,7 +449,7 @@ extern "C" __global__ void moe_fused_down(
     if (n >= n_down_rows) return;
 
     // acc 的初值、专家遍历顺序、每次加法的舍入都与 moe_acc6 完全相同
-    float acc = __bfloat162float(y[n]);                          // moe_acc6 的 "acc = dst[i]"
+    float acc = y[n];                          // moe_acc6 的 "acc = dst[i]"
     for (int e = 0; e < n_exp; ++e) {
         const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
         const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
@@ -461,5 +461,5 @@ extern "C" __global__ void moe_fused_down(
         // w_exp 已在 act 里乘过，这里不再乘
         if (lane == 0) acc += __bfloat162float(__float2bfloat16(d));
     }
-    if (lane == 0) y[n] = __float2bfloat16(acc);                 // fp32 写回，不再舍入
+    if (lane == 0) y[n] = acc;                 // fp32 写回，不再舍入
 }

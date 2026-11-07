@@ -271,14 +271,6 @@ class Expert:
         from ..gemm import fp4_linear
         return fp4_linear(y, w2, s2)
 
-    def _scratch(self, nbytes: int, device):
-        """MoE 融合 kernel 的中间 buffer（fp8 激活 + e8m0 scale），按大小复用。"""
-        buf = getattr(self, "_scratch_buf", None)
-        if buf is None or buf.numel() < nbytes or buf.device != device:
-            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-            self._scratch_buf = buf
-        return buf
-
     def _fused_gate_up(self):
         """把 w1/w3 拼成一个 [2N, K] 的 fp8 权重（vLLM 的 gate_up_proj）。
 
@@ -791,38 +783,19 @@ class MoE:
                             # 1323ms —— 融合的前提是每段工作本身还能并行。vLLM 的
                             # fused_moe_kernel 是靠 sorted_token_ids 把「token x expert」
                             # 铺成一个很大的 grid；单个 token 的 decode 没有那个维度。
-                            # MoE 四个 kernel 合成两个（moe_fused.cu 的 act / down，逐位验证过）：
-                            #   fused_act  = gate_up + clamp/silu/路由权重 + fp8 量化 -> scratch
-                            #   fused_down = down + 按专家顺序累加 -> y
-                            # 每层省两次 CPU enqueue（GPU 侧两者打平，被干掉的两个 launch 本来就只 15us）。
-                            _ne = len(_ids)
-                            _nmid = int(self.cfg.moe_inter_dim)
-                            _nb = _nmid >> 5
-                            _scr = self._scratch(_ne * (_nmid + _nb), _ar.device)
-                            _oq = _scr[:_ne * _nmid]
-                            _os = _scr[_ne * _nmid:]
-                            _fa = _MOE_FUSED.get('act')
-                            if _fa is None:
-                                from ..kernels import native as _nat
-                                _fa = _nat.BoundLaunch(
-                                    _nat.kernel('moe_fused', 'moe_fused_act'),
-                                    ((_nmid + 31) // 32, _ne), (512,), 'TTTTTOOiiiiiiiif')
-                                _MOE_FUSED['act'] = _fa
-                            _fa(_aq.reshape(-1), _asc.reshape(-1), _ar, _sids, _wv, _oq, _os,
-                                _ne, _nmid, int(self.cfg.dim), _bb,
-                                _ts['w1.weight'].dest_offset, _ts['w1.scale'].dest_offset,
-                                _ts['w3.weight'].dest_offset, _ts['w3.scale'].dest_offset,
-                                float(self.swiglu_limit), stream=None)
-                            _fd = _MOE_FUSED.get('down')
-                            if _fd is None:
-                                from ..kernels import native as _nat2
-                                _fd = _nat2.BoundLaunch(
-                                    _nat2.kernel('moe_fused', 'moe_fused_down'),
-                                    ((int(self.cfg.dim) + 15) // 16,), (512,), 'TTTTOiiiiii')
-                                _MOE_FUSED['down'] = _fd
-                            _fd(_oq.view(torch.float8_e4m3fn), _os, _ar, _sids, y,
-                                _ne, int(self.cfg.dim), _nmid, _bb,
-                                _ts['w2.weight'].dest_offset, _ts['w2.scale'].dest_offset, stream=None)
+                            _gu = moe_gemv.gate_up(
+                                _aq, _asc, _ar, _sids, _bb,
+                                (self.cfg.moe_inter_dim, self.cfg.dim),
+                                (_ts["w1.weight"].dest_offset, _ts["w1.scale"].dest_offset,
+                                 _ts["w3.weight"].dest_offset, _ts["w3.scale"].dest_offset))
+                            _aq2, _asc2 = moe_gemv.act_quant(_gu, _wv,
+                                                            float(self.swiglu_limit))
+                            _dn = moe_gemv.down(
+                                _aq2, _asc2, _ar, _sids, _bb,
+                                (self.cfg.dim, self.cfg.moe_inter_dim),
+                                _ts["w2.weight"].dest_offset,
+                                _ts["w2.scale"].dest_offset)
+                            moe_gemv.acc(_dn, y, len(_ids))
                             served.extend(_ids)
                             if (_os0.environ.get("TI_FUSED_CHECK") == "1"
                                     and not getattr(self, "_fused_checked", False)):
