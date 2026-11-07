@@ -14,6 +14,13 @@
 
 #include <cuda_bf16.h>
 
+// bf16 -> float 的位运算版（bf16 就是 float 的高 16 位，直接拼）。
+// 不用 __bfloat162float：CUDA 13 的 __nv_bfloat16 有多个转换运算符，
+// 传进去的若是 ushort 构造出来的值会报歧义。
+__device__ __forceinline__ float bf16_to_f(unsigned short b) {
+    return __uint_as_float(((unsigned int)b) << 16);
+}
+
 extern "C" __global__ void head_gemv(const float* __restrict__ h,
                                      const __nv_bfloat16* __restrict__ w,
                                      float* __restrict__ out,
@@ -38,8 +45,8 @@ extern "C" __global__ void head_gemv(const float* __restrict__ h,
             const unsigned short* hs = reinterpret_cast<const unsigned short*>(&hraw);
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const float wf = __bfloat162float(__ushort_as_bfloat16(ws[i]));
-                const float hf = __bfloat162float(__ushort_as_bfloat16(hs[i]));
+                const float wf = bf16_to_f(ws[i]);
+                const float hf = bf16_to_f(hs[i]);
                 acc += hf * wf;
             }
         } else {
