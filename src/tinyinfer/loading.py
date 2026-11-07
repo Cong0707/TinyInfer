@@ -2496,6 +2496,10 @@ class VramSlotCache:
 
     def table_sync(self) -> None:
         """把 Python 侧的 key->slot 一次性同步到 device 表。
+        # 捕获期禁止任何 H2D（pinned 中转也算），而 pin 之后表内容固定。
+        _t = self._torch
+        if _t is not None and _t.cuda.is_available() and _t.cuda.is_current_stream_capturing():
+            return
         # 捕获期禁止 H2D；pin 之后表内容固定，捕获时不需要重刷。
         if (self._torch is not None and self._torch.cuda.is_available()
                 and self._torch.cuda.is_current_stream_capturing()):
