@@ -373,7 +373,8 @@ class MoE:
                 _one = self._forward_gpu_only(x[_r:_r + 1], xf[_r:_r + 1],
                                               indices[_r:_r + 1], weights[_r:_r + 1])
                 if _one is None:
-                    raise RuntimeError(f"MoE layer {self.layer_id}: row {_r} unavailable")
+                    raise RuntimeError(f"MoE layer {self.layer_id}: row {_r} unavailable "
+                                     f"[{getattr(self, '_gpu_fail', '?')}]")
                 _rows.append(_one)
             return torch.cat(_rows, dim=0)
             return None
