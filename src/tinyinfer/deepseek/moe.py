@@ -365,22 +365,8 @@ class MoE:
             print(f"[capt] L{self.layer_id}", flush=True)
         if not xf.is_cuda:
             raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
-        if xf.size(0) != 1:
-            # prefill：逐行算，每行算完立刻释放该行的槽位。
-            # 6 行 x 6 专家 x 40 层 = 1440 个驻留，不释放会撑爆 1359 个槽。
-            _rows = []
-            for _r in range(xf.size(0)):
-                _one = self._forward_gpu_only(x[:, _r:_r + 1], xf[_r:_r + 1],
-                                              indices[_r:_r + 1], weights[_r:_r + 1])
-                if _one is None:
-                    raise RuntimeError(f"MoE layer {self.layer_id}: row {_r} unavailable")
-                _rows.append(_one)
-                for _e in indices[_r].reshape(-1).tolist():
-                    try:
-                        self._expert_store.slots.release(self.layer_id, int(_e))
-                    except Exception:
-                        pass
-            return torch.cat(_rows, dim=1)
+        # prefill 多行：走同一条 GPU 路径（kernel 带行维，n_exp = rows*topk）。
+        # 逐行会撑爆槽位，所以一次算，算完由调用方释放。
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
             try:
@@ -443,6 +429,7 @@ class MoE:
                 if bool((sids < 0).any().item()):
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
+            _nrows = int(xf.size(0))
             n_exp = int(indices.numel())   # 多行时 = rows * topk
             nmid = int(self.cfg.moe_inter_dim)
             blob = int(sl.blob_bytes)
