@@ -1,4 +1,5 @@
 """MoE with fp4 routed experts and one fp8 shared expert, loaded straight from HF shards.
+        self._drain_req()
 
 Reference implementations (consult when fixing this file):
   * DeepInfer  deepinfer/model_executor/models/v4_modules/mlp.py  (DeepseekMoE:
@@ -334,6 +335,47 @@ class MoE:
             buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
             self._scratch_buf = buf
         return buf
+
+    def _ensure_req(self):
+        """GPU 侧缺专家请求队列（device）+ 它的 pinned 镜像。"""
+        if getattr(self, "_req_q", None) is not None:
+            return self._req_q
+        from ..kernels import native
+        cap = 8
+        self._req_q = torch.zeros(1 + 2 * cap, dtype=torch.int32,
+                                  device=getattr(self.gate.weight, "device", "cuda"))
+        self._req_host = torch.zeros(1 + 2 * cap, dtype=torch.int32, pin_memory=True)
+        self._req_cap = cap
+        self._req_fn = native.kernel("moe_req", "moe_req_probe")
+        self._req_pending = False
+        return self._req_q
+
+    def _drain_req(self):
+        """在 forward 开头调用：处理上一拍 GPU 报上来的缺专家请求。
+
+        读的是 pinned 镜像，而它的 D2H 是在上一次 forward 里异步发起的 —— 中间隔了
+        几十层 GPU 工作，早已完成，所以这里读它不构成停顿。
+        """
+        if not getattr(self, "_req_pending", False):
+            return
+        self._req_pending = False
+        host = getattr(self, "_req_host", None)
+        if host is None:
+            return
+        cap = int(self._req_cap)
+        n = int(host[0])
+        if n <= 0:
+            return
+        store = getattr(self, "_expert_store", None)
+        if store is None:
+            return
+        for i in range(min(n, cap)):
+            layer = int(host[1 + i])
+            expert = int(host[1 + cap + i])
+            try:
+                store.fetch(layer, [expert])
+            except Exception:
+                pass
 
     def _ts_offsets(self, layer: int):
         """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
