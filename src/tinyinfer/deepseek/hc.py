@@ -424,21 +424,9 @@ class HCBlockMixin:
                 bfs = x.dtype == torch.bfloat16
                 # grid 从 (M,) 改成 (J, M)：decode 时 M=1，原来整层只有一个 block
                 # 在一块 SM 上跑 J*K 的乘加，实测 11.6ms/token。
-                if bfs and j_dim == 24 and self.hc_mult == 4:
-                    # 单 block、24 个 warp 各算一个系数：24 个 dot 在 block 内并行，
-                    # 同一个 block 里接着做 Sigmoid/Softmax/Sinkhorn —— 一次 launch
-                    # 替掉 hc_mixes_bf_j + hc_split_sinkhorn 两次。
-                    _pre = torch.empty((b * s, self.hc_mult), dtype=torch.float32, device=x.device)
-                    _post = torch.empty_like(_pre)
-                    _comb = torch.empty((b * s, self.hc_mult * self.hc_mult),
-                                        dtype=torch.float32, device=x.device)
-                    _launch(_kern("hc_mixes_split_sinkhorn"), (b * s,), (768,),
-                            [x2.contiguous(), fn32, hc_scale.float().reshape(-1),
-                             hc_base.float().reshape(-1), _pre, _post, _comb,
-                             b * s, k_dim, j_dim, float(self.hc_eps),
-                             int(self.hc_sinkhorn_iters)])
-                    return (_pre.view(b, s, self.hc_mult), _post.view(b, s, self.hc_mult),
-                            _comb.view(b, s, self.hc_mult, self.hc_mult))
+                # 不做单 block 融合：mixes 的 24 个 dot 要在 block 内并行就得一个 block
+                # 顺序读 24 x 20480 个 float（2MB），单 block 的有效带宽撑不住，
+                # 实测比 hc_mixes_bf_j（24 个 block 并行）+ hc_split_sinkhorn 两次还慢。
                 if bfs:
                     # bf16 但 j_dim/hc_mult 不是融合 kernel 覆盖的组合：仍用两段式
                     _launch(_kern("hc_mixes_bf_j"), (j_dim, b * s), (256,),
