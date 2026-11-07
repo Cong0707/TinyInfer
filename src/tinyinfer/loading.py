@@ -2502,11 +2502,16 @@ class VramSlotCache:
             if data is None:
                 continue
             with self._lock:
+                _ev0 = self.evictions
                 idx = self._reserve_locked((layer, e))
                 if idx is None:
                     continue
                 self._refs[idx] = 1
                 self._state[idx] = self.IN_USE
+            if __import__("os").environ.get("TI_SLOT_TRACE") == "1":
+                print(f"[ensure] L{layer} e={e} idx={idx} ev+={self.evictions - _ev0} "
+                      f"bykey={len(self._by_key)} free={len(self._free)} "
+                      f"state={self._state[idx]}", flush=True)
             ev = self._copy_blocking(idx, data)
             self._event[idx] = ev
             with self._lock:

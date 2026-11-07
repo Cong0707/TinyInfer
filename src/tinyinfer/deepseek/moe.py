@@ -529,6 +529,11 @@ class MoE:
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()):
                 _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
+            if __import__("os").environ.get("TI_SLOT_TRACE") == "1":
+                print(f"[trace] L{self.layer_id} bykey={len(sl._by_key)} "
+                      f"free={len(getattr(sl, '_free', []))} nmiss={_nmiss} "
+                      f"sids={sids.tolist()} tab={[int(tab[self.layer_id, int(e)]) for e in indices.view(-1).tolist()]}",
+                      flush=True)
             if _nmiss:
                 _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
                 if _miss:
@@ -581,34 +586,11 @@ class MoE:
                           f"tabvals={[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
-            # 池子装不下「整步」（40 层 x topk）的小卡（8GB / 271 槽位）：本步用完
-            # 立刻还回去，否则下一层就没槽位可拿。大卡不在这里还 —— 还了下一步
-            # 全部 miss，那是每 token 重读 4.5GB、0.7 tok/s 的来源。大卡的归还在
-            # MoE.forward 里按 _last_ids 做（只留本层最近一次用过的那几个）。
-            _need_step = int(getattr(self.cfg, "n_layers", 40)) * int(
-                getattr(self.cfg, "n_activated_experts", 6))
-            _pool = int(getattr(getattr(getattr(self, "_expert_store", None), "slots", None),
-                                "slots", 0) or 0)
-            if (not getattr(self, "_all_pinned", False)
-                    and not torch.cuda.is_current_stream_capturing()
-                    and _pool < _need_step * 2):
-                # fd 是异步 launch 的：槽位一还给池子，下一个 acquire 立刻就能覆盖
-                # 这块显存，而 kernel 可能还在读它。先同步再还。
-                torch.cuda.synchronize()
-                _sl1 = getattr(getattr(self, "_expert_store", None), "slots", None)
-                if _sl1 is not None:
-                    _tab1 = getattr(_sl1, "_slot_tab", None)
-                    for _ii, _ee in zip(sids.tolist(), indices.view(-1).tolist()):
-                        if int(_ii) >= 0:
-                            _sl1._evict_locked(int(_ii))   # 真正归还槽位（非 pin）
-                            # 表也得跟着置 -1：_evict_locked 只动 _by_key，表里留着
-                            # 旧槽位号，下一层路由到同一专家时会从这个格子读到
-                            # 现在住着的别的专家的权重（不报错，数值是错的）。
-                            if _tab1 is not None:
-                                try:
-                                    _tab1[self.layer_id, int(_ee)] = -1
-                                except Exception:
-                                    pass
+            # 这里不再主动「还槽位」。
+            # 原来按「池子装不下整步（40 层 x topk）」判断，小卡每步把整层用过的
+            # 专家全扔回去 —— 于是每一步每一层都要重读 4.5GB，8GB 卡永远在
+            # 1 tok/s 上趴着。槽位池本来就是覆盖式的：空槽用完就按游标覆盖最老
+            # 的那个，用不到的专家自然被顶掉，不需要谁专门去释放。
             _nrows = int(xf.size(0))
             n_exp = int(indices.numel())   # 多行时 = rows * topk
             nmid = int(self.cfg.moe_inter_dim)
