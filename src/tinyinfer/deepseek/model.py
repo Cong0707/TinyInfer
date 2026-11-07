@@ -472,18 +472,15 @@ class TinyModel:
             if block.engram is not None and hashes is not None:
                 h = block.engram.forward(h, hashes[block.engram.hash_index])
             h, pre_mix = block.forward(h, start_pos, pre_mix)
+            # 每层用完把引用计数还回去（不 evict）：refs 归零后 LRU 下一层自然覆盖。
+            _st = getattr(block.ffn, "_expert_store", None)
+            if _st is not None and getattr(_st, "slots", None) is not None:
+                for _e in getattr(block.ffn, "_last_ids", []):
+                    try:
+                        _st.slots.release(block.ffn.layer_id, int(_e))
+                    except Exception:
+                        pass
         from .hc import hc_split_sinkhorn  # noqa: F401  (kept importable for users)
-        # prefill 每层用过的新专家要把引用计数还回去（不 evict）：refs 归零后
-        # LRU 才能在下一层自然覆盖它们 —— decode 也是这样，不需要主动腾空。
-        for _b in self.blocks:
-            _st = getattr(_b.ffn, "_expert_store", None)
-            if _st is None or getattr(_st, "slots", None) is None:
-                continue
-            for _e in getattr(_b.ffn, "_last_ids", []):
-                try:
-                    _st.slots.release(_b.ffn.layer_id, int(_e))
-                except Exception:
-                    pass
         h = (pre_mix.unsqueeze(-1) * h.float()).sum(dim=2).to(h.dtype)
         h = rms_norm(h, self.out_norm, self.cfg.rms_norm_eps)
         # the official ParallelHead projects in fp32; chunk the vocab axis so the fp32
