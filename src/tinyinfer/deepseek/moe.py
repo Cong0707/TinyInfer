@@ -631,6 +631,10 @@ class MoE:
         # indices.reshape(-1).tolist() —— 一次 D2H，CPU 停下来等 GPU 排空，
         # 流水线断一次，之后的重叠要重新累积。实测后就是那 37ms 空隙的主要来源。
         active = None
+        _fp4_env = _os0.environ.get("TI_MOE_FP4")
+        use_fp4_kernel = target.type == "cuda" and (
+            _fp4_env == "1" or (_single_token and _fp4_env != "0")
+        )
         _aq = _asc = None
         if use_fp4_kernel:
             # NOTE: do NOT swap this to fp4_native.quantize_act. Measured: the end-to-end
@@ -695,12 +699,8 @@ class MoE:
             else:
                 active = [i for i in active if (i % _world) == _rank]
 
-        _fp4_env = _os0.environ.get("TI_MOE_FP4")
         _single_token = xf.size(0) == 1
         target = xf.device
-        use_fp4_kernel = target.type == "cuda" and (
-            _fp4_env == "1" or (_single_token and _fp4_env != "0")
-        )
         # _expert_cache 存的是 Expert 对象（fp4 视图 + 少量 torch 包装），不是 bf16 副本，
         # 所以它的容量不该绑在 _max_bf16 上。quant 模式下 engine 传
         # max_bf16_experts=0（bf16 副本确实不该留），但这个 0 同时把 Expert 视图缓存
