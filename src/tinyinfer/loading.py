@@ -2517,6 +2517,10 @@ class VramSlotCache:
             with self._lock:
                 if self._state[idx] == self.IN_USE:
                     self._state[idx] = self.STAGED
+                # refs 留 1：ensure 的语义是「我接下来就要读它」。调用方用完
+                # 调 release() 归还；归还之后这一格才允许被覆盖。
+                # （refs 归零还不够，必须等本层 kernel 真的跑完 —— 所以没有
+                # 「放完就还」这种捷径。）
                 self._cond.notify_all()
             placed += 1
         return len(miss), placed
