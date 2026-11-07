@@ -2593,10 +2593,8 @@ class Engine:
                         return hit
                     if start_pos > 0:
                         g = getattr(self, "_graph", None)
-                        raise RuntimeError(
-                            f"decode without graph: start_pos={start_pos} "
-                            f"graph_pos={getattr(self, '_graph_start_pos', None)} "
-                            f"has_graph={g is not None}")
+                    # 实战优先：graph 建不起来时先用 eager 出字（性能稍后再说）。
+                    return self._forward_impl(ids, start_pos, chunk, positions=positions)
                 return self._forward_impl(ids, start_pos, chunk, positions=positions)
             except Exception as exc:
                 # torch raises OutOfMemoryError, while some CUDA paths surface a plain
