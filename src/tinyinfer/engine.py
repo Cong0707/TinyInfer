@@ -2050,7 +2050,8 @@ class Engine:
                           flush=True)
                 fn = native.kernel("head_gemv", "head_gemv")
                 native.launch(fn, ((head.shape[0] + 7) // 8,), (256,),
-                              [hf, head, out, head.shape[0], head.shape[1]])
+                              [hf, head, out, head.shape[0], head.shape[1]],
+                              None, int(head.shape[1]) * 4)
                 return out.view(*h.shape[:-1], head.shape[0])
             except Exception as _exc:
                 if __import__("os").environ.get("TI_HEAD_DEBUG"):
