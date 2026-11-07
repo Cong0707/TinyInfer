@@ -279,6 +279,41 @@ class Expert:
             self._scratch_buf = buf
         return buf
 
+    def _ts_offsets(self, layer: int):
+        """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移。同一层所有专家同布局，按层缓存。"""
+        cache = getattr(self, "_ts_off_cache", None)
+        if cache is None:
+            cache = self._ts_off_cache = {}
+        hit = cache.get(layer)
+        if hit is not None:
+            return hit
+        idx = getattr(getattr(self, "_expert_store", None), "index", None)
+        if idx is None:
+            raise RuntimeError("MoE: expert_store.index 不可用，无法取 blob 偏移")
+        t = idx.expert_blob(layer, 0).tensors
+        hit = cache[layer] = (
+            t["w1.weight"].dest_offset, t["w1.scale"].dest_offset,
+            t["w3.weight"].dest_offset, t["w3.scale"].dest_offset,
+            t["w2.weight"].dest_offset, t["w2.scale"].dest_offset)
+        return hit
+
+    def _probe(self, sids, n_exp: int) -> None:
+        """把「本层有几个专家不在槽位」异步写回 pinned（不阻塞）。
+
+        不在 kernel 里写 host 内存，是因为那要求 pinned 页被 GPU 直接寻址；
+        这里用一次异步 D2H，它同样不阻塞 —— 值要到下一次 forward 开头才被读。
+        """
+        host = getattr(self, "_miss_host", None)
+        if host is None:
+            host = self._miss_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        host.copy_((sids < 0).sum(dtype=torch.int32), non_blocking=True)
+
+    def _update_probe(self) -> None:
+        """在下一次 forward 的开头调用：上一次那次异步 D2H 此时已经完成。"""
+        host = getattr(self, "_miss_host", None)
+        if host is not None:
+            self._probe_missed = bool(int(host.item()) > 0)
+
     def _fused_gate_up(self):
         """把 w1/w3 拼成一个 [2N, K] 的 fp8 权重（vLLM 的 gate_up_proj）。
 
@@ -767,6 +802,53 @@ class MoE:
                         if getattr(_rec, "event", None) is not None:
                             _tt.cuda.current_stream().wait_event(_rec.event)
                             _rec.event = None
+                    # ---- 纯 GPU 路径：整层不碰 CPU ----
+                    # 槽位映射已经在 device 表里（pin_hot_experts 结束后一次性刷好的），路由
+                    # ids 和权重本来就在 GPU 上，于是这里一次 index_select 就拿到每个激活专家
+                    # 的槽位编号，没有任何 D2H、没有 fetch、也没有 tolist。
+                    #
+                    # 安全性靠 miss 探针：kernel 把「本层有几个专家不在槽位」写进 pinned 的一个
+                    # 字节，CPU 在**下一次** forward 的开头读它 —— 那时上一次的 GPU 工作早已完成，
+                    # 读是免费的。标记非 0 就退到下面那条带 fetch 的路径，不会漏专家。
+                    if (_fused and getattr(self, '_slot_tab_ready', False)
+                            and not self._probe_missed):
+                        _sl = getattr(getattr(self, '_expert_store', None), 'slots', None)
+                        _tab_all = getattr(_sl, '_slot_tab', None)
+                        _arena0 = getattr(_sl, '_arena', None) if _sl is not None else None
+                        if _tab_all is not None and _arena0 and len(_arena0) == 1:
+                            from . import moe_gemv as _mg
+                            _sids2 = _tab_all[self.layer_id].index_select(0, indices.view(-1))
+                            _wv2 = weights[0]
+                            _ne2 = int(indices.numel())
+                            _ar2 = _arena0[0]
+                            _bb2 = int(_sl.blob_bytes)
+                            _off = self._ts_offsets(self.layer_id)
+                            _scr2 = self._scratch(_ne2 * (_nmid := int(self.cfg.moe_inter_dim))
+                                                   + _ne2 * (_nmid >> 5), _ar2.device)
+                            _fa2 = _MOE_FUSED.get('act')
+                            if _fa2 is None:
+                                from ..kernels import native as _nat3
+                                _fa2 = _nat3.BoundLaunch(
+                                    _nat3.kernel('moe_fused', 'moe_fused_act'),
+                                    ((_nmid + 31) // 32, _ne2), (512,), 'TTTTTOOiiiiiiiif')
+                                _MOE_FUSED['act'] = _fa2
+                            _fa2(_aq.reshape(-1), _asc.reshape(-1), _ar2, _sids2, _wv2,
+                                 _scr2[:_ne2 * _nmid].view(torch.uint8), _scr2[_ne2 * _nmid:].view(torch.uint8),
+                                 _ne2, _nmid, int(self.cfg.dim), _bb2,
+                                 _off[0], _off[1], _off[2], _off[3], float(self.swiglu_limit), stream=None)
+                            _fd2 = _MOE_FUSED.get('down')
+                            if _fd2 is None:
+                                from ..kernels import native as _nat4
+                                _fd2 = _nat4.BoundLaunch(
+                                    _nat4.kernel('moe_fused', 'moe_fused_down'),
+                                    ((int(self.cfg.dim) + 15) // 16,), (512,), 'TTTTOiiiiii')
+                                _MOE_FUSED['down'] = _fd2
+                            _fd2(_scr2[:_ne2 * _nmid].view(torch.float8_e4m3fn), _scr2[_ne2 * _nmid:],
+                                 _ar2, _sids2, y, _ne2, int(self.cfg.dim), _nmid, _bb2,
+                                 _off[4], _off[5], stream=None)
+                            self._probe(_sids2, _ne2)
+                            served.extend(list(ids_batch))
+                            return
                     rec_by_id = {rec.key[1]: rec for rec in recs}
                     if _fused:
                         from . import moe_gemv
