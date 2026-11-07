@@ -521,18 +521,27 @@ class MoE:
                                 # 非 pin、无引用的槽位再试。没有这一步，长时间 decode
                                 # 会在某一层突然报 still not resident —— 池子不是泄漏，
                                 # 是没人来回收。
+                                # 优先无引用的；其次「别的层」的 —— decode 是逐层串行的，
+                                # 别的层的槽位这一刻必然已经算完，收回来是安全的。
+                                # （release() 只减引用、把状态打回 STAGED，槽位本身还占着。）
+                                _victim = -1
                                 for _vi in range(sl.slots):
-                                    if (sl._state[_vi] != sl.FREE and sl._refs[_vi] == 0
-                                            and sl._key[_vi] is not None
-                                            and sl._key[_vi] not in sl._pinned):
-                                        _old = sl._key[_vi]
-                                        sl._evict_locked(_vi)
-                                        if _old is not None:
-                                            try:
-                                                sl._slot_tab[_old[0], _old[1]] = -1
-                                            except Exception:
-                                                pass
+                                    _k = sl._key[_vi]
+                                    if _k is None or _k in sl._pinned or sl._state[_vi] == sl.FREE:
+                                        continue
+                                    if sl._refs[_vi] == 0:
+                                        _victim = _vi
                                         break
+                                    if _victim < 0 and _k[0] != self.layer_id:
+                                        _victim = _vi
+                                if _victim >= 0:
+                                    _old = sl._key[_victim]
+                                    sl._evict_locked(_victim)
+                                    if _old is not None:
+                                        try:
+                                            sl._slot_tab[_old[0], _old[1]] = -1
+                                        except Exception:
+                                            pass
                                 try:
                                     sl.acquire(self.layer_id, _e)
                                 except Exception:
