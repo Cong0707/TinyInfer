@@ -1230,6 +1230,18 @@ class Engine:
             for _expert, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:per_layer]:
                 if slots.pin(lid, _expert):
                     pinned += 1
+        # 把所有 pin 的结果一次性刷进 device 侧的槽位表（table_sync 内部是主机侧
+        # 攒数组 + 一次 copy_，不是逐条 GPU 写）。这张表就是「GPU 侧调度」要用的
+        # (layer, expert) -> slot 映射：kernel 用 index_select 直接拿槽位编号，
+        # 不需要 CPU 每层 tolist 再发 H2D。
+        if pinned:
+            try:
+                slots.slot_table(max(1, len(self._blocks)), int(getattr(
+                    getattr(slots, "_index", None), "n_experts", 0) or 384))
+                slots.table_sync()
+                self._slot_tab_ready = True
+            except Exception:
+                self._slot_tab_ready = False
         return pinned
 
     def reset(self) -> None:

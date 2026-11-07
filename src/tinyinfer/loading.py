@@ -2495,15 +2495,23 @@ class VramSlotCache:
                 pass
 
     def table_sync(self) -> None:
-        """把 Python 侧的 key->slot 一次性同步到 device 表（只用于建表/预热）。"""
+        """把 Python 侧的 key->slot 一次性同步到 device 表。
+
+        不要逐条 tab[layer, expert] = idx —— 那是每次一个 GPU 写 kernel，240 条
+        就是 240 个 kernel，比它省下的那些还多。这里在主机侧攒一个 numpy 数组，
+        一次 copy_ 上去。
+        """
         tab = getattr(self, "_slot_tab", None)
         if tab is None or self._torch is None:
             return
+        import numpy as _np
+
         with self._lock:
-            tab.fill_(-1)
+            host = _np.full((tab.size(0), tab.size(1)), -1, dtype=_np.int32)
             for (layer, expert), idx in self._by_key.items():
-                if layer < tab.size(0) and expert < tab.size(1):
-                    tab[layer, expert] = int(idx)
+                if layer < host.shape[0] and expert < host.shape[1]:
+                    host[layer, expert] = idx
+        tab.copy_(self._torch.from_numpy(host).to(tab.device))
 
     def _evict_locked(self, idx: int) -> None:
         key = self._key[idx]
