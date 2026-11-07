@@ -652,6 +652,9 @@ class MLACompressedAttention:
         # 这个 einsum 是「每个位置一个独立的 [r,d] x [d]」，走 cuBLAS 的 grouped
         # batched gemm，实测 3.65 ms/token（每层一个 91us 的 kernel，占 GPU 时间 15%）。
         # bt_gemv 把它铺成一个 grid：一个 warp 一行，g 在 blockIdx.y。
+        if __import__("os").environ.get("TI_GPUDBG") == "1":
+            print(f"[btgemv] cuda={o.is_cuda} shp={tuple(o.shape)} "
+                  f"wdt={wo_a.dtype} wshp={tuple(wo_a.shape)}", flush=True)
         if (o.is_cuda and o.shape[0] * o.shape[1] == 1
                 and wo_a.dtype == torch.bfloat16):
             _g, _r, _d = int(wo_a.shape[0]), int(wo_a.shape[1]), int(wo_a.shape[2])
@@ -668,7 +671,11 @@ class MLACompressedAttention:
                     _BTGEMV[_key] = _fn
                 _fn(_xb.view(-1), wo_a.reshape(-1).contiguous(), _yb.view(-1), _g, _r, _d)
                 o = _yb.view(1, 1, _g, _r)
-            except Exception:
+            except Exception as _exc:
+                if __import__("os").environ.get("TI_GPUDBG") == "1":
+                    import traceback as _tb
+                    print(f"[btgemv-fail] {_exc!r}", flush=True)
+                    _tb.print_exc()
                 o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         else:
             o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
