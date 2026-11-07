@@ -465,7 +465,7 @@ class MoE:
             _ascx = _ascb[:n_exp * asc.numel()]
             _nk = asc.numel() // _rows
             _ascx.view(_rows, _tk, _nk).copy_(asc.reshape(_rows, 1, _nk).expand(_rows, _tk, _nk))
-            fa(_aqx, _ascx, arena[0], sids, weights[0],
+            fa(_aqx, _ascx, arena[0], sids, weights.reshape(-1),
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
                off[0], off[1], off[2], off[3], float(self.swiglu_limit), stream=None)
