@@ -801,7 +801,7 @@ class MoE:
                                 _fa = _nat.BoundLaunch(
                                     _nat.kernel("moe_fused", "moe_fused_act"),
                                     ((_nmid + 31) // 32, _ne), (512,),
-                                    "TTTTTOOiiiiiiiiif")
+                                    "TTTTTOOiiiiiiiif")
                                 _MOE_FUSED["act"] = _fa
                             _fa(_aq.reshape(-1), _asc.reshape(-1), _ar, _sids, _wv,
                                 _oq, _os, _ne, _nmid, int(self.cfg.dim), _bb,
@@ -814,7 +814,7 @@ class MoE:
                                 _fd = _nat2.BoundLaunch(
                                     _nat2.kernel("moe_fused", "moe_fused_down"),
                                     ((int(self.cfg.dim) + 15) // 16,), (512,),
-                                    "TTTTTOiiiii")
+                                    "TTTTTOiiiiii")
                                 _MOE_FUSED["down"] = _fd
                             _fd(_oq.view(torch.float8_e4m3fn), _os, _ar, _sids, y,
                                 _ne, int(self.cfg.dim), _nmid, _bb,

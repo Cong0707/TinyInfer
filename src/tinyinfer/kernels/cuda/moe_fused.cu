@@ -1,4 +1,4 @@
-﻿// 手写 decode kernel（无 torch 头文件：nvcc -cubin，由 native.py 经 driver API 加载）。
+// 手写 decode kernel（无 torch 头文件：nvcc -cubin，由 native.py 经 driver API 加载）。
 //
 // moe_fused_decode：把 decode 时一层 routed MoE 的四个 launch 收成一个。
 // 原来的四段（见 kernels/cuda/moe_gemv6.cu 与 kernels/cuda/moe_act.cu 的头注释）：
@@ -433,7 +433,7 @@ extern "C" __global__ void moe_fused_down(
     const unsigned char* __restrict__ asc2,     // [n_exp, k_mid/32] e8m0
     const unsigned char* __restrict__ arena,    // 槽位大 buffer
     const int* __restrict__ slot_ids,           // [n_exp]
-    float* __restrict__ y,                      // [n_down_rows] fp32，原地 +=（同 moe_acc6）
+    __nv_bfloat16* __restrict__ y,              // [n_down_rows] bf16，原地 +=（同 moe_acc6）
     int n_exp, int n_down_rows, int k_mid, int blob_bytes,
     int w2_off, int s2_off)
 {
