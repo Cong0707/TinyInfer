@@ -382,6 +382,12 @@ class MoE:
             from ..kernels import native
 
             aq, asc = quantize_act(xf, xf.size(-1))
+            # 路由计数（pin 用）。原来在 serve() 里更新，那条路删掉后这里补上：
+            # 只在还没 pin 的时候统计，pin 之后路由恒定，不必再花这次 D2H。
+            if not getattr(self, "_all_pinned", False):
+                _rc = self._route_counts
+                for _e in indices.view(-1).tolist():
+                    _rc[int(_e)] = _rc.get(int(_e), 0) + 1
             sids = tab[self.layer_id].index_select(0, indices.view(-1))
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             if not getattr(self, "_all_pinned", False) and bool((sids < 0).any().item()):
