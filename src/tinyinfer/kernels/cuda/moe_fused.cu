@@ -1,4 +1,4 @@
-// 手写 decode kernel（无 torch 头文件：nvcc -cubin，由 native.py 经 driver API 加载）。
+﻿// 手写 decode kernel（无 torch 头文件：nvcc -cubin，由 native.py 经 driver API 加载）。
 //
 // moe_fused_decode：把 decode 时一层 routed MoE 的四个 launch 收成一个。
 // 原来的四段（见 kernels/cuda/moe_gemv6.cu 与 kernels/cuda/moe_act.cu 的头注释）：
@@ -244,11 +244,10 @@ extern "C" __global__ void moe_fused_decode(
         const unsigned char* s1 = arena + eb + s1_off;
         const unsigned char* w3 = arena + eb + w3_off;
         const unsigned char* s3 = arena + eb + s3_off;
-        // 参考实现的 gate_up 传 act_stride=0：同一行激活喂所有专家。
-        // 这里按任务给定的 [n_exp, k_dim] 布局逐专家索引；若上游只有一行共享激活，
-        // 把下面两行改成 aq / asc 即可（算术完全相同）。
-        const unsigned char* ae = aq + (long long)e * k_in;
-        const unsigned char* ase = asc + (long long)e * (k_in >> 5);
+        // 本引擎的 decode 只有一行共享激活（moe_gemv6 的 act_stride=0），
+        // 所有专家读同一行，所以这里不做专家维偏移。
+        const unsigned char* ae = aq;
+        const unsigned char* ase = asc;
 
         for (int n = warp; n < n_mid; n += nwarp) {
             const float g0 = gemv_row<0>(ae, ase, w1 + (long long)n * (k_in >> 1),
