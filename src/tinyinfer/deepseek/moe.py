@@ -360,6 +360,7 @@ class MoE:
             self._miss_cnt_dev = _t.zeros(1, dtype=_t.int32, device=sids.device)
             self._miss_ids_host = _t.zeros(_cap, dtype=_t.int32, pin_memory=True)
             self._miss_cnt_host = _t.zeros(1, dtype=_t.int32, pin_memory=True)
+            self._miss_ev = _t.cuda.Event()
             self._miss_cap = _cap
             from ..kernels import native
 
@@ -369,9 +370,13 @@ class MoE:
         self._miss_cnt_dev.zero_()
         self._miss_ln(indices.view(-1), sids, int(n_exp),
                       self._miss_ids_dev, self._miss_cnt_dev, int(self._miss_cap))
-        # 只等这一个计数，不做全设备同步：torch.cuda.synchronize() 连 copy stream
-        # 上在飞的 DMA 一起等，每层一次会把 GPU 饿到 18% 利用率。
-        _cnt = int(self._miss_cnt_dev.item())
+        # 等的是「这一个计数落进 pinned」，不是整张卡：item() 会做一次全设备
+        # 同步（把 copy stream 上在飞的 DMA 也一起等），每层一次能把 GPU 饿到
+        # 18%。这里用一次异步 D2H + 一个事件，等的时间只有 scan kernel 本身。
+        self._miss_cnt_host.copy_(self._miss_cnt_dev, non_blocking=True)
+        self._miss_ev.record(_t.cuda.current_stream())
+        self._miss_ev.synchronize()
+        _cnt = int(self._miss_cnt_host[0])
         if _cnt > 0:
             # 只有真有缺失时才把 id 拉回来（正常 decode 大多数层这一步都不发生）
             self._miss_ids_host[:_cnt].copy_(self._miss_ids_dev[:_cnt], non_blocking=False)
@@ -860,36 +865,11 @@ class MoE:
         xf = x.view(-1, self.cfg.dim)
         _t1 = _tp.perf_counter() if _prof else 0.0
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
-        # 本层上一次用过、这一次不再用的专家，把槽位还给池子。池子是按「一次前向
-        # 要用多少个专家」配的（40 层 x topk = 240，L20 有 1359，余量很大），但
-        # 逐 token 的 prefill 每层会一路攒下几十个历史专家 —— 48 个 token 就能把
-        # 1359 塞满，满了以后一个可回收的槽位都没有，就是 still not resident。
-        # 只留「本层最近一次用过的」：相邻 token 的路由高度重合，这才是真复用。
-        # kernel 是异步 launch 的，归还的槽位可能在别的层被覆盖 —— 所以归还前
-        # 在槽位上记一个 compute stream 的完成事件，loading 的 DMA 会 wait 它。
+        # 只记「本层这一步路由到哪几个专家」（引擎统计路由频率要用）。
+        # 槽位怎么回收不归这里管：池子是「空槽优先 + 环形游标覆盖」，
+        # 不存在需要专门去释放的对象，也就没有「忘了释放」这种 bug。
         if not torch.cuda.is_current_stream_capturing():
-            _keep = {int(v) for v in indices.view(-1).tolist()}
-            self._last_ids = sorted(_keep)
-            # 本层上一次用过、这次不用的槽位，直接收回来还给池子。不这么做，
-            # 逐 token 的 prefill 每层会一路攒下几十个历史专家，几十个 token 就
-            # 把 1359 塞满 —— 之后每一步每一层都要先 evict 再 DMA，而且 DMA 得
-            # 等上一层 kernel 跑完（event），整条流水线被拉成串行。
-            # 只留本层最近一次用过的：相邻 token 的路由高度重合，这才是真复用。
-            _stale = getattr(self, "_slots_last", None)
-            if _stale:
-                _slr = getattr(getattr(self, "_expert_store", None), "slots", None)
-                # 只有在池子用掉大半时才回收本层旧槽位。decode 稳态只要 40x6=240
-                # 个，L20 的 1359 装得下 —— 每步都回收就是每步重读，实测把 6.6
-                # tok/s 打成 1.0。池子紧张（小卡 / 长 prefill 累积）时才让位。
-                if _slr is not None and len(_slr._by_key) > int(_slr.slots * 3 // 4):
-                    for _se in _stale:
-                        if _se in _keep:
-                            continue
-                        _sir = _slr._by_key.get((self.layer_id, _se))
-                        if _sir is None:
-                            continue
-                        _slr._evict_locked(_sir)   # 里面会记 dirty 事件，DMA 覆盖前 wait
-            self._slots_last = _keep
+            self._last_ids = sorted({int(v) for v in indices.view(-1).tolist()})
         # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
         _lid = getattr(self, "_last_ids", None)
         _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
