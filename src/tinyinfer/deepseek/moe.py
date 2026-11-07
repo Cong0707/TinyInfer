@@ -364,13 +364,12 @@ class MoE:
                 and torch.cuda.is_current_stream_capturing()):
             print(f"[capt] L{self.layer_id}", flush=True)
         if not xf.is_cuda:
-            raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
-        # prefill 多行：按 2 行一批算（kernel 带行维）。整批 6 行会让
-        # 40 层 x 36 个专家驻留、撑爆 1359 个槽；2 行一批是 40x12=480。
-        if xf.size(0) > 2:
+        # prefill 多行：按 3 行一批算。整批 6 行要 1440 个 (layer, expert) 槽位，
+        # 池子只有 1359；3 行一批是 720，装得下。
+        if xf.size(0) > 3:
             _outs = []
-            for _s0 in range(0, xf.size(0), 2):
-                _s1 = min(_s0 + 2, xf.size(0))
+            for _s0 in range(0, xf.size(0), 3):
+                _s1 = min(_s0 + 3, xf.size(0))
                 _o = self._forward_gpu_only(x[:, _s0:_s1], xf[_s0:_s1],
                                             indices[_s0:_s1], weights[_s0:_s1])
                 if _o is None:
