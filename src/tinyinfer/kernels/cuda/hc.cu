@@ -199,3 +199,53 @@ extern "C" __global__ void hc_mixes_f(const float* __restrict__ x,
         if ((tid & 31) == 0) out[(long)m * J + j] = acc * r;
     }
 }
+
+// hc_mixes 的并行版：一个 block 负责一个输出 j（grid = (J, M)）。
+//
+// 原 hc_mixes_bf 是 grid = (M,)，decode 时 M=1 —— 整层只有一个 block 在一块 SM 上
+// 做 J*K 的乘加（24 x 20480），实测 11.6ms/token，是 GPU 侧第一大户。这里把 j 拆
+// 到 grid.x，24 个 block 一起跑；行范数在每个 block 里重算一遍（K 次平方和对比
+// 投影是零头），省掉一次额外的 kernel，也不必让所有 block 等一个共享值。
+extern "C" __global__ void hc_mixes_bf_j(const __nv_bfloat16* __restrict__ x,  // [M, K]
+                                         const float* __restrict__ fn,        // [J, K]
+                                         float* __restrict__ out,             // [M, J]
+                                         int M, int K, int J, float eps) {
+    const int m = blockIdx.y;
+    const int j = blockIdx.x;
+    if (m >= M || j >= J) return;
+    const __nv_bfloat16* xm = x + (long long)m * K;
+    const float* f = fn + (long long)j * K;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_warp[HC_BLOCK / 32];
+    __shared__ float s_norm;
+
+    float part = 0.f;
+    for (int k = tid; k < K; k += HC_BLOCK) {
+        const float v = __bfloat162float(xm[k]);
+        part += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffffu, part, off);
+    if ((tid & 31) == 0) s_warp[tid >> 5] = part;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+        for (int w = 0; w < HC_BLOCK / 32; ++w) t += s_warp[w];
+        s_norm = rsqrtf(t / (float)K + eps);
+    }
+    __syncthreads();
+
+    float acc = 0.f;
+    for (int k = tid; k < K; k += HC_BLOCK) {
+        acc += __bfloat162float(xm[k]) * f[k];
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    __syncthreads();
+    if ((tid & 31) == 0) s_warp[tid >> 5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+        for (int w = 0; w < HC_BLOCK / 32; ++w) t += s_warp[w];
+        out[(long long)m * J + j] = t * s_norm;
+    }
+}

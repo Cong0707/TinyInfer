@@ -1214,7 +1214,14 @@ class TinyModelBackend(BaseBackend):
         ids = torch.tensor([[int(bos) if isinstance(bos, int) else 0]], dtype=torch.long)
         try:
             with torch.inference_mode():
-                model.forward(ids, 0)
+                # 多跑几步：一次 forward 只能看到一条路由，pin 不出热点。槽位是
+                # 引擎自己管的固定区（1359 个），pin 住热点后 decode 的路由恒定
+                # 命中，CPU 不必每层再 tolist()（3.3ms/层、130ms/token）。
+                for _w in range(8):
+                    model.forward(ids, 0)
+                _pinned = model.pin_hot_experts()
+                if _pinned:
+                    logger.info("pinned %d hot experts into VRAM slots", _pinned)
             model.reset()
             # NOT empty_cache() here. It releases the blocks the warm-up just proved are
             # needed, so the first real request re-requests them and the allocator has to

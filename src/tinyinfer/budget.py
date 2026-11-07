@@ -118,57 +118,59 @@ def _cudart():
     return None
 
 
-_MANAGED_LIB = None
-_MANAGED_FREE: list = []
+_PINNED_LIB = None
+_PINNED_FREE: list = []
 
 
-class ManagedBuffer:
-    """cudaMallocManaged 的 mmap 兼容包装（含 buffer 协议）。
+class PinnedBuffer:
+    """cudaHostAlloc(Mapped) 的 mmap 兼容包装：主机可读写，GPU 有 device 指针。
 
-    切片返回 bytes（与 mmap 一致）、支持 __setitem__、可 readinto、
-    可 torch.frombuffer。调用方一行都不用改。
+    kernel 直接拿 device 指针读这块内存（实测 24.5 GB/s，满速 PCIe），所以
+    decode 期间 CPU 不需要参与任何搬运 —— 请求由 GPU 发起。
 
-    实测（L20，44GB）：
-      cudaMallocManaged(280GB)       0.18s
-      advise(SetPreferredLocation)   rc=0
-      prefetch 有数据的 8GB           20.9 GB/s（真实 PCIe）
-      已驻留页 GPU 访问               661 GB/s（接近显存）
-    所以：热点命中=显存速度，冷页才付 PCIe 代价。
+    L20 的 cudaDevAttrUnifiedAddressing = 0，pageable 内存（mmap）没有可用的
+    device 指针，因此必须 pin。pin 的实测速度 1.4 GB/s（8GB 4.3s / 32GB 16.3s /
+    128GB 89.9s），275GB 约 3.3 分钟，是一次性启动成本。
     """
-    __slots__ = ("_ptr", "_n")
+    __slots__ = ("_cpu", "_dev", "_n")
 
-    def __init__(self, ptr: int, n: int):
-        self._ptr = int(ptr)
+    def __init__(self, cpu_ptr: int, dev_ptr: int, n: int):
+        self._cpu = int(cpu_ptr)
+        self._dev = int(dev_ptr)
         self._n = int(n)
 
     def __len__(self) -> int:
         return self._n
 
     def addressof(self) -> int:
-        return self._ptr
+        """GPU 侧指针（kernel 用这个）。"""
+        return self._dev
+
+    def cpu_address(self) -> int:
+        return self._cpu
 
     def __getitem__(self, k):
         import ctypes as _c
         if isinstance(k, slice):
             start, stop, step = k.indices(self._n)
             if step != 1:
-                raise ValueError("ManagedBuffer slice step must be 1")
-            return _c.string_at(self._ptr + start, stop - start)
-        return _c.c_ubyte.from_address(self._ptr + k).value
+                raise ValueError("PinnedBuffer slice step must be 1")
+            return _c.string_at(self._cpu + start, stop - start)
+        return _c.c_ubyte.from_address(self._cpu + k).value
 
     def __setitem__(self, k, v) -> None:
         import ctypes as _c
         if isinstance(k, slice):
             start, stop, step = k.indices(self._n)
             if step != 1:
-                raise ValueError("ManagedBuffer slice step must be 1")
-            _c.memmove(self._ptr + start, bytes(v), min(len(v), stop - start))
+                raise ValueError("PinnedBuffer slice step must be 1")
+            _c.memmove(self._cpu + start, bytes(v), min(len(v), stop - start))
         else:
-            _c.c_ubyte.from_address(self._ptr + k).value = int(v) & 0xFF
+            _c.c_ubyte.from_address(self._cpu + k).value = int(v) & 0xFF
 
     def __buffer__(self, flags: int):
         import ctypes as _c
-        return memoryview((_c.c_ubyte * self._n).from_address(self._ptr))
+        return memoryview((_c.c_ubyte * self._n).from_address(self._cpu))
 
     def __release_buffer__(self, view) -> None:
         pass
@@ -177,28 +179,76 @@ class ManagedBuffer:
         pass
 
 
-def _managed_pool(nbytes: int):
-    """cudaMallocManaged 一块 GPU 可寻址的主机池；CUDA 不可用时返回 None。"""
+def _pinned_pool(nbytes: int):
+    """mmap 出内存后分块并行 cudaHostRegister，取得 GPU device 指针。
+
+    cudaHostAlloc 内部 pin 是单线程的：实测 8GB 4.3s、32GB 16.3s、128GB 89.9s
+    （1.4-1.9 GB/s），275GB 要三分多钟，每次启动都要等。
+
+    但 pin 是内核逐页操作，天然可分块并行。cudaHostRegister 分块从 4 个线程
+    起就是 19.1 GB/s（32GB 1.7s，1 线程 16.5s）—— 快 10 倍，275GB 约 14 秒。
+    """
     import ctypes as _c
-    global _MANAGED_LIB
-    if _MANAGED_LIB is None:
+    import mmap
+    import os as _os
+    global _PINNED_LIB
+    if _PINNED_LIB is None:
         try:
-            _lib = _c.CDLL("libcudart.so")
-            _lib.cudaMallocManaged.argtypes = [_c.POINTER(_c.c_void_p),
-                                               _c.c_size_t, _c.c_uint]
-            _lib.cudaMallocManaged.restype = _c.c_int
-            _lib.cudaFree.argtypes = [_c.c_void_p]
-            _MANAGED_LIB = _lib
+            lib = _c.CDLL("libcudart.so")
+            lib.cudaHostRegister.argtypes = [_c.c_void_p, _c.c_size_t, _c.c_uint]
+            lib.cudaHostRegister.restype = _c.c_int
+            lib.cudaHostUnregister.argtypes = [_c.c_void_p]
+            lib.cudaHostUnregister.restype = _c.c_int
+            lib.cudaHostGetDevicePointer.argtypes = [_c.POINTER(_c.c_void_p),
+                                                    _c.c_void_p, _c.c_uint]
+            lib.cudaHostGetDevicePointer.restype = _c.c_int
+            lib.cudaSetDevice.restype = _c.c_int
+            _PINNED_LIB = lib
         except Exception:
-            _MANAGED_LIB = False
-    if not _MANAGED_LIB:
+            _PINNED_LIB = False
+    lib = _PINNED_LIB
+    if not lib:
         return None
-    p = _c.c_void_p()
-    rc = _MANAGED_LIB.cudaMallocManaged(_c.byref(p), _c.c_size_t(int(nbytes)), 1)
-    if rc != 0 or not p.value:
-        return None
-    _MANAGED_FREE.append(p)
-    return ManagedBuffer(p.value, int(nbytes))
+
+    n = int(nbytes)
+    buf = mmap.mmap(-1, n)
+    addr = _c.addressof(_c.c_char.from_buffer(buf))
+    lib.cudaSetDevice(0)
+
+    nthreads = max(1, min(8, (_os.cpu_count() or 4)))
+    chunk = (n + nthreads - 1) // nthreads
+
+    def _reg(off: int, size: int) -> int:
+        return lib.cudaHostRegister(_c.c_void_p(addr + off), _c.c_size_t(size), 2)
+
+    import threading
+    results = [None] * nthreads
+    def _worker(i: int) -> None:
+        off = i * chunk
+        size = min(chunk, n - off)
+        if size > 0:
+            results[i] = _reg(off, size)
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(nthreads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if any(r != 0 for r in results):
+        raise MemoryError(
+            f"cudaHostRegister failed for the {n / (1 << 30):.1f}GB expert pool: "
+            f"{results}. Raise the memlock limit (ulimit -l / RLIMIT_MEMLOCK).")
+
+    dp = _c.c_void_p()
+    rc = lib.cudaHostGetDevicePointer(_c.byref(dp), _c.c_void_p(addr), 0)
+    if rc != 0 or not dp.value:
+        lib.cudaHostUnregister(_c.c_void_p(addr))
+        raise MemoryError(
+            f"cudaHostGetDevicePointer on the {n / (1 << 30):.1f}GB expert pool "
+            f"failed (rc={rc}); the pool would not be GPU addressable.")
+
+    _PINNED_FREE.append((buf, addr))
+    return PinnedBuffer(addr, dp.value, n)
 
 
 def _touch_pages(buf, n: int) -> None:
@@ -575,19 +625,15 @@ class HostBudget:
         # 150GB 也拿不到，而每次重试都要重新 mmap + touch，纯属浪费时间。
         # 池子小了引擎会静默降级（缓存变小、每 token 重新读盘），那种"能跑但慢
         # 十倍"的结果比启动失败更难查。
-        # managed 池默认关闭：实测服务模式 892 ms/token，比 mmap 的 203 慢 4.4 倍。
-        # 原因是 managed 的缺页只有 6.7 GB/s（PCIe 的 1/4），而 decode 每次 reset
-        # 都会让页重新掉出去。代码留着（ManagedBuffer + _managed_pool），
-        # TI_MANAGED_POOL=1 可以打开做实验，不作为默认。
-        buf = None
-        if __import__("os").environ.get("TI_MANAGED_POOL") == "1":
-            buf = _managed_pool(n)
-        if buf is None:
-            buf = mmap.mmap(-1, n)
-        if False:
-            pass
+        # 专家权重留在硬盘，只有热点进显存槽位 —— 引擎的主体工作就是这个。
+        # 主存池只是「换入换出」的中间层，用 mmap 就够，不需要 pin：
+        #   1) 275GB 全 pin 会把可用内存吃到只剩 3GB（实测 ssh 都被挤掉），
+        #   2) L20 的 UnifiedAddressing=0，pageable 内存本来也没有可用的 device
+        #      指针，pin 了也只是把「谁在显存里」这件事挪个地方，没有收益。
+        # 真正让 CPU 退出 decode 的是「热点专家常驻显存槽位」（VramSlotCache.pin），
+        # 命中时 _materialize 直接返回显存 tensor，不碰 host、不等 CPU。
         try:
-            _ = buf
+            buf = mmap.mmap(-1, n)
         except (OSError, MemoryError, ValueError) as exc:
             raise MemoryError(
                 f"cannot reserve {n / (1 << 30):.1f}GB host pool: {exc}. "

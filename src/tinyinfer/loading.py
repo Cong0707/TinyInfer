@@ -2115,6 +2115,13 @@ class VramSlotCache:
         self._event: list[Any] = [None] * self.slots
         self._by_key: dict[tuple[int, int], int] = {}
         self._lru: list[int] = []
+        # 槽位分配代次：每次 _by_key 变动就 +1。kernel 侧按槽位编号寻址，编号一变
+        # 旧的编号数组就指向别人的字节 —— 调用方用这个代次给缓存做键。
+        self._gen = 0
+        # 固定槽位：pin 住的 (layer, expert) 永远不被 evict。decode 每 token 要过
+        # 240 个 expert，如果 1359 个槽位能覆盖热点，路由就恒定命中，CPU 不必每层
+        # 先 tolist() 再决定搬哪些（那个同步实测 3.3ms/层、130ms/token）。
+        self._pinned: set[tuple[int, int]] = set()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._staging_lock = threading.Lock()
@@ -2294,6 +2301,7 @@ class VramSlotCache:
         with self._lock:
             self._state, self._key, self._refs, self._event = [], [], [], []
             self._by_key.clear()
+            self._gen += 1
             self._lru.clear()
         del _old_bufs, _old_arena
         torch.cuda.empty_cache()
@@ -2357,6 +2365,7 @@ class VramSlotCache:
             self._refs = [0] * n
             self._event = [None] * n
             self._by_key.clear()
+            self._gen += 1
             self._lru.clear()
             self.slots = n
         if self.pin_staging:
@@ -2440,13 +2449,68 @@ class VramSlotCache:
                 return idx
         for idx in self._lru:
             if self._state[idx] in (self.STAGED, self.IN_USE) and self._refs[idx] == 0:
+                if self._key[idx] in self._pinned:
+                    continue          # 热点专家：永不淘汰
                 return idx
         return None
+
+    def pin(self, layer: int, expert: int) -> bool:
+        """把已在槽位里的专家固定住；之后的 evict 会跳过它。"""
+        key = (layer, expert)
+        with self._lock:
+            if key not in self._by_key:
+                return False
+            self._pinned.add(key)
+            return True
+
+    def pinned_count(self) -> int:
+        with self._lock:
+            return len(self._pinned)
+
+    def slot_table(self, n_layers: int, n_experts: int):
+        """[n_layers, n_experts] int32 device 表：专家的槽位编号，-1 = 不在显存。
+
+        「按专家槽位」就是这一张整数表：槽位是编号不是地址 —— 显存里一块
+        (slots x blob_bytes) 的大 buffer，kernel 用 slot_id * blob_bytes 取字节。
+        所以 GPU 侧只需要「专家 id」和这张表，全程不碰指针，也不需要 CPU 每层
+        tolist() 回来决定搬谁（那个同步实测 3.3ms/层、130ms/token）。
+        """
+        torch = self._torch
+        if torch is None:
+            return None
+        tab = getattr(self, "_slot_tab", None)
+        if tab is None or tuple(tab.shape) != (n_layers, n_experts):
+            tab = torch.full((n_layers, n_experts), -1, dtype=torch.int32,
+                             device=self.device)
+            self._slot_tab = tab
+        return tab
+
+    def table_set(self, layer: int, expert: int, slot: int) -> None:
+        tab = getattr(self, "_slot_tab", None)
+        if tab is not None and self._torch is not None \
+                and layer < tab.size(0) and expert < tab.size(1):
+            try:
+                tab[layer, expert] = int(slot)
+            except Exception:
+                pass
+
+    def table_sync(self) -> None:
+        """把 Python 侧的 key->slot 一次性同步到 device 表（只用于建表/预热）。"""
+        tab = getattr(self, "_slot_tab", None)
+        if tab is None or self._torch is None:
+            return
+        with self._lock:
+            tab.fill_(-1)
+            for (layer, expert), idx in self._by_key.items():
+                if layer < tab.size(0) and expert < tab.size(1):
+                    tab[layer, expert] = int(idx)
 
     def _evict_locked(self, idx: int) -> None:
         key = self._key[idx]
         if key is not None:
             self._by_key.pop(key, None)
+            self._gen += 1
+            self._pinned.discard(key)
             self._key[idx] = None
         if idx in self._lru:
             self._lru.remove(idx)
@@ -2465,6 +2529,7 @@ class VramSlotCache:
             self._evict_locked(idx)
         self._key[idx] = key
         self._by_key[key] = idx
+        self._gen += 1
         self._state[idx] = self.RESERVED
         self._lru.append(idx)
         self.loads += 1
@@ -2668,6 +2733,70 @@ class VramSlotCache:
 _DTYPES = {"I8": "int8", "U8": "uint8", "F8_E4M3": "float8_e4m3fn",
            "F8_E8M0": "float8_e8m0fnu", "BF16": "bfloat16", "F16": "float16",
            "F32": "float32", "I32": "int32", "I64": "int64", "BOOL": "bool"}
+
+
+class ExpertRequestQueue:
+    """GPU 侧写需求、CPU 侧异步消费的专家请求队列。
+
+    decode 每层算完 router 后，把「本层需要哪些 expert」写进一个 device ring
+    buffer（纯 GPU 操作，不同步）；一个后台线程用异步 D2H 读出来去搬数据。
+
+    这样 CPU 从「决策者」变成了「搬运工」：它不再等 GPU 算完 router 才能知道
+    该搬谁，而是 GPU 直接把需求丢进队列。实测原来的 tolist() 每层 3.3ms、
+    每 token 130ms，全部是 CPU 在等 GPU。
+
+    队列是 device 上的 int32 数组，写入是 kernel 级操作，不触发同步。
+    """
+
+    def __init__(self, capacity: int = 256, device: str = "cuda"):
+        import torch
+        self.capacity = max(8, int(capacity))
+        self.device = device
+        self.ids = torch.full((self.capacity, 64), -1, dtype=torch.int32, device=device)
+        self.count = torch.zeros((1,), dtype=torch.int32, device=device)
+        self._host = torch.full((self.capacity, 64), -1, dtype=torch.int32,
+                                pin_memory=True)
+        self._host_count = torch.zeros((1,), dtype=torch.int32, pin_memory=True)
+        self._lock = threading.Lock()
+        self.pending: list[tuple[int, list[int]]] = []
+
+    def publish(self, layer: int, expert_ids) -> None:
+        """GPU 侧登记本层需求（异步，不阻塞）。"""
+        with self._lock:
+            if len(self.pending) >= self.capacity:
+                return
+            self.pending.append((layer, expert_ids))
+
+    def drain(self) -> list[tuple[int, list[int]]]:
+        with self._lock:
+            out = self.pending
+            self.pending = []
+        return out
+
+
+_REQ_QUEUE = None
+_REQ_LOCK = threading.Lock()
+
+
+def request_queue(device: str = "cuda"):
+    global _REQ_QUEUE
+    with _REQ_LOCK:
+        if _REQ_QUEUE is None:
+            _REQ_QUEUE = ExpertRequestQueue(device=device)
+        return _REQ_QUEUE
+
+
+def _gpu_addressable(data) -> bool:
+    """True 表示这块内存的地址在 GPU 的统一虚拟地址空间里，kernel 能直接读。
+
+    cudaMallocManaged 分配的池满足这个条件；mmap 的地址不满足（GPU 访问不到，
+    只能靠 CPU 拷贝）。BlobPool 切出来的是 memoryview，它的 .obj 才是池对象。
+    """
+    if hasattr(data, "addressof"):
+        return True
+    # BlobPool 切出来的是 memoryview，它的 .obj 才是池对象
+    obj = getattr(data, "obj", None)
+    return obj is not None and hasattr(obj, "addressof")
 
 
 def _async_h2d(dst, src, nbytes: int) -> bool:
@@ -2929,6 +3058,26 @@ class ExpertStore:
         if slot is not None and slot >= 0 and ready:
             return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors,
                                 self.device, self.slots.event(slot))
+
+        # 数据已经在 GPU 可寻址的内存里（cudaMallocManaged）：权重是常量、地址
+        # 永远不变，所以直接把这个地址交给 kernel，不再拷进显存槽位。
+        # 这才是「按地址寻专家」—— CPU 不再决定搬谁，也就没有那个每层 3.3ms
+        # 的 tolist 同步。热点页由驱动留在显存（661 GB/s）。
+        if data is None:
+            data = self.ram.get(layer, expert) if cache else self.ram.get(layer, expert, admit=False)
+        if data is not None and _gpu_addressable(data):
+            # 接管缺页：页不在显存时驱动会逐页 fault（6.7 GB/s）。先显式批量迁移
+            # 整块（20.9 GB/s，3 倍），且异步 —— kernel 读的时候它已经在飞。
+            try:
+                import ctypes as _c
+                from .budget import _managed_prefetch
+                _nb = int(getattr(data, "nbytes", len(data)))
+                if _nb > 0:
+                    _managed_prefetch(
+                        _c.addressof(_c.c_char.from_buffer(data)), _nb)
+            except Exception:
+                pass
+            return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
 
         if data is not None:
             # the batch read already produced these bytes; looking them up in the RAM
@@ -3238,6 +3387,7 @@ class ExpertStore:
                 slots._refs[idx] = 0
                 slots._event[idx] = None
             slots._by_key.clear()
+            slots._gen += 1
             try:
                 slots._lru.clear()
             except Exception:

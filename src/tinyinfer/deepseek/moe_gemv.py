@@ -56,62 +56,39 @@ def _check(n_rows: int, k_dim: int) -> None:
         raise ValueError(f"moe_gemv: unsupported shape n_rows={n_rows} k_dim={k_dim}")
 
 
-# Pointer arrays are staged through pinned memory, because building them with
-# torch.tensor(list, device="cuda") is a pageable H2D that synchronises the stream first:
-# at decode that is 8 arrays per layer (320 per step, measured 441us each, 141ms of an
-# 805ms step). The staging arrays CANNOT be shared or recycled on a short cycle --
-# copy_ from pinned memory only queues the DMA, so a reused host buffer is overwritten
-# while the copy is still pending and the kernel reads a pointer array belonging to a
-# different projection. The symptom is not a crash but decode collapsing into one
-# repeated token. A pool large enough to cover far more calls than can be in flight is
-# therefore used, and a slot is only ever rewritten after the stream has long passed it.
-_PTR_RING = 16
-_ptr_pool: dict[tuple, list] = {}
-_ptr_next = [0]
-_host_views: dict[int, "np.ndarray"] = {}
-# 指针数组按「专家组合」缓存：组合相同就是同一份字节，不需要再发 H2D。
-# 上限 4096 条，超了整体清空（比 LRU 简单，且这些条目创建成本很低）。
-_PTR_CACHE: dict = {}
+# 槽位编号，不是指针。显存里是一块 (slots x blob_bytes) 的 arena，kernel 用
+# slot_id * blob_bytes 取这个专家的字节。
+#
+# 每层送一行编号（各层专家组合不同），所以按「层」持有一对 pinned host / device
+# 缓冲，每次覆盖写。不能按 (代次, 组合) 缓存再发新 tensor：那样每层每 token 都是
+# 一次新的 pageable H2D（同步），40 层就是一 token 四十次全设备停顿；而用一个只有
+# 十几个槽的共享环更糟 —— 每层都在写，环很快被占满，复制会在 DMA 还没完成时被
+# 下一层覆盖（这正是老指针数组注释里记的那个「decode 塌成一个重复 token」）。
+# 按层复用意味着同一份 buffer 要过整层 40 层才会被写第二次，DMA 早就完成了。
+_SLOT_BUF: dict = {}
 
 
-def _ptrs(tensors) -> torch.Tensor:
-    """Device pointer array for one launch (staged through pinned memory).
-
-    Each slot is its own tensor, not a row of a bigger one: a slice of a pinned tensor
-    loses the pinned flag on the copy path, so ``copy_`` fell back to a synchronising
-    pageable copy. That was measurable -- the n=6 arrays (down projection) cost 923us
-    each while the n=12 ones were 6us, and the difference is exactly one queue drain.
-    """
-    dev = tensors[0].device
-    n = len(tensors)
-    # Pad to a 16-element (128-byte) multiple. A 6-element array is 48 bytes, and the
-    # copy of it was measured at 923us against 6us for the 12-element one -- a
-    # sub-DMA-granularity async copy is not a fast path. The kernels index the array by
-    # expert, so the padding is never read; only the transfer width changes.
+def slot_ids(slots_dev, layer: int, ids) -> torch.Tensor:
+    """int32 device [E]：本层 active 专家的槽位编号（覆盖写该层自己的缓冲）。"""
+    ids = list(ids)
+    n = len(ids)
+    if n <= 0:
+        return torch.empty(0, dtype=torch.int32, device=slots_dev)
+    key = (slots_dev, int(layer))
+    buf = _SLOT_BUF.get(key)
+    # 补齐到 16 的倍数：sub-DMA 粒度的异步拷贝不是快路径（实测 48 字节的 copy
+    # 要 923us，192 字节的只要 6us）。
     width = ((n + 15) // 16) * 16
-    key = (dev, width)
-    pool = _ptr_pool.get(key)
-    if pool is None:
-        if len(_ptr_pool) > 32:
-            _ptr_pool.clear()
-        pool = _ptr_pool[key] = [
-            (torch.empty(width, dtype=torch.int64, pin_memory=True),
-             torch.empty(width, dtype=torch.int64, device=dev))
-            for _ in range(_PTR_RING)]
-    i = _ptr_next[0]
-    _ptr_next[0] = (i + 1) % _PTR_RING
-    host, gpu = pool[i]
-    # One write into the pinned block, not one ``aten::copy_`` per element. The loop that
-    # used to be here issued a kernel launch per pointer (12 per call, 4 calls per layer,
-    # ~1920 per decode step) purely to move 8 bytes into host memory that a plain store
-    # could write. numba-free numpy view: the pinned allocation is already host memory,
-    # so this is a memcpy the CPU does inline.
-    _host_np = _host_views.get(id(host))
-    if _host_np is None:
-        _host_np = _host_views[id(host)] = host.numpy()
-    _host_np[:n] = [t.data_ptr() for t in tensors]
-    gpu.copy_(host, non_blocking=True)
-    return gpu
+    if buf is None or buf[0].numel() < width:
+        if len(_SLOT_BUF) > 512:
+            _SLOT_BUF.clear()
+        buf = _SLOT_BUF[key] = (
+            torch.empty(width, dtype=torch.int32, pin_memory=True),
+            torch.empty(width, dtype=torch.int32, device=slots_dev))
+    host, dev = buf
+    host.numpy()[:n] = ids
+    dev[:width].copy_(host, non_blocking=True)
+    return dev[:n]
 
 
 def _e8m0_bytes(s: torch.Tensor) -> torch.Tensor:
@@ -121,23 +98,23 @@ def _e8m0_bytes(s: torch.Tensor) -> torch.Tensor:
     return s.view(torch.uint8)
 
 
-def gate_up(aq: torch.Tensor, asc: torch.Tensor, w1, s1, w3, s3) -> torch.Tensor:
-    """[n_exp, 2*n_rows] bf16: gate rows first, then up rows, per expert."""
-    n_exp = len(w1)
-    n_rows, khalf = w1[0].shape
-    k_dim = khalf * 2
+def gate_up(aq: torch.Tensor, asc: torch.Tensor, arena: torch.Tensor,
+            slots: torch.Tensor, blob_bytes: int, geom: tuple[int, int],
+            offs: tuple[int, int, int, int]) -> torch.Tensor:
+    """[n_exp, 2*n_rows] bf16: gate rows first, then up rows, per expert.
+
+    ``arena`` 是 (slots x blob_bytes) 的显存大 buffer，``slots`` 是每个 active
+    专家的槽位编号，``offs`` 是 w1/s1/w3/s3 在 blob 里的字节偏移（同一层所有
+    专家一致）。kernel 取 ``arena + slot*blob_bytes + off``，不问地址。
+    """
+    n_exp = int(slots.numel())
+    n_rows, k_dim = int(geom[0]), int(geom[1])
     _check(n_rows, k_dim)
     out = torch.empty((n_exp, 2 * n_rows), dtype=torch.bfloat16, device=aq.device)
-    wl: list = []
-    sl: list = []
-    for e in range(n_exp):
-        wl.append(w1[e])
-        wl.append(w3[e])
-        sl.append(s1[e])
-        sl.append(s3[e])
+    w1_off, s1_off, w3_off, s3_off = (int(o) for o in offs)
     native.launch(_kernel("moe_gemv6"), ((n_rows + 15) // 16, n_exp, 2), (512,),
-                  [aq, _e8m0_bytes(asc), _ptrs(wl), _ptrs(sl), out, n_rows, k_dim, n_exp,
-                   0, 0], 0)   # one activation row and one scale row shared by every expert
+                  [aq, _e8m0_bytes(asc), arena, slots, out, n_rows, k_dim, n_exp,
+                   0, 0, int(blob_bytes), w1_off, s1_off, w3_off, s3_off], 0)
     return out
 
 
@@ -190,23 +167,20 @@ def act_quant(gu: torch.Tensor, w_exp: torch.Tensor, limit: float = 0.0):
     return aq.view(torch.float8_e4m3fn), asc.view(torch.float8_e8m0fnu)
 
 
-def down(aq: torch.Tensor, asc: torch.Tensor, w2, s2) -> torch.Tensor:
+def down(aq: torch.Tensor, asc: torch.Tensor, arena: torch.Tensor,
+         slots: torch.Tensor, blob_bytes: int, geom: tuple[int, int],
+         w_off: int, s_off: int) -> torch.Tensor:
     """[n_exp, 2*n_rows] bf16: one down projection per expert, plane 0 used."""
-    n_exp = len(w2)
-    n_rows, khalf = w2[0].shape
-    k_dim = khalf * 2
+    n_exp = int(slots.numel())
+    n_rows, k_dim = int(geom[0]), int(geom[1])
     _check(n_rows, k_dim)
     out = torch.empty((n_exp, 2 * n_rows), dtype=torch.bfloat16, device=aq.device)
-    # grid.z stays two planes wide so the kernel's plane indexing is untouched; only
-    # plane 0 is launched and only the first n_rows of each expert are consumed. The
-    # pointers must be interleaved -- [w_e0, w_e0, w_e1, w_e1, ...] -- because the kernel
-    # indexes them as w_ptrs[e*2 + which]; concatenating two copies instead paired expert
-    # e with expert (2e)'s weights.
-    wl = [t for w in w2 for t in (w, w)]
-    sl = [t for s in s2 for t in (s, s)]
+    # grid.z 仍然是 2 个 plane，只有 plane 0 被真正消费；两个 plane 都指向同一
+    # 组槽位，所以 which 的两种取值拿到的是同一段权重（之前靠指针交错实现）。
     native.launch(_kernel("moe_gemv6"), ((n_rows + 15) // 16, n_exp, 1), (512,),
-                  [aq, _e8m0_bytes(asc), _ptrs(wl), _ptrs(sl), out, n_rows, k_dim, n_exp,
-                   k_dim, k_dim // 32], 0)   # [n_exp, k_dim] activation and scale rows
+                  [aq, _e8m0_bytes(asc), arena, slots, out, n_rows, k_dim, n_exp,
+                   k_dim, k_dim // 32, int(blob_bytes), int(w_off), int(s_off),
+                   int(w_off), int(s_off)], 0)
     return out
 
 

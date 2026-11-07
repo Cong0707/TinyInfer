@@ -91,6 +91,43 @@ def window_idxs_general(start_pos: int, seqlen: int, old_len: int, window: int, 
     return torch.where(valid, idx, torch.full_like(idx, -1)).int()
 
 
+def window_idxs_ring(start_pos: int, seqlen: int, old_len: int, window: int, device=None) -> torch.Tensor:
+    """环形 cache 的窗口槽位：位置 p 存在 p % window 这一格。
+
+    vLLM 的 paged cache 也是这个形状 —— 缓存一旦分配就是 fixed 的 slot 池，写入
+    按 slot_mapping 落到某一格，读取按 block table 取，历史永远不搬。这里的
+    slot 就是 position % window，所以窗口索引只依赖绝对位置，不再依赖「历史
+    被移动过多少」（旧实现每 token 都要 buf[:, :n_old].copy_(old.clone()) 把整个
+    历史左移一格）。
+
+    Returns [seqlen, window] int32, -1 = 还没写过的位置。
+    """
+    back = torch.arange(window - 1, -1, -1, device=device)
+    gpos = torch.arange(start_pos, start_pos + seqlen, device=device)[:, None] - back[None, :]
+    idx = gpos % window
+    valid = gpos >= 0
+    return torch.where(valid, idx, torch.full_like(idx, -1)).int()
+
+
+# 窗口索引按 (起始位置, s, window) 缓存：一个 decode step 里 40 层看到的是同一组
+# 槽位，而生成它要 arange/remainder/ge/full_like/where 五个 kernel。旧代码只有
+# 「窗口刚好满」这一种情况才复用 _decode_idxs，窗口没满的那几百个 token 里每层
+# 都重算一遍 —— 40 层 x 5 个 kernel，纯粹是重复劳动。
+_RING_IDX: dict = {}
+
+
+def window_idxs_ring_cached(start_pos: int, seqlen: int, window: int, device) -> torch.Tensor:
+    key = (int(start_pos), int(seqlen), int(window), str(device))
+    hit = _RING_IDX.get(key)
+    if hit is not None:
+        return hit
+    if len(_RING_IDX) > 8192:
+        _RING_IDX.clear()
+    t = window_idxs_ring(start_pos, seqlen, 0, window, device)
+    _RING_IDX[key] = t
+    return t
+
+
 def window_idxs_per_row(positions, seqlen: int, old_len, window: int, device=None) -> torch.Tensor:
     """Window slots for a batch whose rows are at different depths.
 
@@ -190,11 +227,70 @@ def sample_logits(logits: torch.Tensor, temperature: float = 0.0, top_p: float =
     return int(torch.multinomial(probs, 1))
 
 
+_ROPE_FN = None
+
+
+def _rope_kernel():
+    """rope.cu 的原地 kernel（一个 launch 替掉 拷贝+kernel+拷贝 三个）。"""
+    global _ROPE_FN
+    if _ROPE_FN is None:
+        from .kernels import native
+        _ROPE_FN = native.kernel("rope", "rope_inplace_bf")
+    return _ROPE_FN
+
+
+def _apply_rope_cuda(x: torch.Tensor, freqs_cis: torch.Tensor,
+                     inverse: bool):
+    """原地 CUDA rope。返回 None 表示这个形状走不了（调用方用 torch 版）。
+
+    apply_rope 的调用方都是拿 x 的切片当原地函数用（老实现最后一句就是
+    y.copy_(out)），所以这里也原地写回并返回 x。
+
+    非原地版的代价：x 是 q[..., -rope_dim:] 这种切片，最后一维连续但 head 之间
+    有间隔，reshape 必然产生副本，于是每次调用是 拷贝 + kernel + copy_ 三个，
+    实测每 token 八十次 copy_。这里把 head 的 stride 交给 kernel，一个 launch 完成。
+    """
+    if not x.is_cuda or x.dtype != torch.bfloat16 or x.dim() < 2:
+        return None
+    rot = int(x.shape[-1])
+    if rot <= 0 or (rot & 1):
+        return None
+    if x.stride(-1) != 1:
+        return None
+    # 这个 kernel 按「所有行共用当前这一步的 (cos, sin) 表」工作，也就是 decode
+    # 形状。prefill 每一行位置不同，走 torch 那条路（chunk 不是热路径）。
+    if freqs_cis.dim() < 2 or int(freqs_cis.shape[0]) != 1:
+        return None
+    outer = 1
+    for v in x.shape[:-2]:
+        outer *= int(v)
+    if outer != 1:
+        return None
+    heads = int(x.shape[-2])
+    hstride = int(x.stride(-2))
+    if heads <= 0 or hstride < rot:
+        return None
+    # freqs_cis: complex [1, rot/2] -> (cos, sin) 交错的 fp32 表
+    fr = torch.view_as_real(freqs_cis.reshape(1, rot // 2)).reshape(1, rot)
+    if fr.dtype != torch.float32:
+        fr = fr.to(torch.float32)
+    pairs = heads * (rot >> 1)
+    blk = 256
+    grid = ((pairs + blk - 1) // blk,)
+    from .kernels import native
+    native.launch(_rope_kernel(), grid, (blk,),
+                  [x, fr, heads, hstride, rot, 1 if inverse else 0], 0)
+    return x
+
+
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """Rotate adjacent element pairs as complex numbers; accepts [b,s,d] or [b,s,h,d].
 
     Used both for queries/keys and, with inverse=True, to un-rotate the attention output.
     """
+    _r = _apply_rope_cuda(x, freqs_cis, inverse)
+    if _r is not None:
+        return _r
     y = x
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:

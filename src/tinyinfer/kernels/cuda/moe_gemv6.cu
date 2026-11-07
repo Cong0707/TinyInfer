@@ -113,12 +113,13 @@ __device__ __forceinline__ float gemv_row(const unsigned char* __restrict__ a,
 }
 
 extern "C" __global__ void moe_gemv6(
-    const unsigned char* __restrict__ a,    // [K] fp8 e4m3
-    const unsigned char* __restrict__ as,   // [nb] e8m0 bytes
-    const long long* __restrict__ w_ptrs,   // [2E]
-    const long long* __restrict__ s_ptrs,   // [2E]
-    __nv_bfloat16* __restrict__ y,          // [E, 2N]
-    int n_rows, int k_dim, int n_experts, int act_stride, int scale_stride) {
+    const unsigned char* __restrict__ a,     // [K] fp8 e4m3
+    const unsigned char* __restrict__ as,    // [nb] e8m0 bytes
+    const unsigned char* __restrict__ arena, // [slots][blob_bytes] 槽位大 buffer
+    const int* __restrict__ slot_ids,        // [E] 每个 active 专家的槽位编号
+    __nv_bfloat16* __restrict__ y,           // [E, 2N]
+    int n_rows, int k_dim, int n_experts, int act_stride, int scale_stride,
+    int blob_bytes, int w_off, int s_off, int w_off_alt, int s_off_alt) {
     __shared__ float lut[16];
     if (threadIdx.x < 16) lut[threadIdx.x] = kFp4Table[threadIdx.x];
     __syncthreads();
@@ -128,9 +129,13 @@ extern "C" __global__ void moe_gemv6(
     if (n >= n_rows) return;
     const int e = blockIdx.y;
     const int which = blockIdx.z;
-    const unsigned char* w = (const unsigned char*)w_ptrs[e * 2 + which]
+    // 槽位编号就是虚拟地址：权重在同一块 arena 里按 slot * blob_bytes 定位，
+    // 再按本层的固定偏移取 w/s。GPU 侧全程不碰指针，CPU 也不必每层把指针
+    // 数组 H2D 一次 —— slot_ids 是 12 个 int32，且专家组合固定时就是同一份字节。
+    const long long _base = (long long)slot_ids[e] * blob_bytes;
+    const unsigned char* w = arena + _base + (which ? w_off_alt : w_off)
                            + (long long)n * (k_dim >> 1);
-    const unsigned char* ws = (const unsigned char*)s_ptrs[e * 2 + which]
+    const unsigned char* ws = arena + _base + (which ? s_off_alt : s_off)
                             + (long long)n * (k_dim >> 5);
     // gate/up share one activation row and one scale row across experts (stride 0);
     // the down projection consumes a per-expert [E, K] pair (stride K and K/32)
@@ -143,10 +148,11 @@ extern "C" __global__ void moe_gemv6(
 extern "C" __global__ void moe_gemv6_bf16(
     const __nv_bfloat16* __restrict__ a,    // [K] bf16
     const unsigned char* __restrict__ as,   // unused on this path (no block scale)
-    const long long* __restrict__ w_ptrs,   // [2E]
-    const long long* __restrict__ s_ptrs,   // [2E]
-    __nv_bfloat16* __restrict__ y,          // [E, 2N]
-    int n_rows, int k_dim, int n_experts, int act_stride) {
+    const unsigned char* __restrict__ arena, // [slots][blob_bytes]
+    const int* __restrict__ slot_ids,        // [E]
+    __nv_bfloat16* __restrict__ y,           // [E, 2N]
+    int n_rows, int k_dim, int n_experts, int act_stride,
+    int blob_bytes, int w_off, int s_off, int w_off_alt, int s_off_alt) {
     __shared__ float lut[16];
     if (threadIdx.x < 16) lut[threadIdx.x] = kFp4Table[threadIdx.x];
     __syncthreads();
@@ -156,9 +162,11 @@ extern "C" __global__ void moe_gemv6_bf16(
     if (n >= n_rows) return;
     const int e = blockIdx.y;
     const int which = blockIdx.z;
-    const unsigned char* w = (const unsigned char*)w_ptrs[e * 2 + which]
+    // 同 moe_gemv6：槽位编号 × blob_bytes + 层内固定偏移。
+    const long long _base = (long long)slot_ids[e] * blob_bytes;
+    const unsigned char* w = arena + _base + (which ? w_off_alt : w_off)
                            + (long long)n * (k_dim >> 1);
-    const unsigned char* ws = (const unsigned char*)s_ptrs[e * 2 + which]
+    const unsigned char* ws = arena + _base + (which ? s_off_alt : s_off)
                             + (long long)n * (k_dim >> 5);
     // bf16 has no per-block scale, so only the activation row moves with the expert
     const float acc = gemv_row<1>((const unsigned char*)a + (long long)e * act_stride,

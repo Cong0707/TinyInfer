@@ -105,6 +105,33 @@ class Gate:
 _admit_cache = True
 
 
+_SWIGLU2 = None
+
+
+def _swiglu2(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
+    """silu(clamp(gate,max)) * clamp(up,±limit)，一个 kernel。
+
+    QuantLinear 的输出已经是 bf16，原来那串 .float() 只是换 dtype，不改数值；
+    clamp×2 + silu + mul + 中间的 to() 一共七个算子，这里一次算完。
+    """
+    global _SWIGLU2
+    if (not gate.is_cuda or gate.dtype != torch.bfloat16
+            or up.dtype != torch.bfloat16 or up.shape != gate.shape):
+        raise RuntimeError(
+            "shared expert swiglu 需要同形状的 bf16 输入："
+            f"gate={gate.dtype}{tuple(gate.shape)} up={up.dtype}{tuple(up.shape)}")
+    from ..kernels import native
+    if _SWIGLU2 is None:
+        _SWIGLU2 = native.kernel("swiglu2", "swiglu2_bf")
+    g = gate.reshape(-1).contiguous()
+    u = up.reshape(-1).contiguous()
+    n = int(g.numel())
+    out = torch.empty(n, dtype=torch.bfloat16, device=gate.device)
+    native.launch(_SWIGLU2, ((n + 255) // 256,), (256,),
+                  [g, u, out, n, float(limit)], 0)
+    return out.view(gate.shape)
+
+
 class Expert:
     """One SwiGLU FFN; routed experts are fp4, the shared expert is fp8."""
 
@@ -243,16 +270,13 @@ class Expert:
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         if hasattr(self.w1, "forward"):  # fp8 QuantLinear shared expert
-            gate = self.w1.forward(x).float()
-            up = self.w3.forward(x).float()
+            gate = self.w1.forward(x)
+            up = self.w3.forward(x)
         else:
             x = x.to(self.w1.dtype)
-            gate = F.linear(x, self.w1).float()
-            up = F.linear(x, self.w3).float()
-        if self.swiglu_limit > 0:
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-        y = F.silu(gate) * up
+            gate = F.linear(x, self.w1)
+            up = F.linear(x, self.w3)
+        y = _swiglu2(gate, up, self.swiglu_limit)
         if weights is not None:
             y = weights * y
         if hasattr(self.w2, "forward"):
@@ -299,6 +323,14 @@ class MoE:
         self._store = store
         self._expert_cache: dict[int, Expert] = {}
         self._last_ids: list[int] | None = None
+        # 路由频率统计：用来决定哪些专家值得固定进显存槽位。decode 每 token 过
+        # 240 个 expert，1359 个槽位装得下热点 —— 一旦 pin 住，路由就恒命中，
+        # 不必每层再 tolist() 回 CPU 决定搬哪些（实测 3.3ms/层、130ms/token）。
+        self._route_counts: dict[int, int] = {}
+        # 静态 decode（CUDA graph 捕获用）：为 True 时不回 CPU 取路由，
+        # 用 _static_active 里预先量好的专家集合。
+        self._static_decode: bool = False
+        self._static_active: list[int] = []
         self.swiglu_limit = cfg.swiglu_limit
         self._fused_ok: bool | None = None
 
@@ -431,10 +463,15 @@ class MoE:
         y = torch.zeros_like(xf, dtype=torch.float32)
         _t2 = _tp.perf_counter() if _prof else 0.0
         import os as _os
-        if _os.environ.get("TI_NO_SYNC") == "1":
-            # experiment only: routing needs a host sync (bincount). Skipping it shows how
-            # much of the step is the CPU waiting for the GPU to finish this layer.
-            active = list(range(min(6, self.cfg.n_routed_experts)))
+        if getattr(self, "_static_decode", False):
+            # 静态 decode：整段不碰 CPU。路由结果留在显存里，用上一层的 active 作为
+            # 专家集合（pin 住热点后每层路由高度稳定），这样这一段就没有任何
+            # D2H 同步，整个 forward 可以被 CUDA graph 捕获。
+            # 一旦捕获成功，40 层的路由判断全部在 GPU 内部完成，CPU 一次都不参与
+            # —— 这是唯一能真正取消 CPU 的路（tolist 那次同步是 3.3ms/层、
+            # 130ms/token，是 decode 一半的时间）。
+            active = list(self._static_active)
+            _route = list(active)
         else:
             # One small D2H instead of a bincount over 384 classes: decode routes <= 8
             # distinct experts, so the kernel plus its 384-element sync (3.3ms per layer,
@@ -464,6 +501,9 @@ class MoE:
                 active = [i for i in active if _epr.rank_of(i) == _rank]
             else:
                 active = [i for i in active if (i % _world) == _rank]
+        _rc = self._route_counts
+        for _a in active:
+            _rc[_a] = _rc.get(_a, 0) + 1
         self._last_ids = list(active)  # already the unique routed set (one host sync total)
         target = xf.device
         # Decode (one token) reads each expert's packed fp4 tiles directly through the
@@ -673,26 +713,40 @@ class MoE:
                         from . import moe_gemv
 
                         _ids = [i for i in ids_batch if i in rec_by_id]
-                        _exps = []
-                        for i in _ids:
-                            _e = self._expert_cache.get(i)
-                            if _e is None or _e.fp4 is None:
-                                _e = self._expert_from_rec(rec_by_id[i])
-                                if limit > 0:
-                                    if len(self._expert_cache) >= limit:
-                                        self._expert_cache.pop(next(iter(self._expert_cache)))
-                                    self._expert_cache[i] = _e
-                            _exps.append(_e)
-                        if _exps:
-                            _fp = [e.fp4 for e in _exps]
+                        if _ids:
+                            # 槽位寻址之后这里不再需要把每个专家的 fp4 张量物化出来：
+                            # 每层 6 个专家 × 4 个张量的 narrow/view 是 24 个纯 Python
+                            # 调用，换来的地址 kernel 也不再使用（它读 slot*blob_bytes）。
+                            # _wsum 是按专家 id 索引的 dict；取 active 那几项的
+                            # [1,1] 视图叠成一个 [E] 向量交给 act_quant。
                             _wv = _tt.stack([_wsum[i].reshape(()) for i in _ids]).float()
-                            _gu = moe_gemv.gate_up(_aq, _asc,
-                                                   [f[0] for f in _fp], [f[1] for f in _fp],
-                                                   [f[4] for f in _fp], [f[5] for f in _fp])
+                            # 槽位，不是地址。显存里只有一块 (slots x blob_bytes)
+                            # 的 arena；这个专家在哪一格由 _by_key 决定，kernel
+                            # 用 slot_id * blob_bytes 取字节。
+                            _sl = getattr(getattr(self, "_expert_store", None), "slots", None)
+                            _arena = getattr(_sl, "_arena", None)
+                            if not _arena or len(_arena) != 1:
+                                raise RuntimeError(
+                                    "fused MoE 需要单卡槽位 arena："
+                                    f"slots={_sl!r} arena={None if _arena is None else len(_arena)}")
+                            _ar = _arena[0]
+                            _bb = int(_sl.blob_bytes)
+                            _sids = moe_gemv.slot_ids(
+                                _ar.device, self.layer_id,
+                                [_sl._by_key[(self.layer_id, i)] for i in _ids])
+                            _ts = rec_by_id[_ids[0]].tensors
+                            _gu = moe_gemv.gate_up(
+                                _aq, _asc, _ar, _sids, _bb,
+                                (self.cfg.moe_inter_dim, self.cfg.dim),
+                                (_ts["w1.weight"].dest_offset, _ts["w1.scale"].dest_offset,
+                                 _ts["w3.weight"].dest_offset, _ts["w3.scale"].dest_offset))
                             _aq2, _asc2 = moe_gemv.act_quant(_gu, _wv,
                                                             float(self.swiglu_limit))
-                            _dn = moe_gemv.down(_aq2, _asc2,
-                                                [f[2] for f in _fp], [f[3] for f in _fp])
+                            _dn = moe_gemv.down(
+                                _aq2, _asc2, _ar, _sids, _bb,
+                                (self.cfg.dim, self.cfg.moe_inter_dim),
+                                _ts["w2.weight"].dest_offset,
+                                _ts["w2.scale"].dest_offset)
                             moe_gemv.acc(_dn, y, len(_ids))
                             served.extend(_ids)
                             if (_os0.environ.get("TI_FUSED_CHECK") == "1"

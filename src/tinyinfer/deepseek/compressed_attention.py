@@ -121,6 +121,15 @@ class MLACompressedAttention:
         self._st()["kv"] = value
 
     @property
+    def _kv_len(self) -> int:
+        """已写入 cache 的绝对长度（环形槽位下不等于 buffer 宽度）。"""
+        return int(self._st().get("klen", 0))
+
+    @_kv_len.setter
+    def _kv_len(self, value) -> None:
+        self._st()["klen"] = int(value)
+
+    @property
     def _kv_buf(self):
         """Pre-allocated sliding-window staging buffer (fixed address, no per-token cat)."""
         return self._st().get("winbuf")
@@ -252,32 +261,45 @@ class MLACompressedAttention:
             from ..kernels.quant import act_quant
             kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
 
-        old = self._kv_window if self._kv_window is not None else kv.new_empty(b, 0, self.head_dim)
-        # pre-allocated staging: shift + append in place instead of torch.cat, which
-        # allocated a new tensor every token and made the decode step uncapturable
-        cap = self.window + s
+        # ---- vLLM 式槽位 cache（同 MLAWindowAttention）----
+        # 位置 p 写进 p % window 那一格，历史永不移动。旧实现在这里做三份拷贝：
+        # 历史左移（clone + copy_）、新块 copy_、以及把不连续切片交给 attention
+        # 时的 .contiguous() —— 每层每 token 都在搬整个窗口。
         buf = self._kv_buf
-        if buf is None or buf.shape[0] != b or buf.shape[1] < cap or buf.dtype != kv.dtype:
-            buf = kv.new_empty(b, cap, self.head_dim)
+        if (buf is None or buf.shape[0] != b or buf.shape[1] != self.window
+                or buf.dtype != kv.dtype or buf.device != kv.device):
+            buf = kv.new_empty(b, self.window, self.head_dim)
             self._kv_buf = buf
-        n_old = old.size(1)
-        if n_old > 0:
-            buf[:, :n_old].copy_(old.clone())
-        buf[:, n_old:n_old + s].copy_(kv)
-        kv_w = buf[:, :n_old + s]
-        full = s == 1 and old.size(1) == self.window
+            self._decode_win_idxs = None
+        if s == 1:
+            buf[:, start_pos % self.window] = kv[:, 0]
+        else:
+            if s > self.window:
+                _kv = kv[:, s - self.window:]
+                _slots = torch.arange(start_pos + s - self.window, start_pos + s,
+                                      device=x.device) % self.window
+            else:
+                _kv = kv
+                _slots = torch.arange(start_pos, start_pos + s, device=x.device) % self.window
+            buf.index_copy_(1, _slots, _kv)
+        kv_w = buf
+        n_old = min(start_pos, self.window)
+        full = s == 1 and n_old == self.window
         if full and self._decode_win_idxs is not None:
             win_idxs = self._decode_win_idxs
         else:
             if positions is not None and positions.numel() == b and b > 1:
                 from ..nn import window_idxs_per_row
-                win_idxs = window_idxs_per_row(positions, s, old.size(1), self.window, x.device)
+                win_idxs = window_idxs_per_row(positions, s, n_old, self.window, x.device)
             else:
-                win_idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
+                from ..nn import window_idxs_ring_cached
+                win_idxs = window_idxs_ring_cached(start_pos, s, self.window,
+                                                   x.device).unsqueeze(0).expand(b, -1, -1)
             if full:
                 self._decode_win_idxs = win_idxs
-        # view into the staging buffer, not a per-token allocation (see MLAWindowAttention)
-        self._kv_window = kv_w[:, -self.window:]
+        # 整块 cache 就是 attention 的输入：地址固定、连续，没有切片也没有拷贝
+        self._kv_window = buf
+        self._kv_len = start_pos + s
 
         # ---- compressed KV ----
         end_pos = start_pos + s
@@ -430,8 +452,12 @@ class MLACompressedAttention:
 
         o = o.view(b, s, self.o_groups, -1)
         if hasattr(self.wo_a, "weight"):  # fp8 resident: dequant just this grouped GEMM
-            from ..quant import dequant_fp8_block
-            wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
+            # 同 MLAWindowAttention：权重在一次 decode 里不变，反量化结果按层缓存。
+            wo_a = self._st().get("wo_a_bf")
+            if wo_a is None:
+                from ..quant import dequant_fp8_block
+                wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
+                self._st()["wo_a_bf"] = wo_a
         else:
             wo_a = self.wo_a
         wo_a = wo_a.view(self.o_groups, self.o_lora_rank, -1)

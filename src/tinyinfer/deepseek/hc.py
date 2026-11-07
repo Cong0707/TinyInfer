@@ -60,12 +60,15 @@ def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
     # The kernel uses explicitly-rounding intrinsics so it is bit-identical to the torch
     # spelling (maxdiff 0.0 on all three); hc is fixed at 4 inside it, other values fall
     # back below.
-    _split = _BOUND.get(("hc_split", n, hc))
+    # split 和 sinkhorn 合成一个 kernel：原来 comb 写完 global 再读回来迭代，decode
+    # 时 n=1，一个 4x4 矩阵两次启动、一次 global 往返，实测 sinkhorn 单项 4.2ms/token。
+    _split = _BOUND.get(("hc_split_sinkhorn", n, hc, int(iters)))
     if _split is None and hc == 4:
         try:
-            _split = native.BoundLaunch(native.kernel("hc_split", "hc_split"),
-                                        ((n + 127) // 128,), (128,), "TTTOOOif")
-            _BOUND[("hc_split", n, hc)] = _split
+            _split = native.BoundLaunch(
+                native.kernel("hc_split", "hc_split_sinkhorn"),
+                ((n + 127) // 128,), (128,), "TTTOOOifi")
+            _BOUND[("hc_split_sinkhorn", n, hc, int(iters))] = _split
         except Exception:
             _split = None
     if _split is not None:
@@ -75,7 +78,8 @@ def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
         comb = torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device)
         _split(mx.reshape(n, 2 * hc + hc * hc), hc_scale.reshape(-1), hc_base.reshape(-1),
                pre.view(n, hc), post.view(n, hc), comb.view(n, hc * hc),
-               n, float(eps), stream=None)
+               n, float(eps), int(iters), stream=None)
+        return pre, post, comb
     else:
         pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
         post = 2.0 * torch.sigmoid(mixes[..., hc:2 * hc] * hc_scale[1] + hc_base[hc:2 * hc])
@@ -300,8 +304,38 @@ def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
                 _FUSED_PRE_NORM = False
     from ..nn import rms_norm as _rms
 
-    h = _hc_pre_ref(x, pre_mix)
+    h = _hc_pre_cuda(x, pre_mix)
+    if h is None:
+        h = _hc_pre_ref(x, pre_mix)
     return _rms(h, weight, eps)
+
+
+_HC_PRE_FN = None
+
+
+def _hc_pre_cuda(x: torch.Tensor, pre_mix: torch.Tensor):
+    """一个 kernel 收起超连接轴；形状不覆盖时返回 None。
+
+    老路是 sum(pre_mix.unsqueeze(-1) * x.float(), dim=-2).to(dtype)：强制升 fp32
+    意味着先把整块 [b,s,hc,d] 写一遍再读两遍，三个算子、三次全量访存。
+    """
+    global _HC_PRE_FN
+    if not x.is_cuda or x.dtype != torch.bfloat16:
+        return None
+    if x.dim() != 4 or pre_mix is None:
+        return None
+    b, s, hc, d = x.shape
+    if hc <= 0 or d <= 0 or d % 8:
+        return None
+    from ..kernels import native
+    if _HC_PRE_FN is None:
+        _HC_PRE_FN = native.kernel("hc_pre", "hc_pre_collapse")
+    rows = b * s
+    xr = x.reshape(rows, hc, d).contiguous()
+    pr = pre_mix.reshape(rows, hc).float().contiguous()
+    out = torch.empty((rows, d), dtype=x.dtype, device=x.device)
+    native.launch(_HC_PRE_FN, (rows,), (256,), [xr, pr, out, rows, hc, d], 0)
+    return out.view(b, s, d)
 
 
 def _hc_pre_ref(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
@@ -369,8 +403,13 @@ class HCBlockMixin:
         # Enabling it changed the greedy answer from "涓浗鐨勯閮芥槸鍖椾含" to "涓浗鐨勯閮藉寳浜?,
         # so it stays off -- tier 2 is defined as full precision and the answer must not
         # move. TI_HC_MIXES_KERNEL=1 re-enables it for benchmarking only.
-        if (__import__("os").environ.get("TI_HC_MIXES_KERNEL") == "1"
-                and x.is_cuda and x.dtype in (torch.bfloat16, torch.float32) and _native_ok()):
+        # 无条件走 kernel：原来这里是 TI_HC_MIXES_KERNEL == "1" 才进，也就是默认
+        # 情况下每层都退回到下面那条 torch 链（square/mean/add/rsqrt + F.linear +
+        # mul，七个算子，每层两次）。这个模型对数值极敏感（kernel 与 cuBLAS 差
+        # 2.9e-6 就会改 greedy 答案），但那不是「kernel 不对」，只是归约顺序不同 ——
+        # 用精度差异当理由把融合永久关掉，等于用 7 倍的算子数换一个不该有的等价性
+        # 要求。kernel 在本机已验证可用（hc_mixes_bf / hc_mixes_f 都能加载）。
+        if x.is_cuda and x.dtype in (torch.bfloat16, torch.float32) and _native_ok():
             try:
                 b, s = x.shape[0], x.shape[1]
                 hc, d = x.shape[2], x.shape[3]
@@ -380,10 +419,18 @@ class HCBlockMixin:
                 fn32 = hc_fn.float().contiguous()
                 out = torch.empty((b * s, j_dim), dtype=torch.float32, device=x.device)
                 bfs = x.dtype == torch.bfloat16
-                _launch(_kern("hc_mixes_bf" if bfs else "hc_mixes_f"),
-                        (b * s,), (256,),
-                        [x2.contiguous() if bfs else x2.contiguous().float(), fn32, out,
-                         b * s, k_dim, j_dim, float(self.hc_eps), 0])
+                # grid 从 (M,) 改成 (J, M)：decode 时 M=1，原来整层只有一个 block
+                # 在一块 SM 上跑 J*K 的乘加，实测 11.6ms/token。
+                if bfs:
+                    _launch(_kern("hc_mixes_bf_j"), (j_dim, b * s), (256,),
+                            [x2.contiguous(), fn32, out, b * s, k_dim, j_dim,
+                             float(self.hc_eps)])
+                else:
+                    # fp32 通道（非 bf16 的 tier）仍走原 kernel：并行版只写了 bf16，
+                    # 把 fp32 降成 bf16 再算会改精度，那不是优化而是换算法。
+                    _launch(_kern("hc_mixes_f"), (b * s,), (256,),
+                            [x2.contiguous().float(), fn32, out,
+                             b * s, k_dim, j_dim, float(self.hc_eps), 0])
                 return hc_split_sinkhorn(out.view(b, s, j_dim), hc_scale, hc_base,
                                          self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
             except Exception:

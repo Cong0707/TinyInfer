@@ -1172,6 +1172,66 @@ class Engine:
             if self.device == "cuda":
                 torch.cuda.empty_cache()
 
+    def staticize_decode(self) -> int:
+        """把 decode 路径切成「静态」：路由不再回 CPU，为 CUDA graph 捕获做准备。
+
+        做法：用最近一次 forward 记录到的每层路由（MoE._last_ids）作为该层的固定
+        专家集合。pin 住热点之后每层路由高度稳定，因此这个集合就是稳态下的真实
+        路由 —— 而 decode 每层的路由本来也几乎是同一个集合。
+
+        返回设置的层数。调用前必须先跑过 forward（让 _last_ids 有值）。
+        """
+        n = 0
+        store = getattr(self, "expert_store", None)
+        for _lid, b in self._blocks.items():
+            ffn = getattr(b, "ffn", None)
+            ids = getattr(ffn, "_last_ids", None) if ffn is not None else None
+            if not ids:
+                continue
+            ffn._static_active = list(ids)
+            ffn._static_decode = True
+            # 预建 Expert 对象并预占槽位：捕获期间不能有 torch.empty / 新对象分配，
+            # 否则 stream capture 直接被 invalidate。这些专家在稳态下本来就全在
+            # 槽位里，这里只是把「第一次遇到」的分配挪到捕获之前。
+            try:
+                if store is not None:
+                    recs = store.fetch(_lid, list(ids), cache=True)
+                    for _e, _rec in zip(list(ids), recs):
+                        if ffn._expert_cache.get(_e) is None:
+                            ffn._expert_cache[_e] = ffn._make_expert(_rec)
+            except Exception:
+                pass
+            n += 1
+        if n:
+            # 静态路径里不能再有每 token 的 .item()（那是捕获禁区）
+            self.enable_prefetch = False
+            self.predictor = None
+        return n
+
+    def pin_hot_experts(self, per_layer: int = 34) -> int:
+        """把每层最常路由的专家固定进显存槽位（永不淘汰）。
+
+        槽位是引擎的「手搓 manage」：1359 个 x 18.8MB 的固定区，谁在哪个槽位由
+        VramSlotCache 管。pin 住热点之后，decode 的路由恒定落在槽位里，就不需要
+        每层再 tolist() 回 CPU 决定该搬哪些专家 —— 那个 D2H 同步实测 3.3ms/层、
+        每 token 130ms，是 decode 一半的时间。
+
+        per_layer 默认 34：40 层 x 34 = 1360，正好是槽位规模。
+        """
+        slots = getattr(getattr(self, "expert_store", None), "slots", None)
+        if slots is None or getattr(slots, "slots", 0) <= 0:
+            return 0
+        pinned = 0
+        for lid, b in self._blocks.items():
+            ffn = getattr(b, "ffn", None)
+            counts = getattr(ffn, "_route_counts", None) if ffn is not None else None
+            if not counts:
+                continue
+            for _expert, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:per_layer]:
+                if slots.pin(lid, _expert):
+                    pinned += 1
+        return pinned
+
     def reset(self) -> None:
         self._last_routing.clear()
         # streaming completion events are keyed by layer and consumed by _flat_wait; a
@@ -1254,7 +1314,8 @@ class Engine:
         snap = {}
         for i, b in self._blocks.items():
             a = b.attn
-            entry = {"kv": None if a._kv_window is None else a._kv_window.clone()}
+            entry = {"kv": None if a._kv_window is None else a._kv_window.clone(),
+                     "klen": getattr(a, "_kv_len", 0)}
             ckv = getattr(a, "_compress_kv", None)
             entry["ckv"] = None if ckv is None else ckv.clone()
             comp = getattr(a, "compressor", None)
@@ -1294,7 +1355,16 @@ class Engine:
                 continue
             b = self.block(i)
             a = b.attn
-            a._kv_window = None if entry.get("kv") is None else entry["kv"].clone()
+            _kv = None if entry.get("kv") is None else entry["kv"].clone()
+            # 环形槽位 cache 之后 _kv_window 和 _kv_buf 是同一块 buffer（forward 里
+            # 直接 self._kv_window = buf），两个 property 各自映射到自己的 state key
+            # （attention 是 "buf"，compressed 是 "winbuf"），所以两处都要写 ——
+            # 只写 _kv_window 的话 forward 会从 _kv_buf 现开一块空 buffer，
+            # 恢复出来的历史一个字节都用不上。
+            a._kv_window = _kv
+            a._kv_buf = _kv
+            if hasattr(a, "_kv_len"):
+                a._kv_len = int(entry.get("klen", 0))
             if hasattr(a, "_compress_kv"):
                 a._compress_kv = None if entry.get("ckv") is None else entry["ckv"].clone()
             comp = getattr(a, "compressor", None)
@@ -2498,8 +2568,13 @@ class Engine:
             win = getattr(a, "window", None) or 0
             keep = target if not win else min(target, win)
             kv = getattr(a, "_kv_window", None)
-            if kv is not None and kv.shape[1] > keep:
-                a._kv_window = kv[:, :keep].contiguous()
+            if kv is not None:
+                # 槽位 cache 不能切片：位置 p 的 KV 永远在 p % window 那一格里，
+                # 回退只需把长度记回去并丢掉「窗口已满」的索引模板，重新生成时
+                # 会覆盖同一批槽位。切 kv[:, :keep] 拿到的是槽位 0..keep，不是历史。
+                if hasattr(a, "_kv_len"):
+                    a._kv_len = keep
+                a._decode_idxs = None
             if hasattr(a, "_decode_win_idxs"):
                 a._decode_win_idxs = None
             comp = getattr(a, "compressor", None)

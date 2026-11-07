@@ -248,6 +248,19 @@ class MLAWindowAttention:
         self._st()["winbuf"] = value
 
     @property
+    def _kv_len(self) -> int:
+        """已写入 cache 的绝对长度（环形槽位下 = 走过的 token 数，不是 buffer 宽度）。
+
+        buffer 一旦分配就是固定的 window 格，历史不再左右移动，所以「历史有多长」
+        不能再从 buffer 宽度反推，必须单独记。
+        """
+        return int(self._st().get("klen", 0))
+
+    @_kv_len.setter
+    def _kv_len(self, value) -> None:
+        self._st()["klen"] = int(value)
+
+    @property
     def _decode_idxs(self):
         return self._st().get("idxs")
 
@@ -330,54 +343,69 @@ class MLAWindowAttention:
             from ..kernels.quant import act_quant
             kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
 
-        old = self._kv_window
-        if old is None or old.shape[0] != b or old.device != x.device:
-            old = kv.new_empty(b, 0, self.head_dim)
-        # preallocated staging buffer: shift the history left and append the new chunk in place
-        cap = self.window + s
+        # ---- vLLM 式槽位 cache ----
+        # 一次性分配 window 格，位置 p 写进 p % window 那一格，历史永不移动。
+        # 旧实现在这里每层每 token 做三件多余的事：buf[:, :n_old].copy_(old.clone())
+        # 把整个历史左移一格（clone + copy_ 两个 kernel）、buf[:, n:n+s].copy_(kv)
+        # 再拷一次、然后把 buf[:, :n_old+s] 这个不连续的切片交给 attention，于是
+        # sparse_attn_cuda 里又是一次 .contiguous() 全量拷贝。三份拷贝换来的只是
+        # 「历史在 buffer 里连续」这一点，而窗口索引本来就该按槽位算。
         buf = self._kv_buf
-        if buf is None or buf.shape[0] != b or buf.shape[1] < cap or buf.dtype != kv.dtype:
-            buf = kv.new_empty(b, cap, self.head_dim)
+        if (buf is None or buf.shape[0] != b or buf.shape[1] != self.window
+                or buf.dtype != kv.dtype or buf.device != kv.device):
+            buf = kv.new_empty(b, self.window, self.head_dim)
             self._kv_buf = buf
-        n_old = old.size(1)
-        if n_old > 0:
-            # old may alias this very buffer (chunked prefill beyond the window): clone
-            # the source before writing so the copy does not read its own destination.
-            buf[:, :n_old].copy_(old.clone())
-        buf[:, n_old:n_old + s].copy_(kv)
-        kv_att = buf[:, : n_old + s]
+            self._decode_idxs = None
+        # 写入这一批的新 token：slot = position % window，一次 index_copy_
+        if s == 1:
+            buf[:, start_pos % self.window] = kv[:, 0]
+        else:
+            # 一个 chunk 比窗口还长时，只有最后 window 个位置能留在 cache 里；带上
+            # 前面的会让 index_copy_ 收到重复下标（未定义行为）。
+            if s > self.window:
+                _kv = kv[:, s - self.window:]
+                _slots = torch.arange(start_pos + s - self.window, start_pos + s,
+                                      device=x.device) % self.window
+            else:
+                _kv = kv
+                _slots = torch.arange(start_pos, start_pos + s, device=x.device) % self.window
+            buf.index_copy_(1, _slots, _kv)
+        kv_att = buf
+        n_old = min(start_pos, self.window)
         full = s == 1 and n_old == self.window
         if full and self._decode_idxs is not None:
             idxs = self._decode_idxs
         else:
             if positions is not None and positions.numel() == b and b > 1:
-                # Rows at different depths need their own mask AND their own history
-                # length: the buffer is [b, n_old+s, D] with one shared n_old, but a row
-                # that just joined has no history while one that has been decoding for a
-                # while has a full window. Encoding that per row is what the index tensor
-                # is for, so old_len is derived from each row's own position instead of
-                # from the shared buffer width.
                 from ..nn import window_idxs_per_row
                 old_per_row = [max(0, min(self.window, int(p) - (s - 1)))
                                for p in positions.tolist()]
                 idxs = window_idxs_per_row(positions, s, old_per_row, self.window, x.device)
             else:
-                idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
+                from ..nn import window_idxs_ring_cached
+                idxs = window_idxs_ring_cached(start_pos, s, self.window,
+                                               x.device).unsqueeze(0).expand(b, -1, -1)
             if full:
-                # decode with a full linear history: slots 1..window is a fixed template
+                # 窗口满了之后槽位模板不再变化，一个 token 之内 40 层共用一份
                 self._decode_idxs = idxs
-        # keep a VIEW into the pre-allocated buffer (no copy, fixed address once the
-        # window is full): .contiguous() here allocated a fresh tensor every token,
-        # which is exactly what prevents CUDA graph capture of the decode step
-        self._kv_window = kv_att[:, -self.window:]
+        # 整块 cache 就是 attention 的输入：地址固定、连续，不再有切片和拷贝
+        self._kv_window = buf
+        self._kv_len = start_pos + s
 
         o = sparse_attn_dispatch(q, kv_att, self.sink, idxs, self.scale)
         apply_rope(o[..., -self.rope_dim:], freqs, inverse=True)
 
         o = o.view(b, s, self.o_groups, -1)
         if hasattr(self.wo_a, "weight"):  # fp8 resident: dequant the grouped matrix just for this einsum
-            from ..quant import dequant_fp8_block
-            wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
+            # 每层每 token 都反量化一次 wo_a 是纯浪费：权重在一次 decode 期间不变，
+            # 而 dequant_fp8 是一个把整块权重读一遍写一遍的 kernel。结果按层缓存在
+            # 该层的 state 槽里（_st() 以 _active_layer 为键，所以 streamed 层换层
+            # 时各拿各的，不会串味）。
+            wo_a = self._st().get("wo_a_bf")
+            if wo_a is None:
+                from ..quant import dequant_fp8_block
+                wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
+                self._st()["wo_a_bf"] = wo_a
         else:
             wo_a = self.wo_a
         wo_a = wo_a.view(self.o_groups, self.o_lora_rank, -1)
