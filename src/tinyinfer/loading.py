@@ -2118,7 +2118,13 @@ class VramSlotCache:
         # 被收回、但 kernel 可能还在读的槽位 -> 归还时刻的 compute stream 事件。
         # 只有这些槽位在下次 DMA 覆盖前需要 wait；用 _event 不行，那个字段每个
         # 槽位都有值（publish 时写的），等于每次拷贝都插一个跨 stream 同步点。
-        self._dirty: dict[int, Any] = {}
+        self._dirty: set[int] = set()
+        # 覆盖式分配：空槽位按 LIFO 取，取空之后环形游标扫一个「没人在用」的
+        # 直接覆盖。这里刻意没有「释放」这个动作 —— 槽位在池子里转，覆盖即回收。
+        # decode 稳态只要 40x6=240 个槽位，池子按 1359 开，绝大多数时候是 O(1)
+        # 弹出；只有在池子填满之后才开始转游标，摊还也是 O(1)。
+        self._free: list[int] = []
+        self._cur = 0
         # 槽位分配代次：每次 _by_key 变动就 +1。kernel 侧按槽位编号寻址，编号一变
         # 旧的编号数组就指向别人的字节 —— 调用方用这个代次给缓存做键。
         self._gen = 0
@@ -2274,6 +2280,9 @@ class VramSlotCache:
             print(f"[slots] self.slots={self.slots} buffers={len(self._buffers)} "
                   f"state={len(self._state)} devs={getattr(self,'devices',None)}",
                   flush=True)
+        # 空槽位队列：LIFO，从后往前弹，避免和前面分配的槽位争同一段
+        self._free = list(range(len(self._buffers) - 1, -1, -1))
+        self._cur = 0
         if self.pin_staging and dev.type == "cuda":
             self._staging = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
             self._staging_b = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
@@ -2371,6 +2380,9 @@ class VramSlotCache:
             self._by_key.clear()
             self._gen += 1
             self._lru.clear()
+            self._free = list(range(n - 1, -1, -1))
+            self._cur = 0
+            self._dirty.clear()
             self.slots = n
         if self.pin_staging:
             try:
@@ -2392,13 +2404,14 @@ class VramSlotCache:
         else:
             cpu = data
         buf = self._buffers[idx]
-        # 这块槽位上一段数据可能还有 kernel 在读（归还时只记了 compute stream
-        # 的完成事件）：DMA 在 copy stream 上，不 wait 就会盖掉还在用的显存。
-        _blk_ev = self._dirty.pop(idx, None)
-        if _blk_ev is not None and self._copy_stream is not None:
-            self._copy_stream.wait_event(_blk_ev)
         if cpu.dtype != buf.dtype:
             cpu = cpu.view(buf.dtype)
+        if idx in self._dirty:
+            # 这一格刚被别人交还，可能还有 kernel 在读：DMA 改走 compute stream
+            # 的同步拷贝，靠 stream 内顺序排在上一个 kernel 后面。不建 event。
+            self._dirty.discard(idx)
+            buf.copy_(cpu, non_blocking=False)
+            return None
         # prefetch thread uses the second staging buffer so it never blocks a fetch copy
         use_b = threading.current_thread().name.startswith("vram-prefetch")
         lock = self._staging_lock_b if use_b else self._staging_lock
@@ -2451,6 +2464,31 @@ class VramSlotCache:
             buf.copy_(cpu, non_blocking=True)
             ev.record(self._copy_stream)
         return ev
+
+    def _claim_slot_locked(self) -> int | None:
+        """拿一个槽位：先掏空的，掏不到就环形覆盖一个没人在用的。
+
+        这里没有「释放」这个动作 —— 槽位在池子里转圈，被覆盖即回收。
+        每层每步扫一遍全池找 victim（原来的做法）是纯 Python 的 O(slots)
+        循环，池子 1359 个就是每层一千多次解释器迭代；改成游标之后是摊还 O(1)。
+        """
+        while self._free:
+            i = self._free.pop()
+            if self._state[i] == self.FREE and self._key[i] is None:
+                return i
+        n = self.slots
+        if n <= 0:
+            return None
+        for k in range(n):
+            i = self._cur + k
+            if i >= n:
+                i %= n
+            if (self._refs[i] == 0
+                    and self._state[i] != self.COPYING
+                    and (self._key[i] is None or self._key[i] not in self._pinned)):
+                self._cur = (i + 1) % n
+                return i
+        return None
 
     def _find_victim_locked(self) -> int | None:
         for idx in range(self.slots):
@@ -2561,23 +2599,17 @@ class VramSlotCache:
         self._state[idx] = self.FREE
         self._refs[idx] = 0
         self._event[idx] = None
-        # 这块显存里的权重可能还有 kernel 在读（launch 是异步的）。记一个
-        # compute stream 的完成事件，下次 DMA 覆盖这一格之前先 wait 它。
-        _t = self._torch
-        if _t is not None and self._copy_stream is not None:
-            try:
-                if not _t.cuda.is_current_stream_capturing():
-                    _ev = _t.cuda.Event()
-                    _ev.record(_t.cuda.current_stream())
-                    self._dirty[idx] = _ev
-            except Exception:
-                pass
+        # 这块显存里的权重可能还有 kernel 在读（launch 是异步的）。不建 event
+        # （240 次/token 的对象创建本身就贵），只打个脏标记：下一次往这一格
+        # 拷数据时改走 compute stream 的同步拷贝，靠 stream 内的顺序保证
+        # 「上一个读它的 kernel 先跑完」。
+        self._dirty.add(idx)
         self.evictions += 1
 
     def _reserve_locked(self, key: tuple[int, int]) -> int | None:
         if key in self._by_key:
             return self._by_key[key]
-        idx = self._find_victim_locked()
+        idx = self._claim_slot_locked()
         if idx is None:
             return None
         if self._state[idx] != self.FREE:
@@ -2588,6 +2620,15 @@ class VramSlotCache:
         self._state[idx] = self.RESERVED
         self._lru.append(idx)
         self.loads += 1
+        # 表由池子自己维护：槽位装进哪个专家，就写哪一格。以前这一步散在 moe.py
+        # 里（fetch 之后手工 table_set），漏一处就是「表指向别人的权重」这种静默
+        # 错误 —— 槽位和它的编号必须由同一个对象负责。
+        _tab = getattr(self, "_slot_tab", None)
+        if _tab is not None:
+            try:
+                _tab[int(key[0]), int(key[1])] = int(idx)
+            except Exception:
+                pass
         return idx
 
     # -- prefetch path ----------------------------------------------------

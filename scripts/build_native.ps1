@@ -70,7 +70,10 @@ foreach ($f in $files) {
     $name = $f.BaseName
     $mod = if ($rename.ContainsKey($name)) { $rename[$name] } else { $name }
     $dst = Join-Path $out "$mod.cubin"
-    $inc = ""
+    # 源文件是 UTF-8（注释里有中文）。MSVC 在 Windows 上默认按本地代码页解码，
+    # 中文注释的字节会被当成分隔符/引号，nvcc 报出来的行号和错误都莫名其妙
+    # （实测 moe_req.cu 报第 12 行 expected ";"，而第 12 行只是个函数签名）。
+    $inc = "-Xcompiler /utf-8"
     if ($f.DirectoryName -match "marlin") {
         if (-not $cutlass) { Write-Output ("{0,-20} skipped (set CUTLASS_PATH)" -f $name); continue }
         $inc = "-I `"$($f.DirectoryName)`" -I `"$cutlass\include`" --expt-relaxed-constexpr -std=c++17"
