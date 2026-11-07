@@ -366,6 +366,8 @@ class MoE:
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
         if tab is None or not arena or len(arena) != 1:
+            if __import__("os").environ.get("TI_GPUDBG") == "1":
+                print(f"[gpuskip] L{self.layer_id} tab={tab is not None} arena={arena is not None}", flush=True)
             return None
         try:
             from .fp4_native import quantize_act
