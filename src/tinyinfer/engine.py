@@ -2103,8 +2103,12 @@ class Engine:
         if __import__("os").environ.get("TI_GPUDBG") == "1":
             print("[trace] embed done", flush=True)
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
+        if __import__("os").environ.get("TI_GPUDBG") == "1":
+            print("[trace] repeat done", flush=True)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
+        if __import__("os").environ.get("TI_GPUDBG") == "1":
+            print("[trace] premix done", flush=True)
         if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
             print("[capt] pre_mix done", flush=True)
         hash_ids = None
