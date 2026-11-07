@@ -2412,6 +2412,10 @@ class Engine:
         return out.clone()
 
     def _graph_try_capture(self, ids: torch.Tensor, start_pos: int) -> None:
+        if __import__("os").environ.get("TI_GRAPHDBG") == "1":
+            print(f"[graphdbg] tier={getattr(self.tier, 'cuda_graph', None)} "
+                  f"gpu={self.gpu_layers}/{self.max_layers} "
+                  f"shape_ok={self._graph_capture_shape(ids, start_pos)}", flush=True)
         if getattr(self, "_graph", None) is not None or getattr(self, "_graph_failed", False):
             return
         if not self._graph_capture_shape(ids, start_pos):
