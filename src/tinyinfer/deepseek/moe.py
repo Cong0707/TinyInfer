@@ -517,35 +517,16 @@ class MoE:
                             except Exception:
                                 pass
                             if not sl.has(self.layer_id, _e):
-                                # 池子满了（decode 不 evict，槽位会攒满）：回收一个
-                                # 非 pin、无引用的槽位再试。没有这一步，长时间 decode
-                                # 会在某一层突然报 still not resident —— 池子不是泄漏，
-                                # 是没人来回收。
-                                # 优先无引用的；其次「别的层」的 —— decode 是逐层串行的，
-                                # 别的层的槽位这一刻必然已经算完，收回来是安全的。
-                                # （release() 只减引用、把状态打回 STAGED，槽位本身还占着。）
-                                _victim = -1
+                                # 池子满了：不在这里硬抢（抢「别的层」的槽位会
+                                # 清掉别人正在用的权重，输出直接错）。只报事实。
+                                _ns = [0, 0, 0, 0, 0]
                                 for _vi in range(sl.slots):
-                                    _k = sl._key[_vi]
-                                    if _k is None or _k in sl._pinned or sl._state[_vi] == sl.FREE:
-                                        continue
-                                    if sl._refs[_vi] == 0:
-                                        _victim = _vi
-                                        break
-                                    if _victim < 0 and _k[0] != self.layer_id:
-                                        _victim = _vi
-                                if _victim >= 0:
-                                    _old = sl._key[_victim]
-                                    sl._evict_locked(_victim)
-                                    if _old is not None:
-                                        try:
-                                            sl._slot_tab[_old[0], _old[1]] = -1
-                                        except Exception:
-                                            pass
-                                try:
-                                    sl.acquire(self.layer_id, _e)
-                                except Exception:
-                                    pass
+                                    _ns[min(4, sl._state[_vi])] += 1
+                                print(f"[slotfull] L{self.layer_id} e={_e} "
+                                      f"free={_ns[0]} reserved={_ns[1]} copying={_ns[2]} "
+                                      f"staged={_ns[3]} inuse={_ns[4]} "
+                                      f"pinned={sl.pinned_count()} loads={sl.loads} "
+                                      f"evict={sl.evictions}", flush=True)
                     # table_sync 内部是主机侧攒数组 + 一次 copy_，重建后再索引一次
                     tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
                     # 用 GPU 侧的 table_set 写表：没有 H2D，就没有和 compute stream 的时序问题。
