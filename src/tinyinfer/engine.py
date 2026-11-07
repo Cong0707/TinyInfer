@@ -2097,7 +2097,11 @@ class Engine:
             print(f"[memdbg] T={ids.shape[1]} free={_mf / 2**20:.0f}MB alloc="
                   f"{torch.cuda.memory_allocated() / 2**20:.0f}MB reserved="
                   f"{torch.cuda.memory_reserved() / 2**20:.0f}MB", flush=True)
+        if __import__("os").environ.get("TI_GPUDBG") == "1":
+            print(f"[trace] embed start capt={torch.cuda.is_current_stream_capturing()}", flush=True)
         h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
+        if __import__("os").environ.get("TI_GPUDBG") == "1":
+            print("[trace] embed done", flush=True)
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
