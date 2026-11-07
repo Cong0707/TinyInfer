@@ -190,27 +190,23 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
         try:
             from .kernels import native
 
-            aq, asc = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
             n, k = w_fp8.shape
             y = torch.empty(n, device=x.device, dtype=torch.bfloat16)
-            # Bound launcher: 248 calls per decode token, and the generic launch path
-            # spends ~19 us marshalling arguments for a kernel that reads 11 MB.
-            _key = ("fp8_gemv_bs", int(n), int(k))
+            # 激活的量化内联进 GEMV：block 先用 32 个 warp 把 x 量化进 shared，
+            # 再让 32 个 warp 各算一行。这样一层五次 act_quant 的 launch 就没了，
+            # 而激活的全局读取只放大 n/32 倍（相对每层 70MB 的权重是零头）。
+            _key = ("fp8_gemv_inline_q", int(n), int(k))
             _fn = _GEMV_BOUND.get(_key)
             if _fn is None:
-                # 8 rows per block (256 threads), not 16. The reduction is warp-local, so
-                # how many warps share a block is a free scheduling knob: halving it
-                # doubles the block count and fills the wave tail on a 26-SM part.
-                # Measured [2304,5120] with HBM-resident weights: 16 rows 39.5 us /
-                # 307.9 GB/s, 8 rows 37.8 us / 322.4 GB/s, 4 rows 37.6 us / 324.2 GB/s.
-                _fn = native.BoundLaunch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
-                                         ((n + 7) // 8,), (256,), "TTTTOii")
+                _fn = native.BoundLaunch(
+                    native.kernel("fp8_gemv_inline_q", "fp8_gemv_inline_q"),
+                    ((n + 31) // 32,), (1024,), "TTTTOif",
+                    shared=int(k) + int(k) // 32)
                 _GEMV_BOUND[_key] = _fn
-            _fn(aq.view(torch.uint8).reshape(-1),
-                asc.view(torch.uint8).reshape(-1),
+            _fn(x.reshape(-1),
                 w_fp8.view(torch.uint8).reshape(-1),
                 w_scale.view(torch.uint8).reshape(-1),
-                y, int(n), int(k), stream=None)
+                y, int(n), int(k), 1e-4, stream=None)
             return y.view(1, n)
         except Exception as _exc:
             if __import__("os").environ.get("TI_FP8_DEBUG") == "1":
