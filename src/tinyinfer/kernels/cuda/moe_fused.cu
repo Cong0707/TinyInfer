@@ -370,6 +370,8 @@ extern "C" __global__ void moe_fused_act(
     __syncthreads();          // 先同步再早退：提前 return 的 warp 不能绕过错这个栅栏
 
     const int e = blockIdx.y;
+    const int row = blockIdx.z;                     // 多行时每行一组
+    const long long row_a = (long long)row * n_exp;  // 激活/scratch 的行偏移
     const int row0 = blockIdx.x * MOE_ACT_ROWS;
     const int nwarp = blockDim.x >> 5;              // 本 block 的 warp 数（8 或 16）
     const int rpw = MOE_ACT_ROWS / nwarp;           // 每个 warp 负责的行数
@@ -380,8 +382,8 @@ extern "C" __global__ void moe_fused_act(
     const unsigned char* w3 = arena + eb + w3_off;
     const unsigned char* s3 = arena + eb + s3_off;
     // 同第一版：按 [n_exp, k_dim] 逐专家索引；上游若只有一行共享激活就改成 aq / asc
-    const unsigned char* ae = aq + (long long)e * k_in;
-    const unsigned char* ase = asc + (long long)e * (k_in >> 5);
+    const unsigned char* ae = aq + (row_a + e) * k_in;
+    const unsigned char* ase = asc + (row_a + e) * (k_in >> 5);
 
     // ---- gate/up GEMV + clamp/silu/权重：每个 warp 两行，512 线程形状同 moe_gemv6
     for (int r = 0; r < rpw; ++r) {
@@ -448,21 +450,23 @@ extern "C" __global__ void moe_fused_down(
 
     const int rows = blockDim.x >> 5;               // 每 block 行数 = warp 数（512 线程 -> 16 行）
     const int n = blockIdx.x * rows + warp;
+    const int row_d = blockIdx.y;                    // 多行时每行一组
+    const long long row_a2 = (long long)row_d * n_exp;
     if (n >= n_down_rows) return;
 
     // acc 的初值、专家遍历顺序、每次加法的舍入都与 moe_acc6 完全相同
     // accumulate=0：本 token 第一遍，直接覆盖写，调用方就不必每层 y.zero_()
-    float acc = accumulate ? __bfloat162float(y[n]) : 0.f;
+    float acc = accumulate ? __bfloat162float(y[row_d * n_down_rows + n]) : 0.f;
     for (int e = 0; e < n_exp; ++e) {
         const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
         const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
         const unsigned char* s2 = arena + eb + s2_off + (long long)n * (k_mid >> 5);
-        const float d = gemv_row<0>(aq2 + (long long)e * k_mid,
-                                    asc2 + (long long)e * (k_mid >> 5),
+        const float d = gemv_row<0>(aq2 + (row_a2 + e) * k_mid,
+                                    asc2 + (row_a2 + e) * (k_mid >> 5),
                                     w2, s2, k_mid, lane, lut);
         // 复现 moe_gemv6 的 bf16 存储 + moe_acc6 的 bf16 读取：先舍入再加；
         // w_exp 已在 act 里乘过，这里不再乘
         if (lane == 0) acc += __bfloat162float(__float2bfloat16(d));
     }
-    if (lane == 0) y[n] = __float2bfloat16(acc);                 // fp32 写回，不再舍入
+    if (lane == 0) y[row_d * n_down_rows + n] = __float2bfloat16(acc);                 // fp32 写回，不再舍入
 }

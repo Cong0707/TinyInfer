@@ -436,7 +436,7 @@ class MoE:
             fa = _MOE_FUSED.get("act")
             if fa is None:
                 fa = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_act"),
-                                        ((nmid + 31) // 32, 1), (512,), "TTTTTOOiiiiiiiif")
+                                        ((nmid + 31) // 32, n_exp, 1), (512,), "TTTTTOOiiiiiiiif")
                 _MOE_FUSED["act"] = fa
             fa(aq.reshape(-1), asc.reshape(-1), arena[0], sids, weights[0],
                scr[:n_exp * nmid], scr[n_exp * nmid:],
