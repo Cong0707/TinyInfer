@@ -392,6 +392,9 @@ class MoE:
                 _rc = self._route_counts
                 for _e in indices.view(-1).tolist():
                     _rc[int(_e)] = _rc.get(int(_e), 0) + 1
+            if __import__("os").environ.get("TI_GPUDBG") == "1":
+                print(f"[idx] L{self.layer_id} max={int(indices.max())} "
+                      f"shape={tuple(indices.shape)}", flush=True)
             sids = tab[self.layer_id].index_select(0, indices.view(-1))
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             if (not getattr(self, "_all_pinned", False)
