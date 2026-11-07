@@ -2212,6 +2212,8 @@ class Engine:
                     _dh.append((i, h_in.clone(), h.clone()))
             except Exception:
                 try:
+                    if torch.cuda.is_current_stream_capturing():
+                        raise
                     _fr, _ft = torch.cuda.mem_get_info()
                     _m = (f"vram free={_fr/2**20:.0f}MB/{_ft/2**20:.0f}MB "
                           f"alloc={torch.cuda.memory_allocated()/2**20:.0f}MB")
