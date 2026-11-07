@@ -911,7 +911,7 @@ class MoE:
                                 _MOE_FUSED['down'] = _fd
                             _fd(_oq.view(torch.float8_e4m3fn), _os, _ar, _sids, y,
                                 _ne, int(self.cfg.dim), _nmid, _bb,
-                                _ts['w2.weight'].dest_offset, _ts['w2.scale'].dest_offset, stream=None)
+                                _ts['w2.weight'].dest_offset, _ts['w2.scale'].dest_offset, 0, stream=None)
                             served.extend(_ids)
                             if (_os0.environ.get("TI_FUSED_CHECK") == "1"
                                     and not getattr(self, "_fused_checked", False)):
