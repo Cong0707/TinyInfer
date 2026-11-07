@@ -279,24 +279,6 @@ class Expert:
             self._scratch_buf = buf
         return buf
 
-    def _ts_offsets(self, layer: int):
-        """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
-        cache = getattr(self, "_ts_off_cache", None)
-        if cache is None:
-            cache = self._ts_off_cache = {}
-        hit = cache.get(layer)
-        if hit is not None:
-            return hit
-        idx = getattr(getattr(self, "_expert_store", None), "index", None)
-        if idx is None:
-            raise RuntimeError("MoE: expert_store.index 不可用")
-        t = idx.expert_blob(layer, 0).tensors
-        hit = cache[layer] = (
-            t["w1.weight"].dest_offset, t["w1.scale"].dest_offset,
-            t["w3.weight"].dest_offset, t["w3.scale"].dest_offset,
-            t["w2.weight"].dest_offset, t["w2.scale"].dest_offset)
-        return hit
-
     def _fused_gate_up(self):
         """把 w1/w3 拼成一个 [2N, K] 的 fp8 权重（vLLM 的 gate_up_proj）。
 
@@ -352,6 +334,24 @@ class MoE:
             buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
             self._scratch_buf = buf
         return buf
+
+    def _ts_offsets(self, layer: int):
+        """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
+        cache = getattr(self, "_ts_off_cache", None)
+        if cache is None:
+            cache = self._ts_off_cache = {}
+        hit = cache.get(layer)
+        if hit is not None:
+            return hit
+        idx = getattr(getattr(self, "_expert_store", None), "index", None)
+        if idx is None:
+            raise RuntimeError("MoE: expert_store.index 不可用")
+        t = idx.expert_blob(layer, 0).tensors
+        hit = cache[layer] = (
+            t["w1.weight"].dest_offset, t["w1.scale"].dest_offset,
+            t["w3.weight"].dest_offset, t["w3.scale"].dest_offset,
+            t["w2.weight"].dest_offset, t["w2.scale"].dest_offset)
+        return hit
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
                  max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
