@@ -513,6 +513,27 @@ class MoE:
                                 sl.acquire(self.layer_id, _e)
                             except Exception:
                                 pass
+                            if not sl.has(self.layer_id, _e):
+                                # 池子满了（decode 不 evict，槽位会攒满）：回收一个
+                                # 非 pin、无引用的槽位再试。没有这一步，长时间 decode
+                                # 会在某一层突然报 still not resident —— 池子不是泄漏，
+                                # 是没人来回收。
+                                for _vi in range(sl.slots):
+                                    if (sl._state[_vi] != sl.FREE and sl._refs[_vi] == 0
+                                            and sl._key[_vi] is not None
+                                            and sl._key[_vi] not in sl._pinned):
+                                        _old = sl._key[_vi]
+                                        sl._evict_locked(_vi)
+                                        if _old is not None:
+                                            try:
+                                                sl._slot_tab[_old[0], _old[1]] = -1
+                                            except Exception:
+                                                pass
+                                        break
+                                try:
+                                    sl.acquire(self.layer_id, _e)
+                                except Exception:
+                                    pass
                     # table_sync 内部是主机侧攒数组 + 一次 copy_，重建后再索引一次
                     tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
                     # 用 GPU 侧的 table_set 写表：没有 H2D，就没有和 compute stream 的时序问题。
