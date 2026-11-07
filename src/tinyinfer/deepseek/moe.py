@@ -271,6 +271,70 @@ class Expert:
         from ..gemm import fp4_linear
         return fp4_linear(y, w2, s2)
 
+    def _scratch(self, nbytes: int, device):
+        """MoE 融合 kernel 的中间 buffer（fp8 激活 + e8m0 scale），按大小复用。"""
+        buf = getattr(self, "_scratch_buf", None)
+        if buf is None or buf.numel() < nbytes or buf.device != device:
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            self._scratch_buf = buf
+        return buf
+
+    def _fused_gate_up(self):
+        """把 w1/w3 拼成一个 [2N, K] 的 fp8 权重（vLLM 的 gate_up_proj）。
+
+        shared expert 每层都要跑，而它在 decode 里是三次独立 GEMV 加一次 cat：
+        w1(x) 和 w3(x) 读同一个 x、同一个量化后的激活，却各自 launch 一次、
+        各自量化一遍，结果还要 torch.cat 拼起来交给 silu_and_mul。
+        拼成一个权重之后是一次 GEMV 直接产出 [2N]，silu_and_mul 直接吃，
+        连 cat 都省了。
+        """
+        if getattr(self, "_gu_w", None) is not None:
+            return self._gu_w, self._gu_s
+        a, b = self.w1, self.w3
+        if not (hasattr(a, "weight") and hasattr(b, "weight")):
+            return None, None
+        if (a.weight.dtype != b.weight.dtype or a.scale.dtype != b.scale.dtype
+                or int(a.weight.shape[1]) != int(b.weight.shape[1])
+                or int(a.weight.shape[0]) % 32 or int(b.weight.shape[0]) % 32):
+            return None, None
+        self._gu_w = torch.cat([a.weight, b.weight], dim=0).contiguous()
+        self._gu_s = torch.cat([a.scale, b.scale], dim=0).contiguous()
+        return self._gu_w, self._gu_s
+
+    def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+        from .vllm_ops import clamp_swiglu
+        _gw, _gs = self._fused_gate_up()
+        if _gw is not None and x.is_cuda and x.dtype == torch.bfloat16:
+            from ..gemm import fp8_linear
+            _gu = fp8_linear(x, _gw, _gs)
+            y = clamp_swiglu(_gu, self.swiglu_limit)
+        elif hasattr(self.w1, "forward"):  # fp8 QuantLinear shared expert
+            gate = self.w1.forward(x)
+            up = self.w3.forward(x)
+            y = clamp_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit)
+        else:
+            x = x.to(self.w1.dtype)
+            gate = F.linear(x, self.w1)
+            up = F.linear(x, self.w3)
+            y = clamp_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit)
+        if y is None:
+            raise RuntimeError("vllm clamp_swiglu unavailable (vllm_silu_and_mul.cubin)")
+        if weights is not None:
+            y = weights * y
+        if hasattr(self.w2, "forward"):
+            return self.w2.forward(y)
+        return F.linear(y.to(self.w2.dtype), self.w2)
+
+
+class MoE:
+    def _scratch(self, nbytes: int, device):
+        """MoE 融合 kernel 的中间 buffer（fp8 激活 + e8m0 scale），按大小复用。"""
+        buf = getattr(self, "_scratch_buf", None)
+        if buf is None or buf.numel() < nbytes or buf.device != device:
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            self._scratch_buf = buf
+        return buf
+
     def _ts_offsets(self, layer: int):
         """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
         cache = getattr(self, "_ts_off_cache", None)
@@ -338,70 +402,6 @@ class Expert:
             return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
         except Exception:
             return None
-
-    def _scratch(self, nbytes: int, device):
-        """MoE 融合 kernel 的中间 buffer（fp8 激活 + e8m0 scale），按大小复用。"""
-        buf = getattr(self, "_scratch_buf", None)
-        if buf is None or buf.numel() < nbytes or buf.device != device:
-            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-            self._scratch_buf = buf
-        return buf
-
-    def _fused_gate_up(self):
-        """把 w1/w3 拼成一个 [2N, K] 的 fp8 权重（vLLM 的 gate_up_proj）。
-
-        shared expert 每层都要跑，而它在 decode 里是三次独立 GEMV 加一次 cat：
-        w1(x) 和 w3(x) 读同一个 x、同一个量化后的激活，却各自 launch 一次、
-        各自量化一遍，结果还要 torch.cat 拼起来交给 silu_and_mul。
-        拼成一个权重之后是一次 GEMV 直接产出 [2N]，silu_and_mul 直接吃，
-        连 cat 都省了。
-        """
-        if getattr(self, "_gu_w", None) is not None:
-            return self._gu_w, self._gu_s
-        a, b = self.w1, self.w3
-        if not (hasattr(a, "weight") and hasattr(b, "weight")):
-            return None, None
-        if (a.weight.dtype != b.weight.dtype or a.scale.dtype != b.scale.dtype
-                or int(a.weight.shape[1]) != int(b.weight.shape[1])
-                or int(a.weight.shape[0]) % 32 or int(b.weight.shape[0]) % 32):
-            return None, None
-        self._gu_w = torch.cat([a.weight, b.weight], dim=0).contiguous()
-        self._gu_s = torch.cat([a.scale, b.scale], dim=0).contiguous()
-        return self._gu_w, self._gu_s
-
-    def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-        from .vllm_ops import clamp_swiglu
-        _gw, _gs = self._fused_gate_up()
-        if _gw is not None and x.is_cuda and x.dtype == torch.bfloat16:
-            from ..gemm import fp8_linear
-            _gu = fp8_linear(x, _gw, _gs)
-            y = clamp_swiglu(_gu, self.swiglu_limit)
-        elif hasattr(self.w1, "forward"):  # fp8 QuantLinear shared expert
-            gate = self.w1.forward(x)
-            up = self.w3.forward(x)
-            y = clamp_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit)
-        else:
-            x = x.to(self.w1.dtype)
-            gate = F.linear(x, self.w1)
-            up = F.linear(x, self.w3)
-            y = clamp_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit)
-        if y is None:
-            raise RuntimeError("vllm clamp_swiglu unavailable (vllm_silu_and_mul.cubin)")
-        if weights is not None:
-            y = weights * y
-        if hasattr(self.w2, "forward"):
-            return self.w2.forward(y)
-        return F.linear(y.to(self.w2.dtype), self.w2)
-
-
-class MoE:
-    def _scratch(self, nbytes: int, device):
-        """MoE 融合 kernel 的中间 buffer（fp8 激活 + e8m0 scale），按大小复用。"""
-        buf = getattr(self, "_scratch_buf", None)
-        if buf is None or buf.numel() < nbytes or buf.device != device:
-            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-            self._scratch_buf = buf
-        return buf
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
                  max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
