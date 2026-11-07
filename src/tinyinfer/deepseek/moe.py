@@ -417,7 +417,11 @@ class MoE:
                 _miss = sorted({int(v) for v, sid in
                                 zip(indices.view(-1).tolist(), sids.tolist()) if int(sid) < 0})
                 if _miss:
-                    self._expert_store.fetch(self.layer_id, _miss)
+                    _recs = self._expert_store.fetch(self.layer_id, _miss)
+                    if __import__("os").environ.get("TI_GPUDBG") == "1":
+                        print(f"[fetch] L{self.layer_id} miss={_miss} recs={len(_recs)} "
+                              f"slots={[getattr(r, 'buffer', None) is not None for r in _recs]}",
+                              flush=True)
                     if __import__("os").environ.get("TI_GPUDBG") == "1":
                         _st = [0, 0, 0, 0]
                         for _i in range(sl.slots):
