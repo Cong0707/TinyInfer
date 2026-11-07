@@ -34,14 +34,13 @@ extern "C" __global__ void head_gemv(const float* __restrict__ h,
         if (k0 + 8 <= k_dim) {
             const uint4 wraw = *reinterpret_cast<const uint4*>(row + k0);
             const uint4 hraw = *reinterpret_cast<const uint4*>(hb + k0);
-            const unsigned int* wu = reinterpret_cast<const unsigned int*>(&wraw);
-            const unsigned int* hu = reinterpret_cast<const unsigned int*>(&hraw);
+            const unsigned short* ws = reinterpret_cast<const unsigned short*>(&wraw);
+            const unsigned short* hs = reinterpret_cast<const unsigned short*>(&hraw);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const __nv_bfloat162 w2 = *reinterpret_cast<const __nv_bfloat162*>(&wu[i]);
-                const __nv_bfloat162 h2 = *reinterpret_cast<const __nv_bfloat162*>(&hu[i]);
-                acc += __bfloat162float(h2.x) * __bfloat162float(w2.x)
-                     + __bfloat162float(h2.y) * __bfloat162float(w2.y);
+            for (int i = 0; i < 8; ++i) {
+                const float wf = __bfloat162float(__ushort_as_bfloat16(ws[i]));
+                const float hf = __bfloat162float(__ushort_as_bfloat16(hs[i]));
+                acc += hf * wf;
             }
         } else {
             for (int k = k0; k < k_dim; ++k) acc += hb[k] * row[k];
