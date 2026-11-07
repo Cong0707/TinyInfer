@@ -365,8 +365,17 @@ class MoE:
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
-        if tab is None or not arena or len(arena) != 1:
+        if not arena or len(arena) != 1:
             return None
+        if tab is None:
+            # 表是懒建的；warmup 阶段还没有路由统计，先建一张全 -1 的表，
+            # 下面的 miss 分支会把它填起来。
+            try:
+                _n_exp_total = int(getattr(getattr(self, 'cfg', None), 'n_routed_experts', 0) or 0)
+                tab = sl.slot_table(int(getattr(self, '_n_layers_hint', 40) or 40),
+                                    _n_exp_total or 384)
+            except Exception:
+                return None
         try:
             from .fp4_native import quantize_act
             from ..kernels import native
