@@ -1,0 +1,27 @@
+print('RESULT === 口径换算的基础 ===')
+print('  time_per_token = bytes_per_token / achieved_BW')
+print('  tok/s = achieved_BW / bytes_per_token')
+print('  => tok/s per GB/s = 1 / bytes_per_token[GB]')
+print()
+print('RESULT === 每 token 必须搬的字节（本模型）===')
+expert = 240 * 18.8 / 1000
+nonexp = 6.51
+total = expert + nonexp
+print('  专家      240 x 18.8MB = %.2f GB' % expert)
+print('  非专家权重  40 层       = %.2f GB' % nonexp)
+print('  合计                    = %.2f GB/token' % total)
+print('  再加 KV cache 读写和激活: 约 %.2f GB/token' % (total))
+print()
+print('RESULT === 理论极限（100%% 带宽）===')
+base = total
+print('  tok/s per GB/s = 1/%.2f = %.4f' % (base, 1/base))
+print('  RTX 5060 Laptop  384 GB/s -> %.1f tok/s' % (384/base))
+print('  RTX 5060         448 GB/s -> %.1f tok/s' % (448/base))
+print('  RTX 2080 Ti      616 GB/s -> %.1f tok/s' % (616/base))
+print('  RTX 5090        1792 GB/s -> %.1f tok/s' % (1792/base))
+print('  RTX PRO 6000    1792 GB/s -> %.1f tok/s' % (1792/base))
+print()
+print('RESULT === 300 tok/s 需要多少带宽 ===')
+print('  300 x %.2f GB = %.0f GB/s' % (base, 300*base))
+print('  => 需要 %.0f GB/s，100%% 效率' % (300*base))
+print('  若 kernel 达到 41%% 效率 -> 需要 %.0f GB/s' % (300*base/0.41))

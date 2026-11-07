@@ -1,0 +1,22 @@
+print('RESULT === 300 tok/s 需要什么 ===')
+print('  300 tok/s = 3.33 ms/token')
+print('  当前纯 kernel = 96.2 ms')
+print('  **需要快 29 倍**')
+print()
+print('RESULT === 各项在 3.33ms 预算里能分多少 ===')
+items = [('kernel_kernel', 23.65), ('fp8_gemv_bs', 21.99), ('moe_gemv6', 18.70),
+         ('gemvx (bmm)', 7.01), ('head_gemv', 5.53), ('sinkhorn_hc', 4.01), ('其它', 15.31)]
+tot = sum(v for _,v in items)
+for name, v in items:
+    print('  %-16s %6.2f ms -> 需降到 %.2f ms (快 %.0fx)' % (name, v, 3.33*v/tot, tot/v))
+print()
+print('RESULT === 关键观察 ===')
+print('  kernel_kernel 23.65ms n=40 -> 每层 0.59ms，这是什么 kernel 要查')
+print('  fp8_gemv_bs 21.99ms n=248 -> 每次 0.089ms，共享专家')
+print('  moe_gemv6 18.70ms n=80 -> 每次 0.23ms，6专家合并')
+print()
+print('RESULT === 数据量对照 ===')
+print('  moe_gemv6 每层读 6x2x(2304x5120/2) = 71.7 MB')
+print('  40 层 = 2.87 GB / 18.70ms = 153 GB/s')
+print('  **远低于 295 GB/s 的读带宽上限 -> 有 2x 空间**')
+print('  fp8_gemv_bs: 248 x 11.8MB = 2.93 GB / 21.99ms = 133 GB/s -> 也有 2x 空间')

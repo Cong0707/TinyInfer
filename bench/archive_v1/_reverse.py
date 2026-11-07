@@ -1,0 +1,36 @@
+print("=== 反推：公开 8xH200 1000 tok/s @batch32, 那单 token 到底读了什么 ===")
+print()
+BW = 8 * 4.8   # TB/s
+print(f"8 x H200 聚合带宽 {BW:.1f} TB/s")
+print()
+# at 1000 tok/s aggregate with batch 32, each step is 32 tokens
+print("batch 32, 1000 tok/s 总吞吐 -> 每秒 31.25 个 step, 每个 step 32 token")
+step_ms = 1000 / (1000/32)
+print(f"  每个 step {step_ms:.1f} ms")
+bytes_per_step = BW * step_ms / 1000
+print(f"  一个 step 能从 HBM 读 {bytes_per_step:.1f} GB")
+print()
+print("而这个模型一个 step（32 token）如果全读权重只需 12.4 GB（共享）")
+print(f"  {bytes_per_step:.1f} GB 的带宽预算 vs 12.4 GB 的需求")
+print(f"  -> 说明真实 kernel 只用了约 {12.4/bytes_per_step*100:.0f}% 的带宽")
+print()
+print("再看 FLOPs 一侧：")
+ACTIVE = 37e9
+flops_step = 2 * ACTIVE * 32
+print(f"  batch32 一个 step: 2 x {ACTIVE/1e9:.0f}B x 32 = {flops_step/1e12:.2f} TFLOP")
+fp8 = 8 * 1979e12
+print(f"  8 x H200 fp8: {fp8/1e12:.0f} TFLOP/s")
+print(f"  -> {fp8/flops_step:.0f} step/s = {fp8/flops_step*32:.0f} tok/s 算力上限")
+print()
+print("所以 1000 tok/s 是【算力】允许的范围，且远低于上限。")
+print("单流 decode 受带宽限制，但那个限制被我算错了：")
+print()
+print("=== 我用错的地方 ===")
+print("MLA 的 wq_b/wo_b 是 40MB，但每层只需要读【一次】且 40 层是串行的。")
+print("真实单流 decode 时，这 12.4 GB 是【必须】从 HBM 读的 —— 这点没错。")
+print("但 4.8 TB/s 是【峰值】，真实 GEMV 在稀疏 gather + 小 batch 下只有:")
+print("  实测（我笔记本 8GB 卡）：单次大 GEMV 343 GB/s，理论 336 GB/s 峰值")
+print("  -> 真实效率接近峰值，所以 12.4/4.8 = 2.6s 是对的...")
+print()
+print("除非：专家不需要全读！top-6 里 w1/w3 是按行 gather，且")
+print("w2 的输入是 6 个专家的稀疏和，输出只写一次。真实读的是命中行，不是整块。")

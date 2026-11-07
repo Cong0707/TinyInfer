@@ -493,18 +493,31 @@ class MoE:
                     and not torch.cuda.is_current_stream_capturing()):
                 _sl1 = getattr(getattr(self, "_expert_store", None), "slots", None)
                 if _sl1 is not None:
-                    for _ii in sids.tolist():
+                    _tab1 = getattr(_sl1, "_slot_tab", None)
+                    for _ii, _ee in zip(sids.tolist(), indices.view(-1).tolist()):
                         if int(_ii) >= 0:
                             _sl1._evict_locked(int(_ii))   # 真正归还槽位（非 pin）
+                            # 表也得跟着置 -1：_evict_locked 只动 _by_key，表里留着
+                            # 旧槽位号，下一层路由到同一专家时会从这个格子读到
+                            # 现在住着的别的专家的权重（不报错，数值是错的）。
+                            if _tab1 is not None:
+                                try:
+                                    _tab1[self.layer_id, int(_ee)] = -1
+                                except Exception:
+                                    pass
             _nrows = int(xf.size(0))
             n_exp = int(indices.numel())   # 多行时 = rows * topk
             nmid = int(self.cfg.moe_inter_dim)
             blob = int(sl.blob_bytes)
             off = self._ts_offsets(self.layer_id)
             scr = self._scratch(n_exp * (nmid + (nmid >> 5)), arena[0].device)
+            # moe_fused_down 的 y 形参是 __nv_bfloat16*：这里必须是 bf16。分配成
+            # fp32 时 kernel 只写进每 4 字节的低半部分，读回来是位模式垃圾 ——
+            # 实测 MoE 输出 absmax 从 ~1 变成 217，这就是整条链输出乱码的根因。
             y = getattr(self, "_gpu_y_buf", None)
-            if y is None or y.shape != xf.shape or y.device != xf.device:
-                y = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
+            if (y is None or y.shape != xf.shape or y.device != xf.device
+                    or y.dtype != torch.bfloat16):
+                y = torch.zeros(xf.shape, dtype=torch.bfloat16, device=xf.device)
                 self._gpu_y_buf = y
             else:
                 y.zero_()
@@ -524,14 +537,21 @@ class MoE:
             _aqx = _aqb[:n_exp * _k]
             _rows = int(xf.size(0))
             _tk = max(1, n_exp // _rows)
-            _aqx.view(_rows, _tk, _k).copy_(aq.reshape(_rows, 1, _k).expand(_rows, _tk, _k))
-            _ascb = getattr(self, "_asc_buf", None)
-            if _ascb is None or _ascb.numel() < n_exp * (asc.numel() // max(1, asc.size(0))) :
-                _ascb = torch.empty(n_exp * (asc.numel() // max(1, asc.size(0))), dtype=torch.uint8, device=asc.device)
-                self._asc_buf = _ascb
-            _ascx = _ascb[:n_exp * asc.numel()]
+            # aq 是 float8_e4m3fn、_aqx 是 uint8：直接 copy_ 会走 dtype cast
+            # （e4m3 的 1.0 写成 uint8 的 1），kernel 按字节解 e4m3 就全错。
+            # .view(torch.uint8) 是位重解释，保证搬的是同一批字节。
+            _aqx.view(_rows, _tk, _k).copy_(
+                aq.view(torch.uint8).reshape(_rows, 1, _k).expand(_rows, _tk, _k))
+            # 每行的 scale 字节数是 k/32（不是 asc 整张的 numel）：多行时
+            # n_exp * asc.numel() 会算成 rows 倍，view 直接报 shape 不匹配。
             _nk = asc.numel() // _rows
-            _ascx.view(_rows, _tk, _nk).copy_(asc.reshape(_rows, 1, _nk).expand(_rows, _tk, _nk))
+            _ascb = getattr(self, "_asc_buf", None)
+            if _ascb is None or _ascb.numel() < n_exp * _nk:
+                _ascb = torch.empty(n_exp * _nk, dtype=torch.uint8, device=asc.device)
+                self._asc_buf = _ascb
+            _ascx = _ascb[:n_exp * _nk]
+            _ascx.view(_rows, _tk, _nk).copy_(
+                asc.view(torch.uint8).reshape(_rows, 1, _nk).expand(_rows, _tk, _nk))
             fa(_aqx, _ascx, arena[0], sids, weights.reshape(-1),
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
@@ -731,7 +751,11 @@ class MoE:
         # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
         _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
         if _gpu_only is not None:
-            return _gpu_only
+            # official model.py:905 `y += self.shared_experts(x)` —— 每个 token 都过一遍
+            # shared expert，它和 routed 部分是相加关系。之前这条累加在纯 GPU 路径里
+            # 整段缺失，每层都少一个专家的贡献。
+            _sh = self.shared.forward(xf).reshape(_gpu_only.shape)
+            return (_gpu_only.float() + _sh.float()).to(x.dtype)
         # eager / serve 路径已整段删除：MoE 只有纯 GPU 这一条路。
         raise RuntimeError(
             f"MoE layer {self.layer_id}: pure-GPU path unavailable "
