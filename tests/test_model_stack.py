@@ -90,7 +90,13 @@ def test_two_layer_forward_and_decode():
     # decode 的形状和数值，把它放到卡上才是它本来想测的东西。
     if not torch.cuda.is_available():
         pytest.skip("the MoE path is GPU-only")
-    model.to("cuda")
+    # TinyModel 没有 to()：它的权重是按张量从 store 里取的，逐层用 Block.to()
+    # 搬（engine 也是这么做的）。
+    for _b in model.blocks:
+        _b.to("cuda")
+    model.embed = model.embed.to("cuda")
+    model.out_norm = model.out_norm.to("cuda")
+    model.head = model.head.to("cuda")
     model.reset()
     ids = torch.tensor([[19923, 14, 342, 1030]], device="cuda")
     logits = model.forward(ids, 0)
