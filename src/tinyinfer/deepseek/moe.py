@@ -444,8 +444,18 @@ class MoE:
             # kernel 按 [row, expert] 索引激活，所以这里把每行的激活铺成 n_exp 份。
             # 之前只传了一行（5120 字节），e=1..5 时读的是越界地址 —— 不报错但数值是垃圾。
             _k = int(self.cfg.dim)
-            _aqx = aq.view(1, 1, _k).expand(1, n_exp, _k).reshape(-1)
-            _ascx = asc.view(1, 1, -1).expand(1, n_exp, -1).reshape(-1)
+            _aqb = getattr(self, "_aq_buf", None)
+            if _aqb is None or _aqb.numel() < n_exp * _k or _aqb.device != aq.device:
+                _aqb = torch.empty(n_exp * _k, dtype=torch.uint8, device=aq.device)
+                self._aq_buf = _aqb
+            _aqx = _aqb[:n_exp * _k]
+            _aqx.view(n_exp, _k).copy_(aq.view(1, _k).expand(n_exp, _k))
+            _ascb = getattr(self, "_asc_buf", None)
+            if _ascb is None or _ascb.numel() < n_exp * asc.numel() or _ascb.device != asc.device:
+                _ascb = torch.empty(n_exp * asc.numel(), dtype=torch.uint8, device=asc.device)
+                self._asc_buf = _ascb
+            _ascx = _ascb[:n_exp * asc.numel()]
+            _ascx.view(n_exp, -1).copy_(asc.view(1, -1).expand(n_exp, -1))
             fa(_aqx, _ascx, arena[0], sids, weights[0],
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
