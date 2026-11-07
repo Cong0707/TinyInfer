@@ -2221,7 +2221,7 @@ class Engine:
                 h, pre_mix = b.forward(h, start_pos, pre_mix, positions=positions)
                 if torch.cuda.is_current_stream_capturing() and i == 4:
                     continue
-                if torch.cuda.is_current_stream_capturing() and i >= 8:
+                if torch.cuda.is_current_stream_capturing() and i >= 4:
                     break
                 _dh = getattr(self, "_dump_h", None)
                 if _dh is not None:
