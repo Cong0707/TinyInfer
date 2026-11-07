@@ -290,8 +290,9 @@ class MLACompressedAttention:
                 _fb = _kv_raw.new_empty(b, self.window, self.head_dim)
                 self._kv_buf = _fb
                 self._decode_win_idxs = None
-            _cs = torch.view_as_real(
-                freqs.reshape(1, self.rope_dim // 2)).reshape(-1).float().contiguous()
+            # kernel 要的是 cos‖sin（前 rot/2 个 cos、后 rot/2 个 sin），不是交错的
+            # (cos0,sin0,cos1,sin1,...)。给错了就是 rope 区 64 维里错 63 维。
+            _cs = torch.cat([freqs.real, freqs.imag], dim=-1).reshape(-1).float().contiguous()
             _kvfn = _KV_PREP.get("fn")
             if _kvfn is None:
                 from ..kernels import native as _nat
