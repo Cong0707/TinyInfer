@@ -481,7 +481,7 @@ class MoE:
                     _r0 = sum(1 for _i in range(sl.slots) if sl._refs[_i] == 0)
                     print(f"[diag] L{self.layer_id} miss={_miss} bykey={len(sl._by_key)} "
                           f"free={_free} staged={_stg} refs0={_r0} pinned={sl.pinned_count()} "
-                          f"last_ids={len(getattr(self, '_last_ids', None) or [])} "
+                          f"last_ids={len(getattr(self, '_last_ids', None) or [])} prev={len(getattr(self, '_prev_ids', None) or [])} "
                           f"byslot={[sl._by_key.get((self.layer_id, e), -1) for e in _miss]} "
                           f"tabvals={[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
                     raise RuntimeError(
