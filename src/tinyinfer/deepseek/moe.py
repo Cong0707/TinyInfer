@@ -494,7 +494,16 @@ class MoE:
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
         if _prof:
             self._parts["gate"] += _tp.perf_counter() - _t1
-        y = torch.zeros_like(xf, dtype=torch.float32)
+        # 复用一块累加 buffer：每层新建 + 清零一个 [1, dim] fp32 是 20KB 的 memset
+        # 加一次分配，40 层就是 40 个 memset kernel。zero_() 仍是 memset，但省掉
+        # 分配器往返；这块 buffer 的生命周期跨层，地址固定。
+        _yb = getattr(self, "_y_buf", None)
+        if _yb is None or _yb.shape != xf.shape or _yb.device != xf.device:
+            _yb = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
+            self._y_buf = _yb
+        else:
+            _yb.zero_()
+        y = _yb
         _t2 = _tp.perf_counter() if _prof else 0.0
         import os as _os
         if getattr(self, "_static_decode", False):
