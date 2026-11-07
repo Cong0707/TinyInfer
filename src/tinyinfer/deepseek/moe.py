@@ -418,6 +418,14 @@ class MoE:
                                 zip(indices.view(-1).tolist(), sids.tolist()) if int(sid) < 0})
                 if _miss:
                     self._expert_store.fetch(self.layer_id, _miss)
+                    # fetch 有时只把字节放进 RAM/池而不占槽位（acquire_many 撞到
+                    # RESERVED 时会返回 None）；这里再显式 acquire 一次，保证有槽位号。
+                    for _e in _miss:
+                        if not sl.has(self.layer_id, _e):
+                            try:
+                                sl.acquire(self.layer_id, _e)
+                            except Exception:
+                                pass
                     # table_sync 内部是主机侧攒数组 + 一次 copy_，重建后再索引一次
                     tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
                     sl.table_sync()
