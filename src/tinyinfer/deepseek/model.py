@@ -475,13 +475,9 @@ class TinyModel:
             # 每层用完把引用计数还回去（不 evict）：refs 归零后 LRU 下一层自然覆盖。
             _st = getattr(block.ffn, "_expert_store", None)
             if _st is not None and getattr(_st, "slots", None) is not None:
-                for _e in getattr(block.ffn, "_last_ids", []):
+                for _e in (getattr(block.ffn, "_last_ids", None) or []):
                     try:
                         _st.slots.release(block.ffn.layer_id, int(_e))
-                if __import__("os").environ.get("TI_GPUDBG") == "1" and block.ffn.layer_id <= 2:
-                    _sl = _st.slots
-                    print(f"[rel] L{block.ffn.layer_id} released={len(getattr(block.ffn, '_last_ids', None) or [])} "
-                          f"refs0={sum(1 for _i in range(_sl.slots) if _sl._refs[_i] == 0)}", flush=True)
                     except Exception:
                         pass
         from .hc import hc_split_sinkhorn  # noqa: F401  (kept importable for users)
