@@ -587,6 +587,50 @@ class MoE:
         # indices.reshape(-1).tolist() —— 一次 D2H，CPU 停下来等 GPU 排空，
         # 流水线断一次，之后的重叠要重新累积。实测后就是那 37ms 空隙的主要来源。
         active = None
+        _aq = _asc = None
+        if use_fp4_kernel:
+            # NOTE: do NOT swap this to fp4_native.quantize_act. Measured: the end-to-end
+            # decode output changes ([989,43,...] -> [95991,...]) even though the native
+            # act_quant is bit-identical to the reference on every synthetic shape tested.
+            # Whatever differs is data dependent, so this stays on the reference until
+            # that is found. The cost is that gemv_fp4 (hence tilelang) is still imported
+            # on this path.
+            # Set TI_QUANT_CHECK=1 to run fp4_native.quantize_act_checked, which compares
+            # the native quantiser against the reference on REAL activations and reports
+            # the first mismatch. It returns the reference's answer, so a checked run stays
+            # numerically correct; it is not on by default and not the fast path.
+            # Native quantiser. gemv_fp4.quantize_act imports tilelang at module scope, so
+            # on a deployment without it this whole branch silently produced _aq = None
+            # (the except below) and surfaced later as "NoneType has no attribute dim".
+            # The native path was verified against the reference on REAL activations
+            # (TI_QUANT_CHECK=1, zero fp8 or scale differences over a full decode), not
+            # just synthetic shapes.
+            try:
+                if __import__("os").environ.get("TI_QUANT_CHECK") == "1":
+                    from .fp4_native import quantize_act_checked as quantize_act
+                else:
+                    from .fp4_native import quantize_act
+
+                _aq, _asc = quantize_act(xf, xf.size(-1))
+            except Exception as _exc:
+                if __import__("os").environ.get("TI_QUANT_CHECK") == "1":
+                    import traceback as _tb
+
+                    print(f"[quant-fail] {_exc!r}", flush=True)
+                    _tb.print_exc()
+                _aq = _asc = None
+
+
+        _rc = self._route_counts
+        for _a in active:
+            _rc[_a] = _rc.get(_a, 0) + 1
+        self._last_ids = list(active)  # already the unique routed set (one host sync total)
+        # Decode (one token) reads each expert's packed fp4 tiles directly through the
+        # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
+        # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
+        # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
+        # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
+        # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
         # ---- 纯 GPU 路径：整层不碰 CPU ----
         # 槽位映射在 device 表里（pin_hot_experts 结束后一次性刷好），路由 ids 和权重本来
         # 就在 GPU 上：一次 index_select 就得到每个激活专家的槽位编号，没有 D2H、没有
@@ -665,50 +709,6 @@ class MoE:
         # one activation quantisation for every routed expert of this layer: the
         # quantiser does not depend on the expert, and per-expert (per-row) quantising
         # repeated it 6x per token / 48x at prefill
-        _aq = _asc = None
-        if use_fp4_kernel:
-            # NOTE: do NOT swap this to fp4_native.quantize_act. Measured: the end-to-end
-            # decode output changes ([989,43,...] -> [95991,...]) even though the native
-            # act_quant is bit-identical to the reference on every synthetic shape tested.
-            # Whatever differs is data dependent, so this stays on the reference until
-            # that is found. The cost is that gemv_fp4 (hence tilelang) is still imported
-            # on this path.
-            # Set TI_QUANT_CHECK=1 to run fp4_native.quantize_act_checked, which compares
-            # the native quantiser against the reference on REAL activations and reports
-            # the first mismatch. It returns the reference's answer, so a checked run stays
-            # numerically correct; it is not on by default and not the fast path.
-            # Native quantiser. gemv_fp4.quantize_act imports tilelang at module scope, so
-            # on a deployment without it this whole branch silently produced _aq = None
-            # (the except below) and surfaced later as "NoneType has no attribute dim".
-            # The native path was verified against the reference on REAL activations
-            # (TI_QUANT_CHECK=1, zero fp8 or scale differences over a full decode), not
-            # just synthetic shapes.
-            try:
-                if __import__("os").environ.get("TI_QUANT_CHECK") == "1":
-                    from .fp4_native import quantize_act_checked as quantize_act
-                else:
-                    from .fp4_native import quantize_act
-
-                _aq, _asc = quantize_act(xf, xf.size(-1))
-            except Exception as _exc:
-                if __import__("os").environ.get("TI_QUANT_CHECK") == "1":
-                    import traceback as _tb
-
-                    print(f"[quant-fail] {_exc!r}", flush=True)
-                    _tb.print_exc()
-                _aq = _asc = None
-
-
-        _rc = self._route_counts
-        for _a in active:
-            _rc[_a] = _rc.get(_a, 0) + 1
-        self._last_ids = list(active)  # already the unique routed set (one host sync total)
-        # Decode (one token) reads each expert's packed fp4 tiles directly through the
-        # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
-        # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
-        # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
-        # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
-        # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
         # per-expert (token, slot) selection computed once and reused by both passes
         sels: dict[int, tuple] = {}
         _single = xf.size(0) == 1
