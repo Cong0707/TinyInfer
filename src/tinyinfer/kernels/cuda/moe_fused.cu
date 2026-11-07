@@ -322,7 +322,7 @@ extern "C" __global__ void moe_fused_decode(
     for (int n = blockIdx.x * nwarp + warp; n < n_down_rows; n += gridDim.x * nwarp) {
     // accumulate=0：本 token 第一遍，直接覆盖写（省掉调用方每层一次 y.zero_()
     // 的 memset）。accumulate=1 时保持原有「读旧值再加」的语义。
-    float acc = accumulate ? __bfloat162float(y[n]) : 0.f;
+    float acc = __bfloat162float(y[n]);            // moe_acc6 的 "acc = dst[i]"
         for (int e = 0; e < n_exp; ++e) {
             const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
             const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
@@ -451,7 +451,8 @@ extern "C" __global__ void moe_fused_down(
     if (n >= n_down_rows) return;
 
     // acc 的初值、专家遍历顺序、每次加法的舍入都与 moe_acc6 完全相同
-    float acc = __bfloat162float(y[n]);                          // moe_acc6 的 "acc = dst[i]"
+    // accumulate=0：本 token 第一遍，直接覆盖写，调用方就不必每层 y.zero_()
+    float acc = accumulate ? __bfloat162float(y[n]) : 0.f;
     for (int e = 0; e < n_exp; ++e) {
         const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
         const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
