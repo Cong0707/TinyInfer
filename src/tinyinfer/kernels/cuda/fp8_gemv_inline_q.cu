@@ -99,10 +99,10 @@ extern "C" __global__ void __launch_bounds__(1024) fp8_gemv_inline_q(
     __nv_bfloat16* __restrict__ y,          // [N]
     int n_rows, int k_dim, float eps) {
     // 动态 shared：k_dim 字节 fp8 激活 + (k_dim >> 5) 字节 e8m0 scale。launch 时必须
-    // 传 k_dim + (k_dim >> 5)，少了阶段二会读到别的 block 的 shared 之外。
+    // 传 k_dim + (k_dim >> 5)：shared 写入不做边界检查，传 0 会写穿到本 block 的区域之外。
     extern __shared__ __align__(16) unsigned char smem[];
     __nv_fp8_e4m3* aq = reinterpret_cast<__nv_fp8_e4m3*>(smem);
-    unsigned char* asc = smem + k_dim;
+    unsigned char* asc_q = smem + k_dim;
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;      // 0 .. 31
@@ -111,8 +111,9 @@ extern "C" __global__ void __launch_bounds__(1024) fp8_gemv_inline_q(
     // ---- 阶段一：把 x 量化进 shared -------------------------------------------
     // 一个 warp 就是一组 32 个 k（32 个 lane 是这一组），absmax 是一次 shuffle
     // 归约，scale 一组算一次 —— 与 act_quant.cu 的调度完全相同，只把输出指向 shared。
-    // 32 个 warp 每轮覆盖 32 组 = 1024 个 k，所以 K=5120 时第一轮就干完 31 组剩下
-    // 的交给第二轮（g < nb 的循环上界，warp 内部所有 lane 迭代次数一致，无发散）。
+    // warp 与组一一对应，每个 warp 的迭代次数只取决于 nb：K=5120（nb=160）每个 warp
+    // 5 轮，K=2304（nb=72）前 8 个 warp 3 轮、其余 2 轮 —— warp 内所有 lane 一致，
+    // 没有发散，__shfl 不会挂。
     for (int g = warp; g < nb; g += 32) {
         const long long base = (long long)g * 32;
         const float v = __bfloat162float(x[base + lane]);
@@ -134,7 +135,7 @@ extern "C" __global__ void __launch_bounds__(1024) fp8_gemv_inline_q(
             int code = (int)lrintf(log2f(y_s)) + 127;
             if (code < 0) code = 0;
             if (code > 255) code = 255;
-            asc[g] = (unsigned char)code;
+            asc_q[g] = (unsigned char)code;
         }
     }
     // 整块同步：阶段二所有 warp 读同一份量化结果。这里不能提前 return，全部 1024
@@ -143,7 +144,7 @@ extern "C" __global__ void __launch_bounds__(1024) fp8_gemv_inline_q(
 
     // 阶段二的 a / as 指向 shared，其余与 fp8_gemv_bs.cu 逐字相同。
     const unsigned char* a = reinterpret_cast<const unsigned char*>(aq);
-    const unsigned char* as = asc;
+    const unsigned char* as = asc_q;
 
     // One warp handles one row, so the block covers 32 rows and the grid is
     // ceil(n_rows/32). Rows per block is no longer a free knob: the quant phase above
@@ -213,7 +214,7 @@ extern "C" __global__ void __launch_bounds__(1024) fp8_gemv_inline_q(
                 av[j] = (kk < k_dim) ? e4m3_one(a[kk]) : 0.f;
             }
         }
-        const float asc_s = e8m0(as[grp]);
+        const float asc = e8m0(as[grp]);
         const float wsc = e8m0(wsr[grp]);
 
         float part = 0.f;
@@ -238,7 +239,7 @@ extern "C" __global__ void __launch_bounds__(1024) fp8_gemv_inline_q(
         // BROKE the shapes that used to be bit-identical: end to end went from
         // [989,43,4571,5958] to [989,19923,201,19923]. Whatever tilelang's gemm does
         // internally, it is not that, so this stays as the verified form.
-        if (valid) acc += part * asc_s * wsc;
+        if (valid) acc += part * asc * wsc;
     }
     // Warp reduce. The groups are already summed in the same order as tilelang's
     // k loop within each lane; a fully serial k-order reduce was tried and is far

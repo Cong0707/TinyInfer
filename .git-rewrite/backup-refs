@@ -1,10 +1,5 @@
 7e2dc1ac862b0d3c4cc872cf63eb6ef3420b8de6 commit	refs/heads/backup-before-rewrite
-1734b608abf2ebb06506fdd6c8dc0e3d70dec242 commit	refs/heads/master
-1ab575ee4a4d6af8d842e63a01a35655d613cf12 commit	refs/original/refs/heads/backup-before-rewrite
-1ab575ee4a4d6af8d842e63a01a35655d613cf12 commit	refs/original/refs/heads/master
-1ab575ee4a4d6af8d842e63a01a35655d613cf12 commit	refs/original/refs/remotes/origin/master
-a800e6a91cd5dfb9b6bd6d40698884c48748b0cf commit	refs/original/refs/stash
-6224f59986a454e61c5e5d8d96aca05bf1f83e51 commit	refs/original/refs/tags/checkpoint-2026-11-06
+94a003464027aa75fceb825288c50f01435b7bd6 commit	refs/heads/master
 1734b608abf2ebb06506fdd6c8dc0e3d70dec242 commit	refs/remotes/origin/HEAD
 1734b608abf2ebb06506fdd6c8dc0e3d70dec242 commit	refs/remotes/origin/master
 a800e6a91cd5dfb9b6bd6d40698884c48748b0cf commit	refs/stash
