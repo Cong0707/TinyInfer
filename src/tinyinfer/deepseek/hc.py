@@ -267,7 +267,10 @@ def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
     global _FUSED_PRE_NORM
     import os as _os
 
-    if _FUSED_PRE_NORM is not False and _os.environ.get("TI_FUSE") == "1":
+    # 无条件走融合：hc_pre_rms_norm.cu 本来就把「按 pre_mix 收起超连接轴」和
+    # rms_norm 写在一个 kernel 里，但这里原来要求 TI_FUSE=1 才进 —— 默认情况每层
+    # 都退回「hc_pre 一个 kernel + rms_norm 一个 kernel」，40 层就是多 40 次 launch。
+    if _FUSED_PRE_NORM is not False:
         if _FUSED_PRE_NORM is None:
             try:
                 from ..kernels import native
