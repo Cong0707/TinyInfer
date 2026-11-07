@@ -120,6 +120,33 @@ def fp8_linear_q(aq: torch.Tensor, asc: torch.Tensor, w_fp8: torch.Tensor,
     return y.view(1, n)
 
 
+def fp8_linear_dual(aq: torch.Tensor, asc: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor,
+                    w2: torch.Tensor, s2: torch.Tensor):
+    """一次 launch 算两个 fp8 GEMV，共享同一份已量化的激活。
+
+    attention 里 q_a_proj 和 kv_a_proj_with_mqa 吃的是同一个 hidden，vLLM 把它们
+    拼成一个 FusedA 权重走一次 GEMM；这里不拼权重，而是把两段行拼进同一个 grid
+    （n < n1 走 w1，否则走 w2），效果相同：一次 launch、一次激活读取。
+    """
+    from .kernels import native
+
+    n1, k = int(w1.shape[0]), int(w1.shape[1])
+    n2 = int(w2.shape[0])
+    y1 = torch.empty(n1, device=aq.device, dtype=torch.bfloat16)
+    y2 = torch.empty(n2, device=aq.device, dtype=torch.bfloat16)
+    key = ("fp8_gemv_dual", n1, n2, k)
+    fn = _GEMV_BOUND.get(key)
+    if fn is None:
+        fn = native.BoundLaunch(native.kernel("fp8_gemv_dual", "fp8_gemv_dual"),
+                                ((n1 + n2 + 7) // 8,), (256,), "TTTTTTTTiii")
+        _GEMV_BOUND[key] = fn
+    fn(aq.view(torch.uint8).reshape(-1), asc.view(torch.uint8).reshape(-1),
+       w1.view(torch.uint8).reshape(-1), s1.view(torch.uint8).reshape(-1),
+       w2.view(torch.uint8).reshape(-1), s2.view(torch.uint8).reshape(-1),
+       y1, y2, n1, n2, k, stream=None)
+    return y1.view(1, n1), y2.view(1, n2)
+
+
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, block: int = 32) -> torch.Tensor:
     # Cast BEFORE the fast path decides anything. act_quant only has a native
     # kernel for bf16 input; handing it fp32 falls back to the tilelang one, which

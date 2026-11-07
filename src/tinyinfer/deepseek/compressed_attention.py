@@ -252,14 +252,17 @@ class MLACompressedAttention:
             _xf = x.reshape(-1, int(x.shape[-1]))
             _shared_q = _aq(_xf, 32, "ue8m0", torch.float8_e8m0fnu)
         if _shared_q is not None:
-            from ..gemm import fp8_linear_q
+            from ..gemm import fp8_linear_dual
             _aq_x, _asc_x = _shared_q
-            _qa = fp8_linear_q(_aq_x, _asc_x, self.wq_a.weight, self.wq_a.scale)
+            # 两个投影一次 launch（vLLM 的 FusedA 做法：拼进同一个 grid）
+            _qa, _kv_raw = fp8_linear_dual(
+                _aq_x, _asc_x,
+                self.wq_a.weight, self.wq_a.scale,
+                self.wkv.weight, self.wkv.scale)
             qr = rms_norm(_qa.view(*x.shape[:-1], int(self.wq_a.weight.shape[0])),
                           self.q_norm, self.eps)
             q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
             apply_rope(q[..., -self.rope_dim:], freqs)
-            _kv_raw = fp8_linear_q(_aq_x, _asc_x, self.wkv.weight, self.wkv.scale)
             _kv_raw = _kv_raw.view(*x.shape[:-1], int(self.wkv.weight.shape[0]))
         else:
             qr = rms_norm(_lin(self.wq_a, x), self.q_norm, self.eps)
