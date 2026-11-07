@@ -410,7 +410,7 @@ class MoE:
                       f"shape={tuple(indices.shape)}", flush=True)
             sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
             if not torch.cuda.is_current_stream_capturing():
-                self._last_ids = [int(v) for v in indices.view(-1).tolist()]
+                self._last_ids = getattr(self, "_last_ids", []) + [int(v) for v in indices.view(-1).tolist()]
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()
