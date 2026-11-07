@@ -365,36 +365,14 @@ class MoE:
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
-        if not arena or len(arena) != 1:
+        if tab is None or not arena or len(arena) != 1:
             return None
-        if tab is None:
-            # 表是懒建的；warmup 阶段还没有路由统计，先建一张全 -1 的表，
-            # 下面的 miss 分支会把它填起来。
-            try:
-                _n_exp_total = int(getattr(getattr(self, 'cfg', None), 'n_routed_experts', 0) or 0)
-                tab = sl.slot_table(int(getattr(self, '_n_layers_hint', 40) or 40),
-                                    _n_exp_total or 384)
-        except Exception as _exc:
-            raise RuntimeError(
-                f"MoE layer {self.layer_id}: pure-GPU path failed: {_exc!r}") from _exc
+        try:
             from .fp4_native import quantize_act
             from ..kernels import native
 
             aq, asc = quantize_act(xf, xf.size(-1))
             sids = tab[self.layer_id].index_select(0, indices.view(-1))
-            # miss 时自己补：缺的专家当场 fetch 进槽位，然后重建 sids。
-            # 不再是「另一条路径」，同一条路上把缺的填上。
-            if bool((sids < 0).any().item()):
-                _miss = [int(v) for v, sid in zip(indices.view(-1).tolist(),
-                                                   sids.tolist()) if int(sid) < 0]
-                if _miss:
-                    self._expert_store.fetch(self.layer_id, sorted(set(_miss)))
-                    sl.table_sync()
-                    tab = sl._slot_tab
-                    sids = tab[self.layer_id].index_select(0, indices.view(-1))
-                if bool((sids < 0).any().item()):
-                    raise RuntimeError(
-                        f"MoE layer {self.layer_id}: experts {_miss} still not resident")
             n_exp = int(indices.numel())
             nmid = int(self.cfg.moe_inter_dim)
             blob = int(sl.blob_bytes)
@@ -611,12 +589,6 @@ class MoE:
         _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
         if _gpu_only is not None:
             return _gpu_only
-        # 慢路径已删除：不再回落。缺槽位表、形状不对、或 kernel 出错，
-        # 这里直接抛，由调用方看到真实原因，而不是悄悄走另一条计数不同的路。
-        raise RuntimeError(
-            f"MoE layer {self.layer_id}: pure-GPU path unavailable "
-            f"(cuda={xf.is_cuda} rows={xf.size(0)} "
-            f"slot_tab={getattr(getattr(getattr(self, '_expert_store', None), 'slots', None), '_slot_tab', None) is not None})")
         if _prof:
             self._parts["gate"] += _tp.perf_counter() - _t1
         # 复用一块累加 buffer：每层新建 + 清零一个 [1, dim] fp32 是 20KB 的 memset
