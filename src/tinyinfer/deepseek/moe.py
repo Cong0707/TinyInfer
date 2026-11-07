@@ -376,7 +376,7 @@ class MoE:
                     raise RuntimeError(f"MoE layer {self.layer_id}: row {_r} unavailable "
                                      f"[{getattr(self, '_gpu_fail', '?')}]")
                 _rows.append(_one)
-            return torch.cat(_rows, dim=0)
+            return torch.cat(_rows, dim=1)   # x 是 [b, s, d]，按 s 拼
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
