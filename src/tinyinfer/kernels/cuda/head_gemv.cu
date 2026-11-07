@@ -40,9 +40,8 @@ extern "C" __global__ void head_gemv(const float* __restrict__ h,
             for (int i = 0; i < 4; ++i) {
                 const __nv_bfloat162 w2 = *reinterpret_cast<const __nv_bfloat162*>(&wu[i]);
                 const __nv_bfloat162 h2 = *reinterpret_cast<const __nv_bfloat162*>(&hu[i]);
-                float2 wf = __bfloat1622float2(w2);
-                float2 hf = __bfloat1622float2(h2);
-                acc += hf.x * wf.x + hf.y * wf.y;
+                acc += __bfloat162float(h2.x) * __bfloat162float(w2.x)
+                     + __bfloat162float(h2.y) * __bfloat162float(w2.y);
             }
         } else {
             for (int k = k0; k < k_dim; ++k) acc += hb[k] * row[k];
