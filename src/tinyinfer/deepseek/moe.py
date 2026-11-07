@@ -360,6 +360,8 @@ class MoE:
         自包含：只吃 x / xf / indices / weights 和槽位表，不引用 forward 后面才定义的
         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
         """
+        if __import__("os").environ.get("TI_GPUDBG") == "1":
+            print(f"[gpuenter] L{self.layer_id}", flush=True)
         if not (xf.is_cuda and xf.size(0) == 1):
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
