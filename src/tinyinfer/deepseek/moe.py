@@ -361,6 +361,7 @@ class MoE:
         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
         """
         if not (xf.is_cuda and xf.size(0) == 1):
+            return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
