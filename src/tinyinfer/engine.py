@@ -2472,7 +2472,7 @@ class Engine:
                     out = self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
             finally:
-            pass  # 不 restore（snap=None）
+                pass
             self._graph = {"graph": g, "in": in_buf, "out": out, "start_pos": start_pos}
             self._graph_start_pos = start_pos
             print(f"[tinyinfer] decode CUDA graph captured at pos={start_pos}", flush=True)
