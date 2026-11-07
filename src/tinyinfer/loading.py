@@ -2388,6 +2388,11 @@ class VramSlotCache:
         else:
             cpu = data
         buf = self._buffers[idx]
+        # 这块槽位上一段数据可能还有 kernel 在读（归还时只记了 compute stream
+        # 的完成事件）：DMA 在 copy stream 上，不 wait 就会盖掉还在用的显存。
+        _blk_ev = self._event[idx]
+        if _blk_ev is not None and self._copy_stream is not None:
+            self._copy_stream.wait_event(_blk_ev)
         if cpu.dtype != buf.dtype:
             cpu = cpu.view(buf.dtype)
         # prefetch thread uses the second staging buffer so it never blocks a fetch copy

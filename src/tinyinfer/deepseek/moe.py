@@ -398,20 +398,6 @@ class MoE:
     def _forward_gpu_only(self, x: torch.Tensor, xf: torch.Tensor,
                           indices: torch.Tensor, weights: torch.Tensor):
         """整层不碰 CPU 的 decode 路径；走不通返回 None，由调用方回落慢路径。
-        # 上一轮自己用过的专家先还引用：refs 归零后 LRU 才能覆盖它们。
-        # （放在这里而不是 model.py，是因为那条路实测没被执行到。）
-        _prev = getattr(self, "_prev_ids", None)
-        _sl0 = getattr(getattr(self, "_expert_store", None), "slots", None)
-        if _prev and _sl0 is not None:
-            for _pe in _prev:
-                try:
-                    _sl0.release(self.layer_id, int(_pe))
-                except Exception as _ex:
-                    if __import__("os").environ.get("TI_GPUDBG") == "1":
-                        print(f"[relfail] L{self.layer_id} e={_pe} {_ex!r}", flush=True)
-                    pass
-        self._prev_ids = None
-
         自包含：只吃 x / xf / indices / weights 和槽位表，不引用 forward 后面才定义的
         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
         """
@@ -483,8 +469,6 @@ class MoE:
             sids = _sb[:_sn]
             torch.index_select(tab[self.layer_id], 0,
                                indices.view(-1).clamp_(0, 383), out=sids)
-            if not torch.cuda.is_current_stream_capturing():
-                self._prev_ids = (getattr(self, "_prev_ids", None) or []) + [int(v) for v in indices.view(-1).tolist()]
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             # 「有没有缺」由 GPU 判断（moe_miss_scan 在 device 上扫 slot_ids），CPU 只
             # 拿回缺的那几个专家 id 去搬 —— 不再把整条 sids/indices 拉回来自己比。
@@ -577,23 +561,19 @@ class MoE:
                           f"tabvals={[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
-            # 只有「多行 prefill 分批」才需要腾槽位：那样一批就要 18 个专家，不还回去
-            # 会把池子占满。逐 token 的 prefill 和 decode 每步每层只要 6 个，还回去
-            # 等于让下一步全部 miss —— 那是每 token 重读 4.5GB、0.7 tok/s 的来源。
-            # 自适应：多行 prefill 每层要 rows*topk 个槽位，必须还；decode 只有
-            # topk 个，能不能留住取决于池子装不下整步（40 层 x topk）。8GB 卡的
-            # 271 个装不下 240，必须继续 evict；L20 的 1359 装得下，就不 evict，
-            # 让专家常驻 —— 同一份代码，规模由 slots 自己决定。
+            # 池子装不下「整步」（40 层 x topk）的小卡（8GB / 271 槽位）：本步用完
+            # 立刻还回去，否则下一层就没槽位可拿。大卡不在这里还 —— 还了下一步
+            # 全部 miss，那是每 token 重读 4.5GB、0.7 tok/s 的来源。大卡的归还在
+            # MoE.forward 里按 _last_ids 做（只留本层最近一次用过的那几个）。
             _need_step = int(getattr(self.cfg, "n_layers", 40)) * int(
                 getattr(self.cfg, "n_activated_experts", 6))
             _pool = int(getattr(getattr(getattr(self, "_expert_store", None), "slots", None),
                                 "slots", 0) or 0)
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()
-                    and (xf.size(0) > 1 or _pool < _need_step * 2)):
+                    and _pool < _need_step * 2):
                 # fd 是异步 launch 的：槽位一还给池子，下一个 acquire 立刻就能覆盖
-                # 这块显存，而 kernel 可能还在读它。先同步再还（只有多行 prefill
-                # 走这里，这个等待本来就藏着 IO）。
+                # 这块显存，而 kernel 可能还在读它。先同步再还。
                 torch.cuda.synchronize()
                 _sl1 = getattr(getattr(self, "_expert_store", None), "slots", None)
                 if _sl1 is not None:
@@ -865,6 +845,15 @@ class MoE:
         xf = x.view(-1, self.cfg.dim)
         _t1 = _tp.perf_counter() if _prof else 0.0
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
+        # 本层上一次用过、这一次不再用的专家，把槽位还给池子。池子是按「一次前向
+        # 要用多少个专家」配的（40 层 x topk = 240，L20 有 1359，余量很大），但
+        # 逐 token 的 prefill 每层会一路攒下几十个历史专家 —— 48 个 token 就能把
+        # 1359 塞满，满了以后一个可回收的槽位都没有，就是 still not resident。
+        # 只留「本层最近一次用过的」：相邻 token 的路由高度重合，这才是真复用。
+        # kernel 是异步 launch 的，归还的槽位可能在别的层被覆盖 —— 所以归还前
+        # 在槽位上记一个 compute stream 的完成事件，loading 的 DMA 会 wait 它。
+        if not torch.cuda.is_current_stream_capturing():
+            self._last_ids = sorted({int(v) for v in indices.view(-1).tolist()})
         # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
         _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
         if _gpu_only is not None:
