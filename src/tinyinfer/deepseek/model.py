@@ -481,8 +481,22 @@ class TinyModel:
         if head.dtype == torch.float32:
             h = h.float()
             return torch.nn.functional.linear(h, head)
-        # bf16 head 走一次 cuBLAS GEMV：1.3GB / 719GB/s = 1.8ms。
-        # 原来按 32768 分四块跑 fp32 GEMM（每块把权重 cast 成 fp32，等于读 2x2.6GB），
-        # M=1 的 GEMM 在 tensor core 上又是 M 维闲置，实测 7.4ms。
-        _hb = h.to(head.dtype)
-        return torch.nn.functional.linear(_hb, head)
+        # head 量化成 fp8：1.3GB -> 0.65GB，满带宽下这就是 1.8ms -> 0.9ms。
+        # per-32 维一组 e8m0 scale，和 MoE 专家用的是同一套 fp8_gemv。
+        _hq = getattr(self, "_head_fp8", None)
+        if _hq is None:
+            _w = head.detach().to(torch.bfloat16)
+            _n, _k = int(_w.shape[0]), int(_w.shape[1])
+            _nb = _k // 32
+            _wr = _w.view(_n, _nb, 32)
+            _amax = _wr.float().abs().amax(dim=2).clamp(min=1e-4)
+            _exp = _amax.log2().ceil()
+            _sc = torch.pow(2.0, _exp - int(torch.finfo(torch.float8_e4m3fn).max).bit_length())
+            _q = (_wr.float() / _sc.unsqueeze(-1)).clamp(-448.0, 448.0)
+            _wq = _q.to(torch.float8_e4m3fn).view(_n, _k)
+            _ws = (_exp + 127).to(torch.uint8).view(torch.float8_e8m0fnu)
+            _hq = self._head_fp8 = (_wq, _ws, _n, _k)
+            del _w, _wr, _amax, _exp, _sc, _q
+        from .gemm import fp8_linear as _fp8_lin
+        _hv = h.reshape(1, -1)
+        return _fp8_lin(_hv, _hq[0], _hq[1]).view(*h.shape[:-1], _hq[2])
