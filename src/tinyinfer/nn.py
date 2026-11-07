@@ -109,21 +109,7 @@ def window_idxs_ring(start_pos: int, seqlen: int, old_len: int, window: int, dev
     # start_pos 给 tensor 也能算：arange 只生成 [0, seqlen)，位置靠广播加进去。
 
 
-    if torch.is_tensor(start_pos):
-        base = start_pos
-    else:
-        # 捕获图时不能临时分配 tensor：用一块全局 buffer，调用方在 replay 前写值。
-        global _POS_BUF
-        if _POS_BUF is None or _POS_BUF.device != torch.device(device or "cuda"):
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-                base = torch.zeros((), dtype=torch.long, device=device)
-            else:
-                _POS_BUF = torch.zeros((), dtype=torch.long, device=device)
-                base = _POS_BUF
-        else:
-            if not torch.cuda.is_current_stream_capturing():
-                _POS_BUF.fill_(int(start_pos))
-            base = _POS_BUF
+    base = start_pos if torch.is_tensor(start_pos) else torch.tensor(start_pos, device=device)
     gpos = (base + torch.arange(seqlen, device=device))[:, None] - back[None, :]
     idx = gpos % window
     valid = gpos >= 0
