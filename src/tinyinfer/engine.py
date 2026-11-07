@@ -2107,7 +2107,8 @@ class Engine:
         # expert prefetch: learned CPU predictor first, temporal routing as fallback
         pred = None
         tok_now = None
-        if self.enable_prefetch and start_pos > 0:
+        if (self.enable_prefetch and start_pos > 0
+                and not torch.cuda.is_current_stream_capturing()):
             if self.predictor is not None and ids.numel() == 1:
                 tok_now = int(ids.reshape(-1)[0].item())
                 pred = self.predictor.predict(tok_now)
