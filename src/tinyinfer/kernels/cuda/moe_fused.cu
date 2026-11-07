@@ -197,4 +197,116 @@ __device__ __forceinline__ float warp_max(float v) {
 
 }  // namespace
 
-// @@PART3@@
+// ---------------------------------------------------------------------------
+// 一个 block 负责一段输出行；block 内先把所有专家的量化激活算进共享内存，再按专家序累加。
+// 动态共享内存布局（调用方按 smem_bytes 传入）：
+//   [0, n_exp*k_mid)      a8 ：每个专家量化后的激活（fp8 e4m3，[e][k_mid]）
+//   [.., + n_exp*nb)      as8：上面的 e8m0 scale 字节（[e][k_mid/32]）
+//   [.., + 2*k_mid)       act：当前专家的 bf16 暂存，供 32 宽分组量化用
+// ---------------------------------------------------------------------------
+extern "C" __global__ void moe_fused_decode(
+    const unsigned char* __restrict__ aq,        // [n_exp, k_dim] 已量化的激活 fp8 e4m3
+    const unsigned char* __restrict__ asc,       // [n_exp, k_dim/32] e8m0
+    const unsigned char* __restrict__ arena,     // 槽位大 buffer：[slot][blob_bytes]
+    const int* __restrict__ slot_ids,            // [n_exp] 每个 active 专家的槽位编号
+    const float* __restrict__ w_exp,             // [n_exp] 路由权重
+    __nv_bfloat16* __restrict__ y,               // [dim] 累加输出（原地 +=）
+    int n_exp, int n_gate_rows, int k_in, int n_down_rows, int k_mid,
+    int blob_bytes,
+    int w1_off, int s1_off, int w3_off, int s3_off,     // gate/up 的权重与 scale 偏移
+    int w2_off, int s2_off,                              // down 的偏移
+    float limit)
+{
+    extern __shared__ unsigned char smem[];
+    const int nb = k_mid >> 5;                       // 每 32 维一组，共 nb 组
+    unsigned char* a8 = smem;
+    unsigned char* as8 = a8 + (long long)n_exp * k_mid;
+    __nv_bfloat16* act = reinterpret_cast<__nv_bfloat16*>(as8 + (long long)n_exp * nb);
+
+    // fp4 表放共享内存：用运行期 nibble 索引 __constant__ 会被 replay，shared 一次就出
+    __shared__ float lut[16];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarp = blockDim.x >> 5;
+    if (tid < 16) lut[tid] = kFp4Table[tid];
+    __syncthreads();
+
+    // gate 的行数就是中间维度；两者不相等时取小的那个，保证不越界写 act[]
+    const int n_mid = (n_gate_rows < k_mid) ? n_gate_rows : k_mid;
+
+    // ================= 阶段一：gemv(gate/up) -> clamp/silu/权重 -> fp8 量化 =================
+    // 对应 moe_gemv6(gate_up) + moe_act_q6 两次 launch，逐个专家进行。
+    for (int e = 0; e < n_exp; ++e) {
+        // 槽位编号就是虚拟地址：arena + slot*blob_bytes + 层内固定偏移
+        const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
+        const unsigned char* w1 = arena + eb + w1_off;
+        const unsigned char* s1 = arena + eb + s1_off;
+        const unsigned char* w3 = arena + eb + w3_off;
+        const unsigned char* s3 = arena + eb + s3_off;
+        // 参考实现的 gate_up 传 act_stride=0：同一行激活喂所有专家。
+        // 这里按任务给定的 [n_exp, k_dim] 布局逐专家索引；若上游只有一行共享激活，
+        // 把下面两行改成 aq / asc 即可（算术完全相同）。
+        const unsigned char* ae = aq + (long long)e * k_in;
+        const unsigned char* ase = asc + (long long)e * (k_in >> 5);
+
+        for (int n = warp; n < n_mid; n += nwarp) {
+            const float g0 = gemv_row<0>(ae, ase, w1 + (long long)n * (k_in >> 1),
+                                         s1 + (long long)n * (k_in >> 5), k_in, lane, lut);
+            const float u0 = gemv_row<0>(ae, ase, w3 + (long long)n * (k_in >> 1),
+                                         s3 + (long long)n * (k_in >> 5), k_in, lane, lut);
+            if (lane == 0) {
+                // (a) 复现 moe_gemv6 把结果写成 bf16、moe_act_q6 再从 bf16 读回的那次舍入
+                float g = __bfloat162float(__float2bfloat16(g0));
+                float u = __bfloat162float(__float2bfloat16(u0));
+                // (b) clamp：limit <= 0 时不做
+                if (limit > 0.f) {
+                    u = fminf(fmaxf(u, -limit), limit);
+                    g = fminf(g, limit);
+                }
+                // (c) silu(g) * u * w_exp[e]；路由权重只在这里乘**一次**
+                const float s = g / (1.f + __expf(-g));
+                // (d) 先舍入到 bf16：moe_act_q6 里 v 是 bf16 之后才参与 amax 和量化
+                act[n] = __float2bfloat16(s * u * w_exp[e]);
+            }
+        }
+        __syncthreads();
+
+        // (e) 量化：一个 warp 负责一个 32 宽分组，与 moe_act_q6 / act_quant.cu 同调度
+        for (int gi = warp; gi < nb; gi += nwarp) {
+            const int i = (gi << 5) + lane;
+            const float v = __bfloat162float(act[i]);
+            float amax = warp_max(fabsf(v));
+            amax = fmaxf(amax, 1e-4f);                 // 参考的下限
+            const float y_s = round_scale(amax);       // 2^ceil(log2(amax/448))
+            const float qv = fminf(fmaxf(v / y_s, -448.0f), 448.0f);
+            a8[(long long)e * k_mid + i] =
+                (unsigned char)__nv_cvt_float_to_fp8(qv, __NV_SATFINITE, __NV_E4M3);
+            if (lane == 0) {
+                // e8m0 只存指数：code = ex + 127，解码即 2^(code-127) = y_s
+                const int ex = fast_log2_ceil(amax * (1.f / 448.f));
+                as8[(long long)e * nb + gi] = (unsigned char)(ex + 127);
+            }
+        }
+        __syncthreads();
+    }
+
+    // ===================== 阶段二：down + 按专家顺序累加进 y =====================
+    // 对应 moe_gemv6(down, 平面 0) + moe_acc6 两次 launch。
+    // acc 的初值与加法顺序与 moe_acc6 完全相同：float acc = dst[i]; for e: acc += ...
+    for (int n = blockIdx.x * nwarp + warp; n < n_down_rows; n += gridDim.x * nwarp) {
+        float acc = __bfloat162float(y[n]);            // moe_acc6 的 "acc = dst[i]"
+        for (int e = 0; e < n_exp; ++e) {
+            const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
+            const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
+            const unsigned char* s2 = arena + eb + s2_off + (long long)n * (k_mid >> 5);
+            // a 与 as 指向本 block 自己算出来的共享内存激活（fp8 模式）
+            const float d = gemv_row<0>(a8 + (long long)e * k_mid,
+                                        as8 + (long long)e * nb, w2, s2, k_mid, lane, lut);
+            // 复现 moe_gemv6 的 bf16 存储 + moe_acc6 的 bf16 读取：先舍入再加。
+            // 注意：w_exp 已在阶段一乘过，这里**不再**乘（moe_acc6 只做加法）
+            if (lane == 0) acc += __bfloat162float(__float2bfloat16(d));
+        }
+        if (lane == 0) y[n] = __float2bfloat16(acc);
+    }
+}

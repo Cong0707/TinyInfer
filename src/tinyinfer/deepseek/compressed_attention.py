@@ -297,7 +297,7 @@ class MLACompressedAttention:
                 from ..kernels import native as _nat
                 _kvfn = _KV_PREP["fn"] = _nat.BoundLaunch(
                     _nat.kernel("kv_norm_rope_quant", "kv_norm_rope_quant"),
-                    (1,), (128,), "TTTTOif")
+                    (1,), (128,), "TTTTif")
             _kvfn(_kv_raw.reshape(-1), self.kv_norm.reshape(-1), _cs,
                   _fb.reshape(-1), int(start_pos) % self.window,
                   float(self.eps), stream=None)
