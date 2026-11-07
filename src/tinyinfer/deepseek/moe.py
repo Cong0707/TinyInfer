@@ -864,18 +864,13 @@ class MoE:
             if _stale:
                 _slr = getattr(getattr(self, "_expert_store", None), "slots", None)
                 if _slr is not None:
-                    _evr = None
                     for _se in _stale:
                         if _se in _keep:
                             continue
                         _sir = _slr._by_key.get((self.layer_id, _se))
                         if _sir is None:
                             continue
-                        if _evr is None:
-                            _evr = torch.cuda.Event()
-                            _evr.record(torch.cuda.current_stream())
-                        _slr._evict_locked(_sir)
-                        _slr._event[_sir] = _evr
+                        _slr._evict_locked(_sir)   # 里面会记 dirty 事件，DMA 覆盖前 wait
             self._slots_last = _keep
         # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
         _lid = getattr(self, "_last_ids", None)
@@ -887,16 +882,9 @@ class MoE:
         if (_lid and not torch.cuda.is_current_stream_capturing()):
             _slr = getattr(getattr(self, "_expert_store", None), "slots", None)
             if _slr is not None:
-                _evr = None
                 for _se in _lid:
-                    _sir = _slr._by_key.get((self.layer_id, _se))
-                    if _sir is None:
-                        continue
-                    if _evr is None:
-                        _evr = torch.cuda.Event()
-                        _evr.record(torch.cuda.current_stream())
-                    _slr._event[_sir] = _evr
-                    _slr.release(self.layer_id, _se)
+                    if _slr._by_key.get((self.layer_id, _se)) is not None:
+                        _slr.release(self.layer_id, _se)
         if _gpu_only is not None:
             # official model.py:905 `y += self.shared_experts(x)` —— 每个 token 都过一遍
             # shared expert，它和 routed 部分是相加关系。之前这条累加在纯 GPU 路径里

@@ -2115,6 +2115,10 @@ class VramSlotCache:
         self._event: list[Any] = [None] * self.slots
         self._by_key: dict[tuple[int, int], int] = {}
         self._lru: list[int] = []
+        # 被收回、但 kernel 可能还在读的槽位 -> 归还时刻的 compute stream 事件。
+        # 只有这些槽位在下次 DMA 覆盖前需要 wait；用 _event 不行，那个字段每个
+        # 槽位都有值（publish 时写的），等于每次拷贝都插一个跨 stream 同步点。
+        self._dirty: dict[int, Any] = {}
         # 槽位分配代次：每次 _by_key 变动就 +1。kernel 侧按槽位编号寻址，编号一变
         # 旧的编号数组就指向别人的字节 —— 调用方用这个代次给缓存做键。
         self._gen = 0
@@ -2390,7 +2394,7 @@ class VramSlotCache:
         buf = self._buffers[idx]
         # 这块槽位上一段数据可能还有 kernel 在读（归还时只记了 compute stream
         # 的完成事件）：DMA 在 copy stream 上，不 wait 就会盖掉还在用的显存。
-        _blk_ev = self._event[idx]
+        _blk_ev = self._dirty.pop(idx, None)
         if _blk_ev is not None and self._copy_stream is not None:
             self._copy_stream.wait_event(_blk_ev)
         if cpu.dtype != buf.dtype:
@@ -2557,6 +2561,17 @@ class VramSlotCache:
         self._state[idx] = self.FREE
         self._refs[idx] = 0
         self._event[idx] = None
+        # 这块显存里的权重可能还有 kernel 在读（launch 是异步的）。记一个
+        # compute stream 的完成事件，下次 DMA 覆盖这一格之前先 wait 它。
+        _t = self._torch
+        if _t is not None and self._copy_stream is not None:
+            try:
+                if not _t.cuda.is_current_stream_capturing():
+                    _ev = _t.cuda.Event()
+                    _ev.record(_t.cuda.current_stream())
+                    self._dirty[idx] = _ev
+            except Exception:
+                pass
         self.evictions += 1
 
     def _reserve_locked(self, key: tuple[int, int]) -> int | None:
