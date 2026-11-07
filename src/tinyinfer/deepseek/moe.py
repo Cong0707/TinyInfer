@@ -395,7 +395,7 @@ class MoE:
             if __import__("os").environ.get("TI_GPUDBG") == "1":
                 print(f"[idx] L{self.layer_id} max={int(indices.max())} "
                       f"shape={tuple(indices.shape)}", flush=True)
-            sids = tab[self.layer_id].index_select(0, indices.view(-1))
+            sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()
@@ -406,7 +406,7 @@ class MoE:
                     self._expert_store.fetch(self.layer_id, _miss)
                     sl.table_sync()
                     tab = sl._slot_tab
-                    sids = tab[self.layer_id].index_select(0, indices.view(-1))
+                    sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
                 if bool((sids < 0).any().item()):
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
