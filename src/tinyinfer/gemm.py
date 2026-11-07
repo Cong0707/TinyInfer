@@ -93,6 +93,33 @@ _FP8_NATIVE = None
 _GEMV_BOUND: dict = {}
 
 
+def fp8_linear_q(aq: torch.Tensor, asc: torch.Tensor, w_fp8: torch.Tensor,
+                 w_scale: torch.Tensor) -> torch.Tensor:
+    """fp8 GEMV with an activation that the CALLER already quantised.
+
+    同一层里有成对的投影共用一个输入（attention 的 wq_a 和 wkv 都吃同一个 h，
+    shared expert 的 w1/w3 都吃同一个 xf）。原来每个 fp8_linear 内部都跑一遍
+    act_quant —— 每层七次，每次一个 launch 加一趟全局往返去换同一份 5KB 的 fp8。
+    这里接已量化好的 (aq, asc)，调用方共享一次量化。
+    """
+    from .kernels import native
+
+    n, k = w_fp8.shape
+    y = torch.empty(n, device=aq.device, dtype=torch.bfloat16)
+    _key = ("fp8_gemv_bs", int(n), int(k))
+    _fn = _GEMV_BOUND.get(_key)
+    if _fn is None:
+        _fn = native.BoundLaunch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
+                                 ((n + 7) // 8,), (256,), "TTTTOii")
+        _GEMV_BOUND[_key] = _fn
+    _fn(aq.view(torch.uint8).reshape(-1),
+        asc.view(torch.uint8).reshape(-1),
+        w_fp8.view(torch.uint8).reshape(-1),
+        w_scale.view(torch.uint8).reshape(-1),
+        y, int(n), int(k), stream=None)
+    return y.view(1, n)
+
+
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, block: int = 32) -> torch.Tensor:
     # Cast BEFORE the fast path decides anything. act_quant only has a native
     # kernel for bf16 input; handing it fp32 falls back to the tilelang one, which

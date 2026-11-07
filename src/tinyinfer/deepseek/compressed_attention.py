@@ -241,11 +241,31 @@ class MLACompressedAttention:
         def _lin(w, x_):
             return w.forward(x_) if hasattr(w, "forward") else F.linear(x_, w)
 
-        qr = rms_norm(_lin(self.wq_a, x), self.q_norm, self.eps)
-        q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
-        apply_rope(q[..., -self.rope_dim:], freqs)
-
-        _kv_raw = _lin(self.wkv, x)
+        # wq_a 和 wkv 吃的是同一个 h，量化一次给两个用。原来每个 fp8_linear 内部
+        # 各跑一遍 act_quant（每层七次，每次一个 launch 加一趟全局往返），换来的
+        # 却是同一份 fp8 激活。
+        _shared_q = None
+        if (hasattr(self.wq_a, "weight") and hasattr(self.wkv, "weight")
+                and x.is_cuda and x.dtype == torch.bfloat16
+                and int(x.shape[-1]) % 32 == 0):
+            from ..kernels.quant import act_quant as _aq
+            _xf = x.reshape(-1, int(x.shape[-1]))
+            _shared_q = _aq(_xf, 32, "ue8m0", torch.float8_e8m0fnu)
+        if _shared_q is not None:
+            from ..gemm import fp8_linear_q
+            _aq_x, _asc_x = _shared_q
+            _qa = fp8_linear_q(_aq_x, _asc_x, self.wq_a.weight, self.wq_a.scale)
+            qr = rms_norm(_qa.view(*x.shape[:-1], int(self.wq_a.weight.shape[0])),
+                          self.q_norm, self.eps)
+            q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
+            apply_rope(q[..., -self.rope_dim:], freqs)
+            _kv_raw = fp8_linear_q(_aq_x, _asc_x, self.wkv.weight, self.wkv.scale)
+            _kv_raw = _kv_raw.view(*x.shape[:-1], int(self.wkv.weight.shape[0]))
+        else:
+            qr = rms_norm(_lin(self.wq_a, x), self.q_norm, self.eps)
+            q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
+            apply_rope(q[..., -self.rope_dim:], freqs)
+            _kv_raw = _lin(self.wkv, x)
         kv = None
         if (getattr(self, "quant", False) and _kv_raw.is_cuda and _kv_raw.size(0) == 1
                 and __import__("os").environ.get("TI_FUSED_KV") == "1"):
