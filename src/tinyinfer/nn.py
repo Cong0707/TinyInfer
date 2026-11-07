@@ -91,6 +91,9 @@ def window_idxs_general(start_pos: int, seqlen: int, old_len: int, window: int, 
     return torch.where(valid, idx, torch.full_like(idx, -1)).int()
 
 
+_POS_BUF = None   # window_idxs_ring 的全局位置 buffer（捕获期不能新建 tensor）
+
+
 def window_idxs_ring(start_pos: int, seqlen: int, old_len: int, window: int, device=None) -> torch.Tensor:
     """环形 cache 的窗口槽位：位置 p 存在 p % window 这一格。
 
