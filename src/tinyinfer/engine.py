@@ -2405,7 +2405,6 @@ class Engine:
         # 把整个 context 弄坏，比不 graph 更糟。当前 attention/hc 段有分配和
         # 环形槽写入不在 graph pool 里，必须先把它们改成「捕获前预分配、
         # 捕获期只写不分配」才能开。在那之前关死。
-        return False
         _slots0 = getattr(getattr(self, "expert_store", None), "slots", None)
         if getattr(_slots0, "_slot_tab", None) is None:
             return False
