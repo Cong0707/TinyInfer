@@ -85,8 +85,14 @@ def test_two_layer_forward_and_decode():
     cfg = TinyConfig.from_hf(model_dir())
     store = build_fake_store(cfg, [0, 2], seed=7)
     model = TinyModel(store, cfg, layers=[0, 2])
+    # 纯 GPU 路径是 MoE 唯一的一条路（CPU 上的 routed-expert 分支已经删掉了）：
+    # 模型不在卡上时 forward 会直接报 not cuda。这个测试要测的是两层前向 +
+    # decode 的形状和数值，把它放到卡上才是它本来想测的东西。
+    if not torch.cuda.is_available():
+        pytest.skip("the MoE path is GPU-only")
+    model.to("cuda")
     model.reset()
-    ids = torch.tensor([[19923, 14, 342, 1030]])
+    ids = torch.tensor([[19923, 14, 342, 1030]], device="cuda")
     logits = model.forward(ids, 0)
     assert logits.shape == (1, 4, cfg.vocab_size), logits.shape
     assert torch.isfinite(logits).all()
