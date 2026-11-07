@@ -653,7 +653,7 @@ class MLACompressedAttention:
         # batched gemm，实测 3.65 ms/token（每层一个 91us 的 kernel，占 GPU 时间 15%）。
         # bt_gemv 把它铺成一个 grid：一个 warp 一行，g 在 blockIdx.y。
         if (o.is_cuda and o.shape[0] * o.shape[1] == 1
-                and wo_a.dtype == torch.bfloat16 and wo_a.is_contiguous()):
+                and wo_a.dtype == torch.bfloat16):
             _g, _r, _d = int(wo_a.shape[0]), int(wo_a.shape[1]), int(wo_a.shape[2])
             try:
                 from ..kernels import native as _natb
