@@ -454,6 +454,8 @@ class MoE:
                 if __import__("os").environ.get("TI_GPUDBG") == "1":
                     print(f"[tab] sids={sids.tolist()} tabvals="
                           f"{[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
+                if __import__("os").environ.get("TI_GPUDBG") == "1":
+                    print(f"[t4] L{self.layer_id} sids={sids.tolist()}", flush=True)
                 if bool((sids < 0).any().item()):
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
