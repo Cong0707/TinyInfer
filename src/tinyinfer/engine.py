@@ -2397,6 +2397,13 @@ class Engine:
             return False
         if self.gpu_layers < self.max_layers:
             return False
+        # 捕获期禁止任何 H2D 互拷，而慢路径的 serve() 里就有一次
+        # indices.tolist()（D2H）。纯 GPU 路径（_forward_gpu_only）不含这种
+        # 调用，所以只在槽位表已经建好、也就是 pin 之后才允许捕获 ——
+        # warmup 阶段捕到的图也会因为槽位表内容为空而不可用。
+        _slots = getattr(getattr(self, "expert_store", None), "slots", None)
+        if getattr(_slots, "_slot_tab", None) is None:
+            return False
         if getattr(self, "mtp", None) is not None:
             return False
         return True
