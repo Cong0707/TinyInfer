@@ -103,7 +103,9 @@ def window_idxs_ring(start_pos: int, seqlen: int, old_len: int, window: int, dev
     Returns [seqlen, window] int32, -1 = 还没写过的位置。
     """
     back = torch.arange(window - 1, -1, -1, device=device)
-    gpos = torch.arange(start_pos, start_pos + seqlen, device=device)[:, None] - back[None, :]
+    # start_pos 给 tensor 也能算：arange 只生成 [0, seqlen)，位置靠广播加进去。
+    base = start_pos if torch.is_tensor(start_pos) else torch.tensor(start_pos, device=device)
+    gpos = (base + torch.arange(seqlen, device=device))[:, None] - back[None, :]
     idx = gpos % window
     valid = gpos >= 0
     return torch.where(valid, idx, torch.full_like(idx, -1)).int()

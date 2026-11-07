@@ -497,9 +497,9 @@ class MLACompressedAttention:
             if positions is not None and positions.numel() == b and b > 1:
                 # 同一步里所有层算的是同一份每行窗位，改走跨层缓存（见 _win_idxs_per_row）
                 win_idxs = self._win_idxs_per_row(positions, s, n_old, x.device)
-            else:
-                from ..nn import window_idxs_ring_cached
-                win_idxs = window_idxs_ring_cached(start_pos, s, self.window,
+                from ..nn import window_idxs_ring
+                _wi = window_idxs_ring(start_pos, s, 0, self.window, x.device).unsqueeze(0).expand(b, -1, -1)
+                win_idxs = _wi
                                                    x.device).unsqueeze(0).expand(b, -1, -1)
             if full:
                 self._decode_win_idxs = win_idxs
