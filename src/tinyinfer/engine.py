@@ -2206,6 +2206,8 @@ class Engine:
                 pre_mix = h
                 continue
             try:
+                if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
+                    print(f"[capt] layer {i}", flush=True)
                 h, pre_mix = b.forward(h, start_pos, pre_mix, positions=positions)
                 _dh = getattr(self, "_dump_h", None)
                 if _dh is not None:
