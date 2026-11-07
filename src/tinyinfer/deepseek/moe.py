@@ -370,7 +370,7 @@ class MoE:
             # 慢（每行各读一遍权重），但 prefill 只发生一次，且不许有第二条路径。
             _rows = []
             for _r in range(xf.size(0)):
-                _one = self._forward_gpu_only(x[_r:_r + 1], xf[_r:_r + 1],
+                _one = self._forward_gpu_only(x[:, _r:_r + 1], xf[_r:_r + 1],
                                               indices[_r:_r + 1], weights[_r:_r + 1])
                 if _one is None:
                     raise RuntimeError(f"MoE layer {self.layer_id}: row {_r} unavailable "
