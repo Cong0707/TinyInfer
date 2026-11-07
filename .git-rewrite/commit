@@ -1,0 +1,6 @@
+tree daa361fac88fbee63c56832df3bac78b9a528749
+parent a3205b8def55a5003c3aa16794330693113ac4b7
+author tinyinfer <dev@tinyinfer.local> 1792630619 +0800
+committer tinyinfer <dev@tinyinfer.local> 1792630619 +0800
+
+engine: TI_READERS (disk reader threads); 32 normalises ~5% better
