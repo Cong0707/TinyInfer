@@ -594,6 +594,11 @@ class MoE:
         _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
         if _gpu_only is not None:
             return _gpu_only
+        # 不再兜底：慢路径已删。任何「没走成」都在这里炸出来，
+        # 而不是悄悄换一条计数不同的路，让基准跑出一个假的数字。
+        raise RuntimeError(
+            f"MoE layer {self.layer_id}: pure-GPU path unavailable "
+            f"(cuda={xf.is_cuda} rows={xf.size(0)})")
         if _prof:
             self._parts["gate"] += _tp.perf_counter() - _t1
         # 复用一块累加 buffer：每层新建 + 清零一个 [1, dim] fp32 是 20KB 的 memset
