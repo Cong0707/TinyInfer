@@ -445,9 +445,11 @@ class MoE:
                     for _e in _miss:
                         _si = sl._by_key.get((self.layer_id, _e))
                         if _si is not None:
-                            sl.table_set(self.layer_id, _e, int(_si))
-                    # 全量刷一次表：table_set 只覆盖本次 miss，之前层的旧值也要在。
-                    sl.table_sync()
+0
+                    if __import__("os").environ.get("TI_GPUDBG") == "1":
+                        print(f"[ts] L{self.layer_id} miss={_miss} "
+                              f"byslot={[int(sl._by_key.get((self.layer_id, e), -1)) for e in _miss]}",
+                              flush=True)
                     torch.cuda.synchronize()  # 表落地后才能被 kernel 读到
                     tab = sl._slot_tab
                     sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
