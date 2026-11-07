@@ -461,6 +461,7 @@ class MoE:
                 import traceback as _tb
                 print(f"[gpufail] {_exc!r}", flush=True)
                 _tb.print_exc()
+            self._gpu_fail = f"exc {_exc!r}"
             return None
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
