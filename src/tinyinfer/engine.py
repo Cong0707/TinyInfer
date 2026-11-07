@@ -482,9 +482,15 @@ class Engine:
                 and device != "cpu"
                 and __import__("os").environ.get("TI_WARM", "1") != "0"):
             try:
+                from .expert_tiers import ExpertTierManager
+
                 _nl = int(getattr(self.cfg, "n_layers", 40))
                 _ne = int(getattr(self.cfg, "n_routed_experts", 0) or 384)
-                if self.expert_store.start_warm(_nl, _ne):
+                # 分级管理器由引擎创建（整机只有一个），MoE 通过 store 拿同一个。
+                _mgr = self.expert_store._tier_mgr = ExpertTierManager(
+                    self.expert_store, n_layers=_nl, n_experts=_ne,
+                    device=str(device), warm=False)
+                if _mgr.start_warm():
                     print(f"[tinyinfer] warming {_nl}x{_ne} experts into RAM "
                           f"(background, not on the critical path)", flush=True)
             except Exception as _we:

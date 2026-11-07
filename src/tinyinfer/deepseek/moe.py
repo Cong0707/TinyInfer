@@ -383,20 +383,37 @@ class MoE:
         return _cnt
 
     def _tier_manager(self):
-        """本层的分级管理器（一层一个，持有显存/内存/磁盘的判断）。"""
+        """分级管理器：一个 store 只有一个，全部 40 层共用。
+
+        一开始我把它挂在 MoE 上，于是 40 层各建一个 —— 每个都记自己的命中
+        计数、每个都可能起一条预热线程。分级是「这块卡上的专家数据」的属性，
+        不是「某一层」的属性，所以它归 store。
+        """
         mgr = getattr(self, "_mgr", None)
         if mgr is not None:
             return mgr
-        from ..expert_tiers import ExpertTierManager
-
         st = self._expert_store
-        mgr = ExpertTierManager(
-            st,
-            n_layers=int(getattr(self.cfg, "n_layers", 40)),
-            n_experts=int(getattr(self.cfg, "n_routed_experts", 384) or 384),
-            device=str(getattr(self, "device", "cuda")),
-            warm=False,   # 预热由 Engine 统一起一条线程，不是每层一条
-        )
+        lock = getattr(st, "_tier_lock", None)
+        if lock is None:
+            import threading as _th
+
+            lock = st._tier_lock = _th.Lock()
+        with lock:
+            mgr = getattr(st, "_tier_mgr", None)
+            if mgr is None:
+                from ..expert_tiers import ExpertTierManager
+
+                mgr = ExpertTierManager(
+                    st,
+                    n_layers=int(getattr(self.cfg, "n_layers", 40)),
+                    n_experts=int(getattr(self.cfg, "n_routed_experts", 384) or 384),
+                    device=str(getattr(self, "device", "cuda")),
+                    warm=False,   # 预热由 Engine 统一起一条线程
+                )
+                try:
+                    st._tier_mgr = mgr
+                except Exception:
+                    pass
         self._mgr = mgr
         return mgr
 
