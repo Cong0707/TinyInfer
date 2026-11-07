@@ -2219,6 +2219,8 @@ class Engine:
                 if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
                     print(f"[capt] layer {i}", flush=True)
                 h, pre_mix = b.forward(h, start_pos, pre_mix, positions=positions)
+                if torch.cuda.is_current_stream_capturing() and i >= 1:
+                    break
                 _dh = getattr(self, "_dump_h", None)
                 if _dh is not None:
                     _dh.append((i, h_in.clone(), h.clone()))
