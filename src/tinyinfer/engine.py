@@ -2437,7 +2437,6 @@ class Engine:
         g = getattr(self, "_graph", None)
         if g is None:
             return None
-            return None
         out = g["out"]
         if out.shape[0] != ids.shape[0]:
             return None
@@ -2445,7 +2444,6 @@ class Engine:
         try:
             from .deepseek.compressed_attention import refresh_cos_sin
             _blocks = list(getattr(self, "_blocks", {}).values())
-            if _blocks:
             if _blocks:
                 _att = getattr(_blocks[0], "attn", None)
                 _tbl = getattr(_att, "freqs_cis", None)
