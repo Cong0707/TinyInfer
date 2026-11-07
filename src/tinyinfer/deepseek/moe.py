@@ -495,9 +495,7 @@ class MoE:
                 if _sl1 is not None:
                     for _ii in sids.tolist():
                         if int(_ii) >= 0:
-                            _sl1._refs[int(_ii)] = 0
-                            if _sl1._state[int(_ii)] == _sl1.IN_USE:
-                                _sl1._state[int(_ii)] = _sl1.STAGED
+                            _sl1._evict_locked(int(_ii))   # 真正归还槽位（非 pin）
             _nrows = int(xf.size(0))
             n_exp = int(indices.numel())   # 多行时 = rows * topk
             nmid = int(self.cfg.moe_inter_dim)
