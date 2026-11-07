@@ -3291,7 +3291,11 @@ class ExpertStore:
                         print(f"[fetch] admit path failed: {exc!r}", flush=True)
         # batch the slot reservations under one lock (decode fetches 6 experts/layer)
         acquired = None
-        if self.slots is not None and self.slots.slots > 0 and len(experts) > 1 and cache:
+        # 同样不能加 and cache：acquire_many 对「已经在槽位里」的专家只是加引用，
+        # 不涉及 admit；被 cache=False 挡掉的后果是 decode 每层六个专家全部走到
+        # _materialize 重新 H2D 一遍，每次都带回一个 cudaEvent，于是每层多六次
+        # cudaStreamWaitEvent（实测 6/层、240/token）。
+        if self.slots is not None and self.slots.slots > 0 and len(experts) > 1:
             acquired = self.slots.acquire_many(layer, experts)
         by_expert = {b.key[1]: d for b, d in zip(blobs, datas)} if blobs and datas else {}
         records = []
