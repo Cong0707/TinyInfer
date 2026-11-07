@@ -853,7 +853,30 @@ class MoE:
         # kernel 是异步 launch 的，归还的槽位可能在别的层被覆盖 —— 所以归还前
         # 在槽位上记一个 compute stream 的完成事件，loading 的 DMA 会 wait 它。
         if not torch.cuda.is_current_stream_capturing():
-            self._last_ids = sorted({int(v) for v in indices.view(-1).tolist()})
+            _keep = {int(v) for v in indices.view(-1).tolist()}
+            self._last_ids = sorted(_keep)
+            # 本层上一次用过、这次不用的槽位，直接收回来还给池子。不这么做，
+            # 逐 token 的 prefill 每层会一路攒下几十个历史专家，几十个 token 就
+            # 把 1359 塞满 —— 之后每一步每一层都要先 evict 再 DMA，而且 DMA 得
+            # 等上一层 kernel 跑完（event），整条流水线被拉成串行。
+            # 只留本层最近一次用过的：相邻 token 的路由高度重合，这才是真复用。
+            _stale = getattr(self, "_slots_last", None)
+            if _stale:
+                _slr = getattr(getattr(self, "_expert_store", None), "slots", None)
+                if _slr is not None:
+                    _evr = None
+                    for _se in _stale:
+                        if _se in _keep:
+                            continue
+                        _sir = _slr._by_key.get((self.layer_id, _se))
+                        if _sir is None:
+                            continue
+                        if _evr is None:
+                            _evr = torch.cuda.Event()
+                            _evr.record(torch.cuda.current_stream())
+                        _slr._evict_locked(_sir)
+                        _slr._event[_sir] = _evr
+            self._slots_last = _keep
         # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
         _lid = getattr(self, "_last_ids", None)
         _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
