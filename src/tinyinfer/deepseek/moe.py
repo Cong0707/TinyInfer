@@ -441,7 +441,11 @@ class MoE:
                                 pass
                     # table_sync 内部是主机侧攒数组 + 一次 copy_，重建后再索引一次
                     tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
-                    sl.table_sync()
+                    # 用 GPU 侧的 table_set 写表：没有 H2D，就没有和 compute stream 的时序问题。
+                    for _e in _miss:
+                        _si = sl._by_key.get((self.layer_id, _e))
+                        if _si is not None:
+                            sl.table_set(self.layer_id, _e, int(_si))
                     torch.cuda.synchronize()  # 表落地后才能被 kernel 读到
                     tab = sl._slot_tab
                     sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
