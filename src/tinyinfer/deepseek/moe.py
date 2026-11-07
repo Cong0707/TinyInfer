@@ -271,6 +271,74 @@ class Expert:
         from ..gemm import fp4_linear
         return fp4_linear(y, w2, s2)
 
+    def _ts_offsets(self, layer: int):
+        """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
+        cache = getattr(self, "_ts_off_cache", None)
+        if cache is None:
+            cache = self._ts_off_cache = {}
+        hit = cache.get(layer)
+        if hit is not None:
+            return hit
+        idx = getattr(getattr(self, "_expert_store", None), "index", None)
+        if idx is None:
+            raise RuntimeError("MoE: expert_store.index 不可用")
+        t = idx.expert_blob(layer, 0).tensors
+        hit = cache[layer] = (
+            t["w1.weight"].dest_offset, t["w1.scale"].dest_offset,
+            t["w3.weight"].dest_offset, t["w3.scale"].dest_offset,
+            t["w2.weight"].dest_offset, t["w2.scale"].dest_offset)
+        return hit
+
+    def _forward_gpu_only(self, x: torch.Tensor, xf: torch.Tensor,
+                          indices: torch.Tensor, weights: torch.Tensor):
+        """整层不碰 CPU 的 decode 路径；走不通返回 None，由调用方回落慢路径。
+
+        自包含：只吃 x / xf / indices / weights 和槽位表，不引用 forward 后面才定义的
+        任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
+        """
+        if not (xf.is_cuda and xf.size(0) == 1):
+            return None
+        sl = getattr(getattr(self, "_expert_store", None), "slots", None)
+        tab = getattr(sl, "_slot_tab", None) if sl is not None else None
+        arena = getattr(sl, "_arena", None) if sl is not None else None
+        if tab is None or not arena or len(arena) != 1:
+            return None
+        try:
+            from .fp4_native import quantize_act
+            from ..kernels import native
+
+            aq, asc = quantize_act(xf, xf.size(-1))
+            sids = tab[self.layer_id].index_select(0, indices.view(-1))
+            n_exp = int(indices.numel())
+            nmid = int(self.cfg.moe_inter_dim)
+            blob = int(sl.blob_bytes)
+            off = self._ts_offsets(self.layer_id)
+            scr = self._scratch(n_exp * (nmid + (nmid >> 5)), arena[0].device)
+            y = torch.zeros(xf.shape, dtype=torch.float32, device=xf.device)
+
+            fa = _MOE_FUSED.get("act")
+            if fa is None:
+                fa = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_act"),
+                                        ((nmid + 31) // 32, 1), (512,), "TTTTTOOiiiiiiiif")
+                _MOE_FUSED["act"] = fa
+            fa(aq.reshape(-1), asc.reshape(-1), arena[0], sids, weights[0],
+               scr[:n_exp * nmid], scr[n_exp * nmid:],
+               n_exp, nmid, int(self.cfg.dim), blob,
+               off[0], off[1], off[2], off[3], float(self.swiglu_limit), stream=None)
+
+            fd = _MOE_FUSED.get("down")
+            if fd is None:
+                fd = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_down"),
+                                        ((int(self.cfg.dim) + 15) // 16,), (512,),
+                                        "TTTTOiiiiii")
+                _MOE_FUSED["down"] = fd
+            fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
+               arena[0], sids, y,
+               n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], stream=None)
+            return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
+        except Exception:
+            return None
+
     def _scratch(self, nbytes: int, device):
         """MoE 融合 kernel 的中间 buffer（fp8 激活 + e8m0 scale），按大小复用。"""
         buf = getattr(self, "_scratch_buf", None)
@@ -508,6 +576,10 @@ class MoE:
         xf = x.view(-1, self.cfg.dim)
         _t1 = _tp.perf_counter() if _prof else 0.0
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
+        # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
+        _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
+        if _gpu_only is not None:
+            return _gpu_only
         if _prof:
             self._parts["gate"] += _tp.perf_counter() - _t1
         # 复用一块累加 buffer：每层新建 + 清零一个 [1, dim] fp32 是 20KB 的 memset
