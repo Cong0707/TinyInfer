@@ -116,6 +116,7 @@ extern "C" __global__ void hc_post_bf(const __nv_bfloat16* __restrict__ x,      
 #define HC_BLOCK 256
 // hc_mult 固定为 4（与 hc_split.cu 的 HC 一致），kernel 里用编译期常量展开。
 #define HC 4
+#define HC_MIX_WARPS 24
 
 extern "C" __global__ void hc_mixes_bf(const __nv_bfloat16* __restrict__ x,  // [M, K]
                                        const float* __restrict__ fn,        // [J, K]
@@ -252,12 +253,14 @@ extern "C" __global__ void hc_mixes_bf_j(const __nv_bfloat16* __restrict__ x,  /
     }
 }
 
-// hc_mixes 与 hc_split_sinkhorn 合成一个 kernel。
+
+// hc_mixes + split/sinkhorn 合成一个 kernel（单 block，24 个 warp 各算一个系数）。
 //
-// 原来是一次 hc_mixes_bf_j 把 24 个系数写回全局，紧接着 hc_split_sinkhorn 再读
-// 回来做 sigmoid/softmax/Sinkhorn。中间那趟全局往返 + 一次 launch，在 decode
-// （n=1）里完全没必要：24 个 float 就是这个 kernel 自己算出来的。
-// 每一层调用两次（attention 一次、FFN 一次），40 层就是 160 次 launch/token。
+// 上一版把它们塞进同一个 kernel 时用的是 grid=(J, M)：第 j 个 block 只算得出第 j 个
+// 系数，而 Sinkhorn 需要全部 24 个，跨 block 拿不到 —— 结果错、也更慢。
+// 这一版把 24 个系数放进同一个 block 的 24 个 warp 里：每个 warp 扫一遍 K 算一个
+// dot，写进 shared 后 block 内同步，再让 thread 0 做 Sigmoid/Softmax/Sinkhorn。
+// 于是每层只需一次 launch，而不是 hc_mixes_bf_j + hc_split_sinkhorn 两次。
 extern "C" __global__ void hc_mixes_split_sinkhorn(
     const __nv_bfloat16* __restrict__ x,   // [M, K]
     const float* __restrict__ fn,          // [J, K]
@@ -267,49 +270,47 @@ extern "C" __global__ void hc_mixes_split_sinkhorn(
     float* __restrict__ post,              // [M, HC]
     float* __restrict__ comb,              // [M, HC*HC]
     int M, int K, int J, float eps, int iters) {
-    // 一个 block 负责一个 (m, j)：j 是 24 个系数中的一个，norm 每块重算。
-    const int m = blockIdx.y;
-    const int j = blockIdx.x;
-    if (m >= M || j >= J) return;
-    const __nv_bfloat16* xm = x + (long long)m * K;
-    const int tid = threadIdx.x;
-
-    __shared__ float s_warp[HC_BLOCK / 32];
+    __shared__ float s_mix[HC * (2 * HC + HC)];   // 最多 24 个（HC=4 时 J=24）
+    __shared__ float s_warp[HC_MIX_WARPS];
     __shared__ float s_norm;
-    __shared__ float s_mix[24];
 
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const __nv_bfloat16* xm = x + (long long)m * K;
+
+    // 行范数：全 block 协作（K 通常 5120*hc = 20480）
     float part = 0.f;
-    for (int k = tid; k < K; k += HC_BLOCK) {
+    for (int k = tid; k < K; k += blockDim.x) {
         const float v = __bfloat162float(xm[k]);
         part += v * v;
     }
     for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffffu, part, off);
-    if ((tid & 31) == 0) s_warp[tid >> 5] = part;
+    if (lane == 0) s_warp[warp] = part;
     __syncthreads();
     if (tid == 0) {
         float t = 0.f;
-        for (int w = 0; w < HC_BLOCK / 32; ++w) t += s_warp[w];
+        for (int w = 0; w < HC_MIX_WARPS; ++w) t += s_warp[w];
         s_norm = rsqrtf(t / (float)K + eps);
     }
     __syncthreads();
+    const float rstd = s_norm;
 
-    float acc = 0.f;
-    for (int k = tid; k < K; k += HC_BLOCK) {
-        acc += __bfloat162float(xm[k]) * fn[(long long)j * K + k];
-    }
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
-    __syncthreads();
-    if ((tid & 31) == 0) s_warp[tid >> 5] = acc;
-    __syncthreads();
-    if (tid == 0) {
-        float t = 0.f;
-        for (int w = 0; w < HC_BLOCK / 32; ++w) t += s_warp[w];
-        s_mix[j] = t * s_norm;
+    // 每个 warp 负责一个系数 j
+    if (warp < J) {
+        const float* fj = fn + (long long)warp * K;
+        float acc = 0.f;
+        for (int k = lane; k < K; k += 32) {
+            acc += __bfloat162float(xm[k]) * fj[k];
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) s_mix[warp] = acc * rstd;
     }
     __syncthreads();
-    if (tid != 0 || j != 0) return;
+    if (tid != 0) return;
 
-    // ---- 以下与 hc_split_sinkhorn 的算术完全一致（同序、同 rounding）----
     float* pp = pre + (long long)m * HC;
     float* po = post + (long long)m * HC;
     float* pc = comb + (long long)m * (HC * HC);
