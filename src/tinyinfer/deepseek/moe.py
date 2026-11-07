@@ -361,16 +361,11 @@ class MoE:
         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
         """
         if not (xf.is_cuda and xf.size(0) == 1):
-        if __import__("os").environ.get("TI_GPUDBG") == "1":
-            print("[gpuskip] line=364", flush=True)
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
         if tab is None or not arena or len(arena) != 1:
-        if __import__("os").environ.get("TI_GPUDBG") == "1":
-            print("[gpuskip] line=369", flush=True)
-            return None
         try:
             from .fp4_native import quantize_act
             from ..kernels import native
@@ -414,9 +409,6 @@ class MoE:
                 import traceback as _tb
                 print(f"[gpufail] {_exc!r}", flush=True)
                 _tb.print_exc()
-        if __import__("os").environ.get("TI_GPUDBG") == "1":
-            print("[gpuskip] line=413", flush=True)
-            return None
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
                  max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
