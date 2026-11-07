@@ -396,6 +396,8 @@ class MoE:
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
                off[0], off[1], off[2], off[3], float(self.swiglu_limit), stream=None)
+            if __import__("os").environ.get("TI_GPUDBG") == "1":
+                print(f"[capt] L{self.layer_id} fa", flush=True)
             fd = _MOE_FUSED.get("down")
             if fd is None:
                 fd = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_down"),
@@ -405,6 +407,8 @@ class MoE:
             fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
                arena[0], sids, y,
                n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], 0, stream=None)
+            if __import__("os").environ.get("TI_GPUDBG") == "1":
+                print(f"[capt] L{self.layer_id} fd", flush=True)
             return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
         except Exception as _exc:
             if __import__("os").environ.get("TI_GPUDBG") == "1":
