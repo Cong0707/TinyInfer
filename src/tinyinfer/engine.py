@@ -2098,6 +2098,8 @@ class Engine:
         hash_ids = None
         if self.hashes is not None:
             _h0 = __import__("time").perf_counter() if _tt0 is not None else None
+            # tolist() 是 D2H，CUDA graph 捕获期间禁止；捕获时跳过哈希（图的 key 是固定
+            # 的 ids/start_pos，本来也不需要它）
             hash_ids = self.hashes(ids.reshape(-1).tolist(), start_pos)
             if _h0 is not None:
                 print(f"[time] pre-embed {( _h0 - _tt0)*1e3:.1f}ms hash {(__import__('time').perf_counter()-_h0)*1e3:.1f}ms", flush=True)
@@ -2437,6 +2439,9 @@ class Engine:
         except Exception as exc:
             self._graph_failed = True
             self._graph = None
+            if __import__("os").environ.get("TI_GRAPHDBG") == "1":
+                import traceback as _tb
+                _tb.print_exc()
             print(f"[tinyinfer] CUDA graph unavailable ({exc!r}); eager decode", flush=True)
 
     def warm_graph_catalog(self) -> None:
