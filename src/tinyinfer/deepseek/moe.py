@@ -445,6 +445,7 @@ class MoE:
                     for _e in _miss:
                         _si = sl._by_key.get((self.layer_id, _e))
                         if _si is not None:
+                            sl.table_set(self.layer_id, _e, int(_si))
                     if __import__("os").environ.get("TI_GPUDBG") == "1":
                         print(f"[ts] L{self.layer_id} miss={_miss} "
                               f"byslot={[int(sl._by_key.get((self.layer_id, e), -1)) for e in _miss]}",
