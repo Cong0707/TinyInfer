@@ -1242,7 +1242,15 @@ class Engine:
                     _sel.append((_c, _l, _e))
                     _seen[_l] = _seen.get(_l, 0) + 1
             _cand = _sel
-        _sel = _cand[: int(slots.slots)]
+        # 槽位不能全 pin：剩下的要给「这一步新路由到的专家」腾地方。留一步的
+        # 量（n_layers*topk）。池子连两步都装不下时（8GB 卡 271 < 480）pin 只会
+        # 把池子锁死、decode 直接崩，这种规模就不 pin —— 让它在 LRU 上跑。
+        _need_step = int(getattr(self.cfg, "n_layers", 40)) * int(
+            getattr(self.cfg, "n_activated_experts", 6))
+        _budget = int(slots.slots)
+        if _budget < _need_step * 2:
+            return 0
+        _sel = _cand[: _budget - _need_step]
         _by_layer: dict[int, list[int]] = {}
         for _c, _l, _e in _sel:
             _by_layer.setdefault(_l, []).append(_e)
