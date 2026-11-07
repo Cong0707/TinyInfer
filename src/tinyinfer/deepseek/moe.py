@@ -444,6 +444,9 @@ class MoE:
                     sl.table_sync()
                     torch.cuda.synchronize()  # 表落地后才能被 kernel 读到
                     tab = sl._slot_tab
+                    if __import__("os").environ.get("TI_GPUDBG") == "1":
+                        print(f"[t3] L{self.layer_id} miss={_miss} "
+                              f"tabv={[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
                     sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
                 if __import__("os").environ.get("TI_GPUDBG") == "1":
                     print(f"[miss] L{self.layer_id} miss={_miss} by_key={len(sl._by_key)} "
