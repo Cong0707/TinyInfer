@@ -2465,6 +2465,57 @@ class VramSlotCache:
             ev.record(self._copy_stream)
         return ev
 
+    def wait_ready(self, idxs) -> None:
+        """让当前（compute）stream 等这些槽位的 DMA 落地。
+
+        只对还在飞的插等待：已完成的事件不插，避免每层几十个空的
+        cudaStreamWaitEvent（那个开销实测和真等差不多）。这就是「GPU 自己等
+        数据」—— CPU 已经把搬运命令发出去了，不必陪着等。
+        """
+        t = self._torch
+        cs = getattr(self, "_copy_stream", None)
+        if t is None or cs is None:
+            return
+        stream = t.cuda.current_stream()
+        for i in idxs:
+            ev = self._event[i]
+            if ev is not None and not ev.query():
+                stream.wait_event(ev)
+
+    def ensure(self, layer: int, experts, loader) -> tuple[int, int]:
+        """把这一层要用的专家全部安排进槽位。
+
+        调用方只交两样东西：这一层要哪几个专家、以及「怎么取字节」的回调。
+        槽位怎么选（空优先，否则按游标覆盖最老的）、表怎么写、DMA 什么时候
+        算完 —— 都在这里，外层不再碰 _by_key / _state / 表。返回
+        (缺失数, 放置数)。
+
+        loader(layer, [expert, ...]) -> {expert: bytes-like}，缺失的由它取。
+        """
+        miss = [int(e) for e in experts if (layer, int(e)) not in self._by_key]
+        if not miss:
+            return 0, 0
+        data_map = loader(layer, miss) or {}
+        placed = 0
+        for e in miss:
+            data = data_map.get(e)
+            if data is None:
+                continue
+            with self._lock:
+                idx = self._reserve_locked((layer, e))
+                if idx is None:
+                    continue
+                self._refs[idx] = 1
+                self._state[idx] = self.IN_USE
+            ev = self._copy_blocking(idx, data)
+            self._event[idx] = ev
+            with self._lock:
+                if self._state[idx] == self.IN_USE:
+                    self._state[idx] = self.STAGED
+                self._cond.notify_all()
+            placed += 1
+        return len(miss), placed
+
     def _claim_slot_locked(self) -> int | None:
         """拿一个槽位：先掏空的，掏不到就环形覆盖一个没人在用的。
 
@@ -3465,6 +3516,59 @@ class ExpertStore:
             self._pending[(int(layer), int(expert))] = fut
         return 0
 
+    def start_warm(self, n_layers: int, n_experts: int, threads: int = 2) -> bool:
+        """CPU 空闲时把还没进内存的专家读进来，不空转。
+
+        显存只能放几百个专家位，内存放得下整个专家集（371GB 对 289GB）：
+        预热完之后每次 decode 只剩 RAM->VRAM 的 DMA，不再有读盘。
+        这在「低预算机器撑并发」时是决定性的 —— 磁盘是唯一撑不住的东西。
+        """
+        if getattr(self, "_warm_thread", None) is not None:
+            return False
+        import threading
+
+        stop = threading.Event()
+        state = {"done": 0, "total": 0, "errors": 0}
+        self._warm_stop = stop
+        self._warm_state = state
+
+        def _one(worker: int) -> None:
+            # 两个 worker 争同一份盘带宽没意义，但可以掩盖单次 pread 的延迟。
+            for layer in range(n_layers):
+                if stop.is_set():
+                    return
+                gap = [e for e in range(n_experts) if not self.ram.contains(layer, e)]
+                step = max(1, len(gap) // max(1, threads))
+                mine = gap[worker * step:(worker + 1) * step] if worker < threads - 1 else gap[step * (threads - 1):]
+                for i in range(0, len(mine), 8):
+                    if stop.is_set():
+                        return
+                    chunk = mine[i:i + 8]
+                    state["total"] += len(chunk)
+                    try:
+                        self.ram.prefetch(layer, chunk).result(timeout=180)
+                        state["done"] += len(chunk)
+                    except Exception:
+                        state["errors"] += len(chunk)
+
+        def _run() -> None:
+            ts = [threading.Thread(target=_one, args=(w,), name=f"expert-warm{w}",
+                                   daemon=True) for w in range(max(1, threads))]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+
+        t = threading.Thread(target=_run, name="expert-warm", daemon=True)
+        self._warm_thread = t
+        t.start()
+        return True
+
+    def stop_warm(self) -> None:
+        ev = getattr(self, "_warm_stop", None)
+        if ev is not None:
+            ev.set()
+
     def fetch_async(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> Future:
         """Start a disk read on a private pool so the caller can compute meanwhile."""
         if getattr(self, "_fetch_pool", None) is None:
@@ -3507,23 +3611,37 @@ class ExpertStore:
         slots = self.slots
         if slots is None:
             return
-        slots._paused = True
-        if not getattr(slots, "_buffers", None):
-            return
-        with slots._lock:
-            for idx in range(slots.slots):
-                slots._state[idx] = slots.FREE
-                slots._key[idx] = None
-                slots._refs[idx] = 0
-                slots._event[idx] = None
-            slots._by_key.clear()
-            slots._gen += 1
-            try:
-                slots._lru.clear()
-            except Exception:
-                pass
-            slots._buffers = []
-            slots._arena = None
+        _prev = int(getattr(slots, "slots", 0))
+        if getattr(slots, "_buffers", None):
+            with slots._lock:
+                for idx in range(slots.slots):
+                    slots._state[idx] = slots.FREE
+                    slots._key[idx] = None
+                    slots._refs[idx] = 0
+                    slots._event[idx] = None
+                slots._by_key.clear()
+                slots._gen += 1
+                try:
+                    slots._lru.clear()
+                except Exception:
+                    pass
+                slots._buffers = []
+                slots._arena = None
+                slots._dirty.clear()
+        # 不放 _paused：下一次 acquire 必须能自己重建。但要用更小的尺寸 ——
+        # 这一档刚刚在这张卡上 OOM 掉了，原样重建只会再 OOM 一次。8GB 上
+        # 减半两三次就落到「放得下」的那一档，不需要人工写死数字。
+        if _prev > 0:
+            _n = max(8, _prev // 2)
+            slots.slots = _n
+            with slots._lock:
+                slots._state = [slots.FREE] * _n
+                slots._key = [None] * _n
+                slots._refs = [0] * _n
+                slots._event = [None] * _n
+                slots._free = list(range(_n - 1, -1, -1))
+                slots._cur = 0
+            slots._paused = False
         try:
             import torch
 

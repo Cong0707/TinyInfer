@@ -475,6 +475,20 @@ class Engine:
         # The VRAM slot pool is faster but not bit-reproducible yet (a slot can be
         # re-targeted while the GEMV that reads it is still queued; docs/analysis.md
         # section 10). TI_NO_SLOTS=1 trades about 40% of decode for deterministic logits.
+        # CPU 空闲时往内存里预热还没加载的专家 —— 显存放不下整个专家集，内存
+        # 放得下（371GB 对 289GB）。预热完之后 decode 只剩 RAM->VRAM 的 DMA，
+        # 不再有读盘；低预算机器撑并发靠的就是这一步。TI_WARM=0 可关。
+        if (self.expert_store is not None
+                and device != "cpu"
+                and __import__("os").environ.get("TI_WARM", "1") != "0"):
+            try:
+                _nl = int(getattr(self.cfg, "n_layers", 40))
+                _ne = int(getattr(self.cfg, "n_routed_experts", 0) or 384)
+                if self.expert_store.start_warm(_nl, _ne):
+                    print(f"[tinyinfer] warming {_nl}x{_ne} experts into RAM "
+                          f"(background, not on the critical path)", flush=True)
+            except Exception as _we:
+                print(f"[tinyinfer] warm-up skipped ({_we!r})", flush=True)
         if __import__("os").environ.get("TI_NO_SLOTS") == "1":
             for _st in (getattr(self, "expert_store", None),):
                 try:

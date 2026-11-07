@@ -377,6 +377,47 @@ class MoE:
             self._miss_ids_host[:_cnt].copy_(self._miss_ids_dev[:_cnt], non_blocking=False)
         return _cnt
 
+    def _load_experts(self, layer: int, experts):
+        """槽位池的取字节回调：内存里有就给内存里的，没有才让 CPU 去盘上读。
+
+        按用户的说法，CPU 是卖家：买家（GPU）下单说要哪几个专家，卖家负责找货
+        并发出去 —— 内存是自家仓库，磁盘是上游供货，都不在显存里。
+        """
+        st = self._expert_store
+        out = {}
+        if st is None:
+            return out
+        miss = []
+        for e in experts:
+            d = None
+            try:
+                d = st.ram.get(layer, int(e), blocking=False)
+            except Exception:
+                d = None
+            if d is not None:
+                out[int(e)] = d
+            else:
+                miss.append(int(e))
+        if miss:
+            # 内存里没有的，让 CPU 去盘上取（批量 pread，一个专家一次读）。
+            # 读到的字节同时塞回内存缓存，下一次不用再读盘。
+            try:
+                blobs = [st.index.expert_blob(layer, e) for e in miss]
+                datas = st.reader.read_many(blobs)
+                for e, d in zip(miss, datas):
+                    out[e] = d
+                try:
+                    for e, d in out.items():
+                        st.ram.admit(layer, e, d)
+                except Exception:
+                    pass
+            except Exception as exc:
+                import traceback as _tb
+                if __import__("os").environ.get("TI_GPUDBG") == "1":
+                    print(f"[load] L{layer} read failed: {exc!r}", flush=True)
+                    _tb.print_exc()
+        return out
+
     def _ts_offsets(self, layer: int):
         """(w1,s1,w3,s3,w2,s2) 在 blob 内的字节偏移；同一层所有专家同布局，按层缓存。"""
         cache = getattr(self, "_ts_off_cache", None)
@@ -432,8 +473,15 @@ class MoE:
                 sl._ensure()
                 if not getattr(sl, "_arena", None):
                     raise RuntimeError(f"MoE layer {self.layer_id}: slots _ensure did not build arena")
-            except Exception:
-                pass
+            except Exception as _exc:
+                # 不要静默吞掉：arena 分配失败是「这块卡再也放不下专家」的唯一信号，
+                # 吞掉之后下游只会看到一句 line 375。
+                import os as _os
+                if _os.environ.get("TI_SLOT_DEBUG") == "1" or not getattr(self, "_arena_warned", False):
+                    self._arena_warned = True
+                    print(f"[arena] layer {self.layer_id}: slots={getattr(sl, 'slots', '?')} "
+                          f"buffers={len(getattr(sl, '_buffers', []) or [])} "
+                          f"blob={getattr(sl, 'blob_bytes', '?')} exc={_exc!r}", flush=True)
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
         if not arena or len(arena) != 1:
@@ -479,53 +527,20 @@ class MoE:
             if _nmiss:
                 _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
                 if _miss:
-                    _recs = self._expert_store.fetch(self.layer_id, _miss)
-                    if __import__("os").environ.get("TI_GPUDBG") == "1":
-                        print(f"[fetch] L{self.layer_id} miss={_miss} recs={len(_recs)} "
-                              f"slots={[getattr(r, 'buffer', None) is not None for r in _recs]}",
+                    # 槽位池负责：挑格子（空槽优先，否则按游标覆盖最老的）、把字节
+                    # 搬进去、把槽位号写进表。这里只交出「缺的是谁」和「字节从哪取」——
+                    # 以前这些散在本函数里（acquire + 手工 table_set + 手工清表），
+                    # 漏一处就是「表指向别人的权重」这种不报错的错。
+                    _en_miss, _en_placed = sl.ensure(self.layer_id, _miss, self._load_experts)
+                    if _en_placed < _en_miss and not getattr(self, "_ensure_warned", False):
+                        self._ensure_warned = True
+                        print(f"[ensure] L{self.layer_id} miss={_en_miss} placed={_en_placed} "
+                              f"slot_free={len(getattr(sl, '_free', []))} "
+                              f"byslot={[sl._by_key.get((self.layer_id, e), -1) for e in _miss]}",
                               flush=True)
-                    if __import__("os").environ.get("TI_GPUDBG") == "1":
-                            _st = [0, 0, 0, 0]
-                            for _i in range(sl.slots):
-                                _st[min(3, sl._refs[_i])] += 1
-                            print(f"[slot] L{self.layer_id} free={sl._state.count(sl.FREE)} "
-                                  f"staged={sl._state.count(sl.STAGED)} "
-                                  f"pinned={sl.pinned_count()} refs0={_st[0]} refsN={sl.slots - _st[0]}",
-                                  flush=True)
-                    # fetch 有时只把字节放进 RAM/池而不占槽位（acquire_many 撞到
-                    # RESERVED 时会返回 None）；这里再显式 acquire 一次，保证有槽位号。
-                    for _e in _miss:
-                        if not sl.has(self.layer_id, _e):
-                            try:
-                                sl.acquire(self.layer_id, _e)
-                            except Exception:
-                                pass
-                            if not sl.has(self.layer_id, _e):
-                                # 池子满了：不在这里硬抢（抢「别的层」的槽位会
-                                # 清掉别人正在用的权重，输出直接错）。只报事实。
-                                _ns = [0, 0, 0, 0, 0]
-                                for _vi in range(sl.slots):
-                                    _ns[min(4, sl._state[_vi])] += 1
-                                print(f"[slotfull] L{self.layer_id} e={_e} "
-                                      f"free={_ns[0]} reserved={_ns[1]} copying={_ns[2]} "
-                                      f"staged={_ns[3]} inuse={_ns[4]} "
-                                      f"pinned={sl.pinned_count()} loads={sl.loads} "
-                                      f"evict={sl.evictions}", flush=True)
-                    # table_sync 内部是主机侧攒数组 + 一次 copy_，重建后再索引一次
-                    tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
-                    # 用 GPU 侧的 table_set 写表：没有 H2D，就没有和 compute stream 的时序问题。
-                    for _e in _miss:
-                        _si = sl._by_key.get((self.layer_id, _e))
-                        if _si is not None:
-                            sl.table_set(self.layer_id, _e, int(_si))
-                    if __import__("os").environ.get("TI_GPUDBG") == "1":
-                        print(f"[ts] L{self.layer_id} miss={_miss} "
-                              f"byslot={[int(sl._by_key.get((self.layer_id, e), -1)) for e in _miss]}",
-                              flush=True)
-                    # 不要 torch.cuda.synchronize()：table_set 是这张 GPU 表上的
-                    # 赋值（同一 stream 上的 kernel），下面的 index_select 也在同一
-                    # stream，硬件本来就按顺序执行。原来的全设备同步每层一次，40 层
-                    # 下来把异步流水线彻底掐断（per-layer 同步是 decode 一半的墙钟）。
+                    # GPU 等数据：CPU 只负责把搬运命令发出去，不等它落地。
+                    sl.wait_ready([sl._by_key[(self.layer_id, _e)] for _e in _miss
+                                   if (self.layer_id, _e) in sl._by_key])
                     tab = sl._slot_tab
                     # 写进持久 buffer：index_select 每次新建张量，driver-API 的 kernel 只拿裸
                 # 指针，函数返回后这批显存会被 allocator 立刻复用（多行 prefill 时
