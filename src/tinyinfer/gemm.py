@@ -49,7 +49,7 @@ def available() -> bool:
     try:
         from .kernels import native
 
-        native.kernel("fp8_gemv_bs", "fp8_gemv_bs")
+        native.kernel("fp8_gemv_inline_q", "fp8_gemv_inline_q")
         return True
     except Exception:
         return False
@@ -112,11 +112,10 @@ def fp8_linear_q(aq: torch.Tensor, asc: torch.Tensor, w_fp8: torch.Tensor,
         _fn = native.BoundLaunch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
                                  ((n + 7) // 8,), (256,), "TTTTOii")
         _GEMV_BOUND[_key] = _fn
-    _fn(aq.view(torch.uint8).reshape(-1),
-        asc.view(torch.uint8).reshape(-1),
-        w_fp8.view(torch.uint8).reshape(-1),
-        w_scale.view(torch.uint8).reshape(-1),
-        y, int(n), int(k), stream=None)
+            _fn(x.reshape(-1),
+                w_fp8.view(torch.uint8).reshape(-1),
+                w_scale.view(torch.uint8).reshape(-1),
+                y, int(n), int(k), 1e-4, stream=None)
     return y.view(1, n)
 
 
@@ -190,22 +189,24 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
         try:
             from .kernels import native
 
-            aq, asc = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+            # 激活的量化内联在这个 kernel 里（fp8_gemv_inline_q.cu，vLLM scaled_mm 的
+            # tile 思路）：block 先用 32 个 warp 把 x 量化进 shared，再让 32 个 warp
+            # 各算一行。省掉一层五次 act_quant 的 launch；激活的全局读取放大 n/32 倍，
+            # 折成字节只有权重流量的 1/16。
             n, k = w_fp8.shape
             y = torch.empty(n, device=x.device, dtype=torch.bfloat16)
-            # 试过把量化内联进 GEMV（fp8_gemv_inline_q.cu，vLLM scaled_mm 的 tile 思路），
-            # 接进去直接跑崩了（util 掉到 5%，无输出），先回到已验证的两段式。
-            _key = ("fp8_gemv_bs", int(n), int(k))
+            _key = ("fp8_gemv_inline_q", int(n), int(k))
             _fn = _GEMV_BOUND.get(_key)
             if _fn is None:
-                _fn = native.BoundLaunch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
-                                         ((n + 7) // 8,), (256,), "TTTTOii")
+                _fn = native.BoundLaunch(
+                    native.kernel("fp8_gemv_inline_q", "fp8_gemv_inline_q"),
+                    ((n + 31) // 32,), (1024,), "TTTTiif",
+                    shared=int(k) + int(k) // 32)
                 _GEMV_BOUND[_key] = _fn
-            _fn(aq.view(torch.uint8).reshape(-1),
-                asc.view(torch.uint8).reshape(-1),
+            _fn(x.reshape(-1),
                 w_fp8.view(torch.uint8).reshape(-1),
                 w_scale.view(torch.uint8).reshape(-1),
-                y, int(n), int(k), stream=None)
+                y, int(n), int(k), 1e-4, stream=None)
             return y.view(1, n)
         except Exception as _exc:
             if __import__("os").environ.get("TI_FP8_DEBUG") == "1":
