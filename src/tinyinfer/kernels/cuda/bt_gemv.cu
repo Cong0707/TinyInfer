@@ -5,6 +5,8 @@
 //
 // 布局：w[g][r][d] bf16，x[g][d] bf16，y[g][r] bf16。累加用 fp32，和 cuBLAS 的
 // bf16 GEMM 一样（tf32/fp32 累加），输出一次舍入。
+#include <cuda_bf16.h>
+
 extern "C" __global__ void bt_gemv_bf16(
     const __nv_bfloat16* __restrict__ x,   // [g, d]
     const __nv_bfloat16* __restrict__ w,   // [g, r, d]
