@@ -360,14 +360,13 @@ class MoE:
         自包含：只吃 x / xf / indices / weights 和槽位表，不引用 forward 后面才定义的
         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
         """
-        if __import__("os").environ.get("TI_GPUDBG") == "1":
-            print(f"[gpuenter] L{self.layer_id}", flush=True)
         if not (xf.is_cuda and xf.size(0) == 1):
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
         if tab is None or not arena or len(arena) != 1:
+            return None
         try:
             from .fp4_native import quantize_act
             from ..kernels import native
@@ -411,6 +410,7 @@ class MoE:
                 import traceback as _tb
                 print(f"[gpufail] {_exc!r}", flush=True)
                 _tb.print_exc()
+            return None
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
                  max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
