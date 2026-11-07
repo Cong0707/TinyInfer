@@ -463,7 +463,11 @@ class TinyModel:
     def forward(self, ids: torch.Tensor, start_pos: int = 0):
         h = self.embed[ids]  # [b, s, dim]
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
-        pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32)
+        # 官方初始化是 one-hot（pre_mix[:, :, 0] = 1），不是全零。
+        # hc_pre 是 sum(pre_mix * x) 加权求和：全零等于把第一层的输入清零。
+        pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult,
+                              dtype=torch.float32, device=h.device)
+        pre_mix[:, :, 0] = 1.0
         pre_mix[:, :, 0] = 1.0
         hashes = None
         if self.hashes is not None:
