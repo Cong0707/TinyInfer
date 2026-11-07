@@ -769,28 +769,24 @@ class MoE:
                                 _ar.device, self.layer_id,
                                 [_sl._by_key[(self.layer_id, i)] for i in _ids])
                             _ts = rec_by_id[_ids[0]].tensors
-                            # 一个 kernel 做完 gate_up + 激活量化 + down + 累加
-                            # （原先是 moe_gemv6 / moe_act_q6 / moe_gemv6 / moe_acc6
-                            # 四次 launch，照 vLLM fused_moe 的做法收成一次）。
-                            _ne = len(_ids)
-                            _nmid = int(self.cfg.moe_inter_dim)
-                            _nb = _nmid >> 5
-                            _smem = (_ne * _nmid + _ne * _nb + _ne * _nmid * 2)
-                            _mf = _MOE_FUSED.get("fn")
-                            if _mf is None:
-                                from ..kernels import native as _nat
-                                _mf = _nat.BoundLaunch(
-                                    _nat.kernel("moe_fused", "moe_fused_decode"),
-                                    (1,), (256,), "TTTTTT" + "i" * 12 + "f",
-                                    shared=_smem)
-                                _MOE_FUSED["fn"] = _mf
-                            _mf(_aq.reshape(-1), _asc.reshape(-1), _ar, _sids, _wv,
-                                y, _ne, _nmid, int(self.cfg.dim), int(self.cfg.dim), _nmid,
-                                _bb,
-                                _ts["w1.weight"].dest_offset, _ts["w1.scale"].dest_offset,
-                                _ts["w3.weight"].dest_offset, _ts["w3.scale"].dest_offset,
-                                _ts["w2.weight"].dest_offset, _ts["w2.scale"].dest_offset,
-                                float(self.swiglu_limit), stream=None)
+                            # 不做「整层一个 kernel」：试过 moe_fused.cu，它把 6 个专家的
+                            # GEMM 串进一个 block，util 确实上到 57%，但每 token 要
+                            # 1323ms —— 融合的前提是每段工作本身还能并行。vLLM 的
+                            # fused_moe_kernel 是靠 sorted_token_ids 把「token x expert」
+                            # 铺成一个很大的 grid；单个 token 的 decode 没有那个维度。
+                            _gu = moe_gemv.gate_up(
+                                _aq, _asc, _ar, _sids, _bb,
+                                (self.cfg.moe_inter_dim, self.cfg.dim),
+                                (_ts["w1.weight"].dest_offset, _ts["w1.scale"].dest_offset,
+                                 _ts["w3.weight"].dest_offset, _ts["w3.scale"].dest_offset))
+                            _aq2, _asc2 = moe_gemv.act_quant(_gu, _wv,
+                                                            float(self.swiglu_limit))
+                            _dn = moe_gemv.down(
+                                _aq2, _asc2, _ar, _sids, _bb,
+                                (self.cfg.dim, self.cfg.moe_inter_dim),
+                                _ts["w2.weight"].dest_offset,
+                                _ts["w2.scale"].dest_offset)
+                            moe_gemv.acc(_dn, y, len(_ids))
                             served.extend(_ids)
                             if (_os0.environ.get("TI_FUSED_CHECK") == "1"
                                     and not getattr(self, "_fused_checked", False)):
