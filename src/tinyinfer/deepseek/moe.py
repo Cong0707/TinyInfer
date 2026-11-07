@@ -441,7 +441,12 @@ class MoE:
                 fa = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_act"),
                                         ((nmid + 31) // 32, n_exp, 1), (512,), "TTTTTOOiiiiiiiif")
                 _MOE_FUSED["act"] = fa
-            fa(aq.reshape(-1), asc.reshape(-1), arena[0], sids, weights[0],
+            # kernel 按 [row, expert] 索引激活，所以这里把每行的激活铺成 n_exp 份。
+            # 之前只传了一行（5120 字节），e=1..5 时读的是越界地址 —— 不报错但数值是垃圾。
+            _k = int(self.cfg.dim)
+            _aqx = aq.view(1, 1, _k).expand(1, n_exp, _k).reshape(-1)
+            _ascx = asc.view(1, 1, -1).expand(1, n_exp, -1).reshape(-1)
+            fa(_aqx, _ascx, arena[0], sids, weights[0],
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
                off[0], off[1], off[2], off[3], float(self.swiglu_limit), stream=None)
