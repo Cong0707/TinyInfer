@@ -2372,6 +2372,12 @@ class Engine:
             torch.cuda.empty_cache()
 
     def _graph_capture_shape(self, ids: torch.Tensor, start_pos: int) -> bool:
+        # 不用 CUDA graph。tier 里虽然还留着一个 cuda_graph 标志，但引擎这边
+        # 直接关死：这条路径从来没成功过（每次启动都打一行 "CUDA graph
+        # unavailable"），而它每次尝试都会 snapshot 整个 KV、跑一次完整 forward、
+        # 再 synchronize。关掉之后 torch 也不会在每次 op 里去查
+        # cudaStreamIsCapturing（实测每层 8 次）。
+        return False
         if not getattr(self.tier, "cuda_graph", False):
             return False
         if self.device == "cpu" or ids.shape[1] != 1:
