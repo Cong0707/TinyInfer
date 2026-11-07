@@ -424,13 +424,13 @@ class MoE:
                               f"slots={[getattr(r, 'buffer', None) is not None for r in _recs]}",
                               flush=True)
                     if __import__("os").environ.get("TI_GPUDBG") == "1":
-                        _st = [0, 0, 0, 0]
-                        for _i in range(sl.slots):
-                            _st[min(3, sl._refs[_i])] += 1
-                        print(f"[slot] L{self.layer_id} free={sl._state.count(sl.FREE)} "
-                              f"staged={sl._state.count(sl.STAGED)} "
-                              f"pinned={sl.pinned_count()} refs0={_st[0]} refsN={sl.slots - _st[0]}",
-                              flush=True)
+                            _st = [0, 0, 0, 0]
+                            for _i in range(sl.slots):
+                                _st[min(3, sl._refs[_i])] += 1
+                            print(f"[slot] L{self.layer_id} free={sl._state.count(sl.FREE)} "
+                                  f"staged={sl._state.count(sl.STAGED)} "
+                                  f"pinned={sl.pinned_count()} refs0={_st[0]} refsN={sl.slots - _st[0]}",
+                                  flush=True)
                     # fetch 有时只把字节放进 RAM/池而不占槽位（acquire_many 撞到
                     # RESERVED 时会返回 None）；这里再显式 acquire 一次，保证有槽位号。
                     for _e in _miss:
