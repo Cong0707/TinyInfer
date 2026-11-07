@@ -243,6 +243,78 @@ def bind(name: str, func: str, grid, block, kinds, shared: int = 0) -> BoundLaun
     return BoundLaunch(kernel(name, func), grid, block, kinds, shared)
 
 
+_LAUNCHERS: dict = {}
+_HOLD: list = []
+
+
+def _kind_code(a) -> str:
+    import torch
+
+    if torch.is_tensor(a):
+        return "T"
+    if a is None:
+        return "n"
+    if isinstance(a, bool):
+        return "i"
+    if isinstance(a, int):
+        return "i"
+    if isinstance(a, float):
+        return "f"
+    raise TypeError(f"unsupported kernel arg {type(a)}")
+
+
+def launch(fn: int, grid, block, args, stream=None, shared: int = 0) -> None:
+    """Launch with python args: tensors -> data_ptr, int -> int32, float -> float32.
+
+    The launcher is cached per (kernel, grid, block, argument kinds, shared bytes):
+    the naive path below rebuilt a ctypes array and a ctypes wrapper per argument on
+    every call, plus two torch.cuda.current_stream() calls, and at decode that is 447
+    launches per token -- cProfile put 35ms of the 80ms step in this function alone.
+
+    Tensors are kept alive in a rolling list instead of record_stream(). record_stream
+    is what the uncached path used, but it pins blocks to the stream long after they
+    are dead and fragmented a nearly-full card badly enough to break the layer plan;
+    holding a few hundred argument tuples covers the same window (the GPU never falls
+    that far behind) at a fraction of the cost.
+
+    The stream defaults to torch's CURRENT stream rather than 0. Legacy stream 0 is not
+    captured by torch.cuda.graph_capture, so a kernel launched there executes for real
+    during capture and is absent from every replay.
+    """
+    ks = "".join(_kind_code(a) for a in args)
+    key = (fn, tuple(grid), tuple(block), ks, int(shared))
+    bound = _LAUNCHERS.get(key)
+    if bound is None:
+        if len(_LAUNCHERS) > 4096:
+            _LAUNCHERS.clear()
+        bound = _LAUNCHERS[key] = BoundLaunch(fn, grid, block, ks, shared)
+    _HOLD.append(args)
+    if len(_HOLD) > 512:
+        del _HOLD[:384]
+    bound(*args, stream=stream)
+
+
+# CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+_CU_FUNC_MAX_DYNAMIC_SMEM = 8
+
+
+def set_dynamic_smem(name: str, func: str, nbytes: int) -> None:
+    """Raise the function's dynamic shared memory cap to nbytes.
+
+    Required before any launch asking for more than 48KB, which Marlin does (it uses
+    the entire opt-in budget so one block can hold a whole K-slice of stages).
+    """
+    fn = kernel(name, func)
+    rc = _lib().cuFuncSetAttribute(fn, _CU_FUNC_MAX_DYNAMIC_SMEM, int(nbytes))
+    if rc != 0:
+        raise RuntimeError(f"cuFuncSetAttribute failed: {rc}")
+
+
+def bind(name: str, func: str, grid, block, kinds, shared: int = 0) -> BoundLaunch:
+    """Resolve a cubin kernel once and return a reusable launcher."""
+    return BoundLaunch(kernel(name, func), grid, block, kinds, shared)
+
+
 def launch(fn: int, grid, block, args, stream=None, shared: int = 0) -> None:
     """Generic launch (kept for one-off call sites; prefer bind() in hot paths).
 
