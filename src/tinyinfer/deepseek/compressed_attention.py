@@ -269,20 +269,45 @@ class MLACompressedAttention:
             q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
             apply_rope(q[..., -self.rope_dim:], freqs)
             _kv_raw = _lin(self.wkv, x)
+        # ---- KV 一段：norm + rope + fp8 roundtrip + 写槽位，一个 kernel ----
+        # 原来是 rms_norm / apply_rope / act_quant(inplace) 三次 launch，加一次
+        # buf[:, slot] = kv 的拷贝。kv_norm_rope_quant.cu 把这四步收成一个：
+        # 它复现每一步的 bf16 取整（RoPE 写回 bf16、量化器读到的是取整后的行），
+        # 所以数值与原来逐位相同，而 launch 少三次。
         kv = None
-        if (getattr(self, "quant", False) and _kv_raw.is_cuda and _kv_raw.size(0) == 1
-                and __import__("os").environ.get("TI_FUSED_KV") == "1"):
-            from .deepseek_kernels import norm_rope as _fused_norm_rope
-            kv = _fused_norm_rope(_kv_raw, self.kv_norm, freqs, self.eps, self.rope_dim)
+        _kv_prepped = False
+        if (b == 1 and s == 1 and _kv_raw.is_cuda
+                and _kv_raw.dtype == torch.bfloat16
+                and int(_kv_raw.shape[-1]) == 512
+                and int(self.head_dim) == 512 and int(self.rope_dim) == 64):
+            _fb = self._kv_buf
+            if (_fb is None or _fb.shape[0] != b or _fb.shape[1] != self.window
+                    or _fb.dtype != _kv_raw.dtype or _fb.device != _kv_raw.device):
+                _fb = _kv_raw.new_empty(b, self.window, self.head_dim)
+                self._kv_buf = _fb
+                self._decode_win_idxs = None
+            _cs = torch.view_as_real(
+                freqs.reshape(1, self.rope_dim // 2)).reshape(-1).float().contiguous()
+            _kvfn = _KV_PREP.get("fn")
+            if _kvfn is None:
+                from ..kernels import native as _nat
+                _kvfn = _KV_PREP["fn"] = _nat.BoundLaunch(
+                    _nat.kernel("kv_norm_rope_quant", "kv_norm_rope_quant"),
+                    (1,), (128,), "TTTTOif")
+            _kvfn(_kv_raw.reshape(-1), self.kv_norm.reshape(-1), _cs,
+                  _fb.reshape(-1), int(start_pos) % self.window,
+                  float(self.eps), stream=None)
+            kv = _fb
+            _kv_prepped = True
         if kv is None:
             kv = rms_norm(_kv_raw, self.kv_norm, self.eps)
             apply_rope(kv[..., -self.rope_dim:], freqs)
-        # the reference quantises the window KV to fp8 (and back) AFTER RoPE -- that is
-        # the form the cache holds. Order matters: skipping the round trip is a ~4.7%
-        # output difference, and doing it before the rotation is a different value again.
-        if getattr(self, "quant", False) and kv.is_cuda:
-            from ..kernels.quant import act_quant
-            kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
+            # 参考实现在 RoPE 之后把窗口 KV 过一遍 fp8 再回来，cache 里存的就是那个
+            # 形式；跳过 round trip 是 ~4.7% 的输出差异，放在旋转之前又是另一个值。
+            if getattr(self, "quant", False) and kv.is_cuda:
+                from ..kernels.quant import act_quant
+                kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
+
 
         # ---- vLLM 式槽位 cache（同 MLAWindowAttention）----
         # 位置 p 写进 p % window 那一格，历史永不移动。旧实现在这里做三份拷贝：
@@ -294,7 +319,9 @@ class MLACompressedAttention:
             buf = kv.new_empty(b, self.window, self.head_dim)
             self._kv_buf = buf
             self._decode_win_idxs = None
-        if s == 1:
+        if _kv_prepped:
+            pass                       # kv_norm_rope_quant 已经写进槽位
+        elif s == 1:
             buf[:, start_pos % self.window] = kv[:, 0]
         else:
             if s > self.window:
