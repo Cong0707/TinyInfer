@@ -356,6 +356,17 @@ class MoE:
     def _forward_gpu_only(self, x: torch.Tensor, xf: torch.Tensor,
                           indices: torch.Tensor, weights: torch.Tensor):
         """整层不碰 CPU 的 decode 路径；走不通返回 None，由调用方回落慢路径。
+        # 上一轮自己用过的专家先还引用：refs 归零后 LRU 才能覆盖它们。
+        # （放在这里而不是 model.py，是因为那条路实测没被执行到。）
+        _prev = getattr(self, "_prev_ids", None)
+        _sl0 = getattr(getattr(self, "_expert_store", None), "slots", None)
+        if _prev and _sl0 is not None:
+            for _pe in _prev:
+                try:
+                    _sl0.release(self.layer_id, int(_pe))
+                except Exception:
+                    pass
+        self._prev_ids = None
 
         自包含：只吃 x / xf / indices / weights 和槽位表，不引用 forward 后面才定义的
         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
@@ -410,7 +421,7 @@ class MoE:
                       f"shape={tuple(indices.shape)}", flush=True)
             sids = tab[self.layer_id].index_select(0, indices.view(-1).clamp_(0, 383))
             if not torch.cuda.is_current_stream_capturing():
-                self._last_ids = (getattr(self, "_last_ids", None) or []) + [int(v) for v in indices.view(-1).tolist()]
+                self._prev_ids = [int(v) for v in indices.view(-1).tolist()]
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()
