@@ -377,8 +377,6 @@ class MoE:
         if tab is None:
             # 表是懒建的。warmup 阶段还没有路由统计，先建全 -1，miss 分支会填。
             tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
-            self._gpu_fail = "line 380"
-            return None
         try:
             from .fp4_native import quantize_act
             from ..kernels import native
