@@ -50,6 +50,19 @@ def _packed_cos_sin(table: torch.Tensor, start_pos: int, s: int) -> torch.Tensor
 
 _CS_BUF: dict = {}
 
+def refresh_cos_sin(table: torch.Tensor, start_pos: int, s: int) -> None:
+    """捕获图之后，每步 replay 前把 cos/sin 覆盖到同一块 buffer。
+
+    图里引用的是 _CS_BUF 的地址，replay 不会重跑 Python 侧的写入，所以位置
+    更新必须留在图外。"""
+    key = (str(table.device), int(table.data_ptr()), int(s))
+    buf = _CS_BUF.get(key)
+    if buf is None:
+        return
+    freqs = table[start_pos:start_pos + s]
+    buf[:freqs.numel()].copy_(freqs.real.reshape(-1))
+    buf[freqs.numel():].copy_(freqs.imag.reshape(-1))
+
 class MLACompressedAttention:
     """MLA with compressed KV. Row-parallel split support mirrors MLAWindowAttention."""
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False,

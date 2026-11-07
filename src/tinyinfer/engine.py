@@ -2441,6 +2441,18 @@ class Engine:
         out = g["out"]
         if out.shape[0] != ids.shape[0]:
             return None
+        # 位置相关的 cos/sin 在每步 replay 前重写（图内不会重跑 Python 写入）
+        try:
+            from .deepseek.compressed_attention import refresh_cos_sin
+            _blk = getattr(self, "model", None)
+            _blocks = getattr(_blk, "blocks", None) or []
+            if _blocks:
+                _att = getattr(_blocks[0], "attn", None)
+                _tbl = getattr(_att, "freqs_cis", None)
+                if _tbl is not None:
+                    refresh_cos_sin(_tbl, start_pos, int(ids.shape[1]))
+        except Exception:
+            pass
         g["in"].copy_(ids)
         for _gr in g["graphs"]:
             _gr.replay()
