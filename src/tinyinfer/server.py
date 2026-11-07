@@ -1217,7 +1217,8 @@ class TinyModelBackend(BaseBackend):
                 # 多跑几步：一次 forward 只能看到一条路由，pin 不出热点。槽位是
                 # 引擎自己管的固定区（1359 个），pin 住热点后 decode 的路由恒定
                 # 命中，CPU 不必每层再 tolist()（3.3ms/层、130ms/token）。
-                for _w in range(8):
+                # 第二次给它 pin，多跑只是在重复同一批搬运（实测 8 次 2.9s，2 次 0.8s）。
+                for _w in range(2):
                     model.forward(ids, 0)
                 _pinned = model.pin_hot_experts()
                 if _pinned:
