@@ -374,8 +374,8 @@ class MoE:
                 _n_exp_total = int(getattr(getattr(self, 'cfg', None), 'n_routed_experts', 0) or 0)
                 tab = sl.slot_table(int(getattr(self, '_n_layers_hint', 40) or 40),
                                     _n_exp_total or 384)
-            except Exception:
-                return None
+            except Exception as _exc:
+                raise RuntimeError(f"MoE layer {self.layer_id}: slot_table unavailable {_exc!r}") from _exc
         try:
             from .fp4_native import quantize_act
             from ..kernels import native
