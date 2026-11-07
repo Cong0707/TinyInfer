@@ -2146,6 +2146,8 @@ class Engine:
         flat_seq = [i for i in layer_seq if i in self._stream_layers()] if use_flat else []
         flat_pos = {j: k for k, j in enumerate(flat_seq)}
         for pos_i, i in enumerate(layer_seq):
+            if torch.cuda.is_current_stream_capturing() and i < getattr(self, "_graph_lo", 0):
+                continue
             b = self.block(i)
             streamed = i in self._stream_layers()
             if streamed and self.device != "cpu":
@@ -2450,14 +2452,11 @@ class Engine:
         if out.shape[0] != ids.shape[0]:
             return None
         g["in"].copy_(ids)
-        g["graph"].replay()
+        for _gr in g["graphs"]:
+            _gr.replay()
         return out.clone()
 
     def _graph_try_capture(self, ids: torch.Tensor, start_pos: int) -> None:
-        if __import__("os").environ.get("TI_GRAPHDBG") == "1":
-            print(f"[graphdbg] tier={getattr(self.tier, 'cuda_graph', None)} "
-                  f"gpu={self.gpu_layers}/{self.max_layers} "
-                  f"shape_ok={self._graph_capture_shape(ids, start_pos)}", flush=True)
         if getattr(self, "_graph", None) is not None or getattr(self, "_graph_failed", False):
             return
         if not self._graph_capture_shape(ids, start_pos):
@@ -2468,15 +2467,27 @@ class Engine:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    out = self._forward_impl(in_buf, start_pos, None)
+                # 分块捕获：每 TI_GRAPH_CHUNK 层一张图，所有图共享同一个 graph pool。
+                # 块与块之间的 h/pre_mix 都在 pool 内、地址固定，replay 时依次执行。
+                _chunk = max(1, int(__import__("os").environ.get("TI_GRAPH_CHUNK", "4")))
+                _pool = torch.cuda.graph_pool_handle()
+                _graphs = []
+                out = None
+                for _lo in range(0, self.max_layers, _chunk):
+                    self._graph_lo = _lo
+                    self._graph_hi = min(_lo + _chunk, self.max_layers)
+                    _g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(_g, pool=_pool):
+                        out = self._forward_impl(in_buf, start_pos, None)
+                    _graphs.append(_g)
                 torch.cuda.synchronize()
             finally:
                 self.restore(snap)
-            self._graph = {"graph": g, "in": in_buf, "out": out, "start_pos": start_pos}
+            self._graph = {"graphs": _graphs, "in": in_buf, "out": out,
+                           "start_pos": start_pos}
             self._graph_start_pos = start_pos
-            print(f"[tinyinfer] decode CUDA graph captured at pos={start_pos}", flush=True)
+            print(f"[tinyinfer] decode CUDA graph captured at pos={start_pos} "
+                  f"({len(_graphs)} chunks)", flush=True)
         except Exception as exc:
             self._graph_failed = True
             self._graph = None
@@ -2484,6 +2495,7 @@ class Engine:
                 import traceback as _tb
                 _tb.print_exc()
             print(f"[tinyinfer] CUDA graph unavailable ({exc!r}); eager decode", flush=True)
+
 
     def warm_graph_catalog(self) -> None:
         caps = list(getattr(self.tier, "graph_catalog", ()) or ())
