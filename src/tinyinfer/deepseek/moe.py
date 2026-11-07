@@ -793,7 +793,8 @@ class MoE:
                     # 安全性靠 miss 探针：kernel 把「本层有几个专家不在槽位」写进 pinned 的一个
                     # 字节，CPU 在**下一次** forward 的开头读它 —— 那时上一次的 GPU 工作早已完成，
                     # 读是免费的。标记非 0 就退到下面那条带 fetch 的路径，不会漏专家。
-                    if (_fused and getattr(self, '_slot_tab_ready', False)
+                    if (_fused and getattr(getattr(getattr(self, '_expert_store', None),
+                                               'slots', None), '_slot_tab', None) is not None)
                     ):
                         _sl = getattr(getattr(self, '_expert_store', None), 'slots', None)
                         _tab_all = getattr(_sl, '_slot_tab', None)
