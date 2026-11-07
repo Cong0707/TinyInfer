@@ -2462,6 +2462,14 @@ class Engine:
         if not self._graph_capture_shape(ids, start_pos):
             return
         try:
+            # 捕获期不能新建 tensor：window_idxs_ring 用的全局位置 buffer 先建好。
+            try:
+                from . import nn as _nn
+                import torch as _t
+                if _nn._POS_BUF is None or _nn._POS_BUF.device != _t.device("cuda"):
+                    _nn._POS_BUF = _t.zeros((), dtype=_t.long, device="cuda")
+            except Exception:
+                pass
             snap = self.snapshot()
             try:
                 in_buf = ids.clone()
