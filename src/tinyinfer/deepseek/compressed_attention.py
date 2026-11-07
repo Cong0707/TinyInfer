@@ -497,11 +497,14 @@ class MLACompressedAttention:
             if positions is not None and positions.numel() == b and b > 1:
                 # 同一步里所有层算的是同一份每行窗位，改走跨层缓存（见 _win_idxs_per_row）
                 win_idxs = self._win_idxs_per_row(positions, s, n_old, x.device)
+            else:
+                # tensor 版而不是 cached：cached 的 key 是 int start_pos，每步一个新 tensor
+                # （地址变），图里引用的还是捕获时那一块，replay 会读错槽位。
                 from ..nn import window_idxs_ring
-                _wi = window_idxs_ring(start_pos, s, 0, self.window, x.device).unsqueeze(0).expand(b, -1, -1)
-                win_idxs = _wi
-                                                   x.device).unsqueeze(0).expand(b, -1, -1)
+                win_idxs = window_idxs_ring(start_pos, s, 0, self.window,
+                                            x.device).unsqueeze(0).expand(b, -1, -1)
             if full:
+                self._decode_win_idxs = win_idxs
                 self._decode_win_idxs = win_idxs
         # 整块 cache 就是 attention 的输入：地址固定、连续，没有切片也没有拷贝
         self._kv_window = buf
