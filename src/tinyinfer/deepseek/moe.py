@@ -455,15 +455,16 @@ class MoE:
                 _aqb = torch.empty(n_exp * _k, dtype=torch.uint8, device=aq.device)
                 self._aq_buf = _aqb
             _aqx = _aqb[:n_exp * _k]
-            _aqx.view(n_exp, _k).copy_(
-                aq.reshape(-1, _k).unsqueeze(1).expand(-1, n_exp // max(1, aq.reshape(-1, _k).size(0)), -1).reshape(-1, _k))
+            _rows = int(xf.size(0))
+            _tk = max(1, n_exp // _rows)
+            _aqx.view(_rows, _tk, _k).copy_(aq.reshape(_rows, 1, _k).expand(_rows, _tk, _k))
             _ascb = getattr(self, "_asc_buf", None)
             if _ascb is None or _ascb.numel() < n_exp * asc.numel() or _ascb.device != asc.device:
                 _ascb = torch.empty(n_exp * asc.numel(), dtype=torch.uint8, device=asc.device)
                 self._asc_buf = _ascb
             _ascx = _ascb[:n_exp * asc.numel()]
-            _ascx.view(n_exp, -1).copy_(
-                asc.reshape(-1, asc.numel() // max(1, asc.reshape(-1, 1).size(0))).unsqueeze(1).expand(-1, n_exp // max(1, asc.reshape(-1, 1).size(0)), -1).reshape(-1, asc.numel() // max(1, asc.reshape(-1, 1).size(0))))
+            _nk = asc.numel() // _rows
+            _ascx.view(_rows, _tk, _nk).copy_(asc.reshape(_rows, 1, _nk).expand(_rows, _tk, _nk))
             fa(_aqx, _ascx, arena[0], sids, weights[0],
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
