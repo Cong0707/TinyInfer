@@ -473,6 +473,8 @@ class TinyModel:
                 h = block.engram.forward(h, hashes[block.engram.hash_index])
             h, pre_mix = block.forward(h, start_pos, pre_mix)
             # 每层用完把引用计数还回去（不 evict）：refs 归零后 LRU 下一层自然覆盖。
+            if __import__("os").environ.get("TI_GPUDBG") == "1" and block.ffn.layer_id <= 1:
+                print(f"[rel0] L{block.ffn.layer_id} ids={len(getattr(block.ffn, '_last_ids', None) or [])}", flush=True)
             _st = getattr(block.ffn, "_expert_store", None)
             if _st is not None and getattr(_st, "slots", None) is not None:
                 for _e in (getattr(block.ffn, "_last_ids", None) or []):
