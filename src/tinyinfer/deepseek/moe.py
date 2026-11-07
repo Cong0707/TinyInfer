@@ -420,8 +420,11 @@ class MoE:
                 if _miss:
                     _recs = self._expert_store.fetch(self.layer_id, _miss)
                     if __import__("os").environ.get("TI_GPUDBG") == "1":
-                        print(f"[fetch] L{self.layer_id} miss={_miss} recs={len(_recs)} "
-                              f"slots={[getattr(r, 'buffer', None) is not None for r in _recs]}",
+                        _fr = sum(1 for _i in range(sl.slots) if sl._state[_i] == sl.FREE)
+                        _stg = sum(1 for _i in range(sl.slots) if sl._state[_i] == sl.STAGED)
+                        _r0 = sum(1 for _i in range(sl.slots) if sl._refs[_i] == 0)
+                        print(f"[sl] L{self.layer_id} free={_fr} staged={_stg} refs0={_r0}"
+                              f" pinned={sl.pinned_count()} bykey={len(sl._by_key)}", flush=True)
                               flush=True)
                     if __import__("os").environ.get("TI_GPUDBG") == "1":
                         _st = [0, 0, 0, 0]
