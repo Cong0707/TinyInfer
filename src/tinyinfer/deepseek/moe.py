@@ -364,7 +364,9 @@ class MoE:
             for _pe in _prev:
                 try:
                     _sl0.release(self.layer_id, int(_pe))
-                except Exception:
+                except Exception as _ex:
+                    if __import__("os").environ.get("TI_GPUDBG") == "1":
+                        print(f"[relfail] L{self.layer_id} e={_pe} {_ex!r}", flush=True)
                     pass
         self._prev_ids = None
 
