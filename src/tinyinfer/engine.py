@@ -2462,7 +2462,7 @@ class Engine:
         if not self._graph_capture_shape(ids, start_pos):
             return
         try:
-            snap = self.snapshot()
+            snap = None  # 捕获期不 snapshot：restore 的 DtoD 会掩盖真正的错误
             try:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
@@ -2472,7 +2472,7 @@ class Engine:
                     out = self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
             finally:
-                self.restore(snap)
+            pass  # 不 restore（snap=None）
             self._graph = {"graph": g, "in": in_buf, "out": out, "start_pos": start_pos}
             self._graph_start_pos = start_pos
             print(f"[tinyinfer] decode CUDA graph captured at pos={start_pos}", flush=True)
