@@ -459,8 +459,8 @@ class MoE:
             _tk = max(1, n_exp // _rows)
             _aqx.view(_rows, _tk, _k).copy_(aq.reshape(_rows, 1, _k).expand(_rows, _tk, _k))
             _ascb = getattr(self, "_asc_buf", None)
-            if _ascb is None or _ascb.numel() < n_exp * asc.numel() or _ascb.device != asc.device:
-                _ascb = torch.empty(n_exp * asc.numel(), dtype=torch.uint8, device=asc.device)
+            if _ascb is None or _ascb.numel() < n_exp * (asc.numel() // max(1, asc.size(0))) :
+                _ascb = torch.empty(n_exp * (asc.numel() // max(1, asc.size(0))), dtype=torch.uint8, device=asc.device)
                 self._asc_buf = _ascb
             _ascx = _ascb[:n_exp * asc.numel()]
             _nk = asc.numel() // _rows
