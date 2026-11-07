@@ -394,7 +394,9 @@ class MoE:
                     _rc[int(_e)] = _rc.get(int(_e), 0) + 1
             sids = tab[self.layer_id].index_select(0, indices.view(-1))
             # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
-            if not getattr(self, "_all_pinned", False) and bool((sids < 0).any().item()):
+            if (not getattr(self, "_all_pinned", False)
+                    and not torch.cuda.is_current_stream_capturing()
+                    and bool((sids < 0).any().item())):
                 _miss = sorted({int(v) for v, sid in
                                 zip(indices.view(-1).tolist(), sids.tolist()) if int(sid) < 0})
                 if _miss:
