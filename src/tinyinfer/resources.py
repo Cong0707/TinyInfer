@@ -561,12 +561,15 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
                 + r * layer_b * LAYER_SLACK + buffers * max_layer_b + ws0 + runtime_b)
 
     if need_slots and has_gpu and slots < need_slots * 0.15:
-        # Below ~15% coverage the VRAM slot pool costs more than it saves: every expert
-        # that is not resident pays a DMA plus an event wait per use, and a slot that is
-        # still marked "ready" from a previous use hands back the wrong bytes (measured:
-        # 96 slots produced a different first token, and 13 slots made two identical
-        # greedy runs disagree). Decode speed comes from the host-pool read path instead.
-        slots = 0
+        # Below ~15% coverage the VRAM slot pool used to cost more than it saved: every
+        # non-resident expert paid a DMA plus an event wait, and a slot marked "ready"
+        # from an earlier use could hand back the wrong bytes (96 slots produced a
+        # different first token; 13 made two identical greedy runs disagree).
+        # Those two defects are fixed -- the pool writes its own slot table and never
+        # hands back bytes it did not just place (tests/test_slot_pool.py) -- so the
+        # reason to zero the pool is gone. Keep the slots: on a small card they are the
+        # only thing standing between decode and a disk read per expert.
+        pass
     if need_slots and has_gpu and slots < need_slots and (embed_gpu or head_gpu):
         for _eg, _hg in ((False, False), (False, True), (True, False)):
             _r2 = min(n_layers, layers_that_fit(_eg, _hg, buffers, ws0))

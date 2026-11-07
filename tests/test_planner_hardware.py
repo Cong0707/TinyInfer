@@ -41,10 +41,11 @@ def test_this_box_shape():
     assert p.fits
     assert 1 <= p.gpu_layers <= 6          # measured 4 here
     assert p.stream_layers == N - p.gpu_layers
-    # A small pool (a few percent of the 240 routable experts) costs more in DMAs and event
-    # waits than it saves, so the planner drops it and reinvests in residency (docs/
-    # analysis.md 16). Either an absent pool or one that covers a real fraction is fine.
-    assert p.expert_slots == 0 or p.expert_slots >= 0.15 * 240
+    # The planner used to zero a small pool because a stale "ready" slot could hand back
+    # the wrong bytes (docs/analysis.md 16). The pool now writes its own slot table and
+    # only ever returns bytes it just placed (tests/test_slot_pool.py), so a small pool
+    # is simply a small pool: it must still exist, and it must not eat the residency.
+    assert p.expert_slots >= 2
     assert p.cache_bytes > 1 * GB
 
 
@@ -120,5 +121,8 @@ def test_big_card_covers_all_routable_experts():
     """
     p = _plan([24.0], 64.0, 56.0)
     assert p.fits
+    # What matters is coverage: once every routable expert has a slot the expert IO
+    # term is gone. WHERE the embedding table lives is a means, not the goal -- the
+    # solver used to have to push it to the host to reach 240; it now reaches 268 with
+    # the table still on the card, which is strictly better (no host lookup per token).
     assert p.expert_slots >= 240, p.expert_slots
-    assert p.embed_on_cpu, "the table must move to the host to make room for the slots"
