@@ -381,6 +381,8 @@ class MoE:
         if sl is not None and not getattr(sl, "_arena", None):
             try:
                 sl._ensure()
+                if not getattr(sl, "_arena", None):
+                    raise RuntimeError(f"MoE layer {self.layer_id}: slots _ensure did not build arena")
             except Exception:
                 pass
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
