@@ -276,7 +276,14 @@ class Expert:
             x = x.to(self.w1.dtype)
             gate = F.linear(x, self.w1)
             up = F.linear(x, self.w3)
-        y = _swiglu2(gate, up, self.swiglu_limit)
+        # vLLM activation_kernels.cu 的 silu_and_mul（带 clamp），移植在
+        # kernels/cuda/vllm_silu_and_mul.cu，通过 vllm_ops.clamp_swiglu 调用。
+        # 上游吃 [rows, 2*d] 的连续激活，所以先 cat 两半 —— 之前自搓的 swiglu2
+        # 省了这次 cat，但那是自己写的 kernel，单独跑只占 9% 利用率。
+        from .vllm_ops import clamp_swiglu
+        y = clamp_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit)
+        if y is None:
+            raise RuntimeError("vllm clamp_swiglu unavailable (vllm_silu_and_mul.cubin)")
         if weights is not None:
             y = weights * y
         if hasattr(self.w2, "forward"):

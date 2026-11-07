@@ -228,58 +228,77 @@ def sample_logits(logits: torch.Tensor, temperature: float = 0.0, top_p: float =
 
 
 _ROPE_FN = None
+_ROTARY_CACHE: dict = {}
+_POS_CACHE: dict = {}
 
 
 def _rope_kernel():
-    """rope.cu 的原地 kernel（一个 launch 替掉 拷贝+kernel+拷贝 三个）。"""
+    """vLLM pos_encoding_kernels.cu 的 rotary_embedding（移植版）。"""
     global _ROPE_FN
     if _ROPE_FN is None:
         from .kernels import native
-        _ROPE_FN = native.kernel("rope", "rope_inplace_bf")
+        _ROPE_FN = native.kernel("vllm_rotary", "vllm_rotary_embedding_bf")
     return _ROPE_FN
 
 
-def _apply_rope_cuda(x: torch.Tensor, freqs_cis: torch.Tensor,
-                     inverse: bool):
-    """原地 CUDA rope。返回 None 表示这个形状走不了（调用方用 torch 版）。
+def _rotary_cache(freqs_cis: torch.Tensor, npos: int, rot: int) -> torch.Tensor:
+    """把 complex 的 freqs_cis 换成 vLLM 的 cos_sin_cache 布局 [npos, rot]。
 
-    apply_rope 的调用方都是拿 x 的切片当原地函数用（老实现最后一句就是
-    y.copy_(out)），所以这里也原地写回并返回 x。
+    上游的约定是「每个 position 一段 rot 长的 float，前一半 cos、后一半 sin」，
+    kernel 里 cos_ptr = cache_ptr、sin_ptr = cache_ptr + rot/2。
+    这张表在一次 decode 里不变，按 (存储地址, npos, rot) 缓存。
+    """
+    key = (freqs_cis.data_ptr(), int(npos), int(rot))
+    hit = _ROTARY_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if len(_ROTARY_CACHE) > 256:
+        _ROTARY_CACHE.clear()
+    fr = torch.view_as_real(freqs_cis.reshape(npos, rot // 2))
+    hit = torch.cat([fr[..., 0], fr[..., 1]], dim=-1).float().contiguous()
+    _ROTARY_CACHE[key] = hit
+    return hit
 
-    非原地版的代价：x 是 q[..., -rope_dim:] 这种切片，最后一维连续但 head 之间
-    有间隔，reshape 必然产生副本，于是每次调用是 拷贝 + kernel + copy_ 三个，
-    实测每 token 八十次 copy_。这里把 head 的 stride 交给 kernel，一个 launch 完成。
+
+def _pos_arange(npos: int, device) -> torch.Tensor:
+    key = (int(npos), str(device))
+    hit = _POS_CACHE.get(key)
+    if hit is None:
+        hit = _POS_CACHE[key] = torch.arange(npos, device=device, dtype=torch.int64)
+    return hit
+
+
+def _apply_rope_cuda(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool):
+    """原地旋转。返回 None 表示这个形状走不了（调用方用 torch 版）。
+
+    调用方传的是 q[..., -rope_dim:] 这种切片，所以 rope 段在 x 的偏移是 0，
+    而 head 之间隔着 head_dim（x 的 stride(-2)）。kernel 直接按这两个 stride
+    读写，不需要把切片拷成连续张量。
     """
     if not x.is_cuda or x.dtype != torch.bfloat16 or x.dim() < 2:
         return None
     rot = int(x.shape[-1])
-    if rot <= 0 or (rot & 1):
+    if rot <= 0 or (rot & 1) or x.stride(-1) != 1:
         return None
-    if x.stride(-1) != 1:
+    if freqs_cis.dim() < 2:
         return None
-    # 这个 kernel 按「所有行共用当前这一步的 (cos, sin) 表」工作，也就是 decode
-    # 形状。prefill 每一行位置不同，走 torch 那条路（chunk 不是热路径）。
-    if freqs_cis.dim() < 2 or int(freqs_cis.shape[0]) != 1:
-        return None
-    outer = 1
-    for v in x.shape[:-2]:
-        outer *= int(v)
-    if outer != 1:
+    npos = int(freqs_cis.shape[0])
+    if npos <= 0:
         return None
     heads = int(x.shape[-2])
     hstride = int(x.stride(-2))
-    if heads <= 0 or hstride < rot:
+    ntokens = 1
+    for v in x.shape[:-2]:
+        ntokens *= int(v)
+    if ntokens != npos:
         return None
-    # freqs_cis: complex [1, rot/2] -> (cos, sin) 交错的 fp32 表
-    fr = torch.view_as_real(freqs_cis.reshape(1, rot // 2)).reshape(1, rot)
-    if fr.dtype != torch.float32:
-        fr = fr.to(torch.float32)
-    pairs = heads * (rot >> 1)
-    blk = 256
-    grid = ((pairs + blk - 1) // blk,)
+    qstride = int(x.stride(-3)) if x.dim() >= 3 else heads * hstride
+    if qstride < hstride or hstride < rot:
+        return None
     from .kernels import native
-    native.launch(_rope_kernel(), grid, (blk,),
-                  [x, fr, heads, hstride, rot, 1 if inverse else 0])
+    native.launch(_rope_kernel(), (npos,), (256,),
+                  [_pos_arange(npos, x.device), x, _rotary_cache(freqs_cis, npos, rot),
+                   rot, qstride, hstride, heads, rot, 0, 1 if inverse else 0])
     return x
 
 
