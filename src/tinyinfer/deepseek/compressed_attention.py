@@ -20,6 +20,7 @@ from ..weights import ShardStore
 
 # kv_norm_rope_quant 的 launcher 缓存（几何固定：grid=1, block=128）
 _KV_PREP: dict = {}
+_BTGEMV: dict = {}
 
 # _cs（kernel 要的 cos‖sin 打包向量）按 (表地址, 起点, 长度) 缓存。
 # 一次 decode step 里所有压缩层拿到的都是同一张 freqs 表的同一行，原来每层
@@ -287,7 +288,7 @@ class MLACompressedAttention:
         """batch>1 时每行的窗口槽位模板。原来每层都在 Python 里逐行重建。
 
         window_idxs_per_row 对每一行跑 arange/-/>=/&/full_like/where/int 一长串
-        kernel（一行 ~7 个 launch），而同一 forward 里 37 个压缩层拿到的是同一个
+        kernel（一行 ~7 个 launch），而同一 forward 里 38 个压缩层拿到的是同一个
         positions、同一个 n_old —— 逐层重算是纯重复。输入全只读，函数是确定性的，
         命中缓存与重算逐位相同。
         """
@@ -648,7 +649,29 @@ class MLACompressedAttention:
         if getattr(self, "quant", False) and o.is_cuda:
             from ..kernels.quant import act_quant
             o = act_quant(o, 32, "ue8m0", torch.float8_e8m0fnu, True)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        # 这个 einsum 是「每个位置一个独立的 [r,d] x [d]」，走 cuBLAS 的 grouped
+        # batched gemm，实测 3.65 ms/token（每层一个 91us 的 kernel，占 GPU 时间 15%）。
+        # bt_gemv 把它铺成一个 grid：一个 warp 一行，g 在 blockIdx.y。
+        if (o.is_cuda and o.shape[0] * o.shape[1] == 1
+                and wo_a.dtype == torch.bfloat16 and wo_a.is_contiguous()):
+            _g, _r, _d = int(wo_a.shape[0]), int(wo_a.shape[1]), int(wo_a.shape[2])
+            try:
+                from ..kernels import native as _natb
+                _xb = o.reshape(_g, _d).contiguous()
+                _yb = torch.empty(_g, _r, dtype=torch.bfloat16, device=o.device)
+                _key = ("bt_gemv", _g, _r, _d)
+                _fn = _BTGEMV.get(_key)
+                if _fn is None:
+                    _fn = _natb.BoundLaunch(
+                        _natb.kernel("bt_gemv", "bt_gemv_bf16"),
+                        ((_r + 7) // 8, _g), (256,), "TTTOiii")
+                    _BTGEMV[_key] = _fn
+                _fn(_xb.view(-1), wo_a.reshape(-1).contiguous(), _yb.view(-1), _g, _r, _d)
+                o = _yb.view(1, 1, _g, _r)
+            except Exception:
+                o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        else:
+            o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         out = _lin(self.wo_b, o.flatten(2))
         if getattr(self, "tp_world", 1) > 1:
             from ..tp import all_reduce_sum
