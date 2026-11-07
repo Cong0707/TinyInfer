@@ -606,6 +606,8 @@ class MoE:
             else:
                 active = [i for i in active if (i % _world) == _rank]
 
+        _fp4_env = _os0.environ.get("TI_MOE_FP4")
+        _single_token = xf.size(0) == 1
         target = xf.device
         use_fp4_kernel = target.type == "cuda" and (
             _fp4_env == "1" or (_single_token and _fp4_env != "0")
@@ -706,8 +708,6 @@ class MoE:
         # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
         # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
         # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
-        _fp4_env = _os0.environ.get("TI_MOE_FP4")
-        _single_token = xf.size(0) == 1
         # per-expert (token, slot) selection computed once and reused by both passes
         sels: dict[int, tuple] = {}
         _single = xf.size(0) == 1
