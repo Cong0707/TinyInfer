@@ -363,6 +363,11 @@ class MoE:
         if not (xf.is_cuda and xf.size(0) == 1):
             return None
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
+        if sl is not None and not getattr(sl, "_arena", None):
+            try:
+                sl._ensure()
+            except Exception:
+                pass
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
         if not arena or len(arena) != 1:
