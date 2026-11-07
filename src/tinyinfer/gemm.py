@@ -112,10 +112,11 @@ def fp8_linear_q(aq: torch.Tensor, asc: torch.Tensor, w_fp8: torch.Tensor,
         _fn = native.BoundLaunch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
                                  ((n + 7) // 8,), (256,), "TTTTOii")
         _GEMV_BOUND[_key] = _fn
-            _fn(x.reshape(-1),
-                w_fp8.view(torch.uint8).reshape(-1),
-                w_scale.view(torch.uint8).reshape(-1),
-                y, int(n), int(k), 1e-4, stream=None)
+    _fn(aq.view(torch.uint8).reshape(-1),
+        asc.view(torch.uint8).reshape(-1),
+        w_fp8.view(torch.uint8).reshape(-1),
+        w_scale.view(torch.uint8).reshape(-1),
+        y, int(n), int(k), stream=None)
     return y.view(1, n)
 
 
