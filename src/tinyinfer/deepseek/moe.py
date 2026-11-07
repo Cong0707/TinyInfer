@@ -489,7 +489,7 @@ class MoE:
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: {_miss} still not resident")
             # prefill（未 pin）：本层用到的槽位引用清零，LRU 才能覆盖它们；decode（已 pin）不动。
-            if (xf.size(0) > 1
+            if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()):
                 _sl1 = getattr(getattr(self, "_expert_store", None), "slots", None)
                 if _sl1 is not None:
