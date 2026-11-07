@@ -327,6 +327,14 @@ class Expert:
 
 
 class MoE:
+    def _scratch(self, nbytes: int, device):
+        """MoE 融合 kernel 的中间 buffer（fp8 激活 + e8m0 scale），按大小复用。"""
+        buf = getattr(self, "_scratch_buf", None)
+        if buf is None or buf.numel() < nbytes or buf.device != device:
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            self._scratch_buf = buf
+        return buf
+
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
                  max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
                  plan_fn=None):
