@@ -1279,9 +1279,13 @@ class Engine:
         # 不需要 CPU 每层 tolist 再发 H2D。
         if pinned:
             try:
+                # fetch 的 DMA 是异步的：不先等它落地，表立刻指向这些槽位，decode
+                # 读到的还是空槽位（实测 pin 后同一输入第二次 forward 出 NaN）。
+                torch.cuda.synchronize()
                 slots.slot_table(max(1, len(self._blocks)), int(getattr(
                     getattr(slots, "_index", None), "n_experts", 0) or 384))
                 slots.table_sync()
+                torch.cuda.synchronize()   # 表也必须落地，decode 下一步就会读它
                 self._slot_tab_ready = True
                 # 默认不设 _all_pinned：pin 只覆盖 prefill 期的 top-34，采样解码仍会
                 # 路由到没 pin 的专家，那时表里是 -1，直通 kernel 就是非法地址，
