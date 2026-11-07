@@ -430,6 +430,8 @@ class MoE:
                     and bool((sids < 0).any().item())):
                 _miss = sorted({int(v) for v, sid in
                                 zip(indices.view(-1).tolist(), sids.tolist()) if int(sid) < 0})
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError(f"MoE layer {self.layer_id}: miss during capture")
                 if _miss:
                     _recs = self._expert_store.fetch(self.layer_id, _miss)
                     if __import__("os").environ.get("TI_GPUDBG") == "1":
