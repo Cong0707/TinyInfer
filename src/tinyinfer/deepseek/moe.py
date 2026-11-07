@@ -399,7 +399,7 @@ class MoE:
             if fd is None:
                 fd = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_down"),
                                         ((int(self.cfg.dim) + 15) // 16,), (512,),
-                                        "TTTTOiiiiii")
+                                        "TTTTOiiiiiii")
                 _MOE_FUSED["down"] = fd
             fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
                arena[0], sids, y,
@@ -907,7 +907,7 @@ class MoE:
                                 from ..kernels import native as _nat2
                                 _fd = _nat2.BoundLaunch(
                                     _nat2.kernel('moe_fused', 'moe_fused_down'),
-                                    ((int(self.cfg.dim) + 15) // 16,), (512,), 'TTTTOiiiiii')
+                                    ((int(self.cfg.dim) + 15) // 16,), (512,), 'TTTTOiiiiiii')
                                 _MOE_FUSED['down'] = _fd
                             _fd(_oq.view(torch.float8_e4m3fn), _os, _ar, _sids, y,
                                 _ne, int(self.cfg.dim), _nmid, _bb,
