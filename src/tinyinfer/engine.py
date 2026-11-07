@@ -2474,6 +2474,13 @@ class Engine:
                     _nn._POS_BUF = _t.zeros((), dtype=_t.long, device="cuda")
             except Exception:
                 pass
+            # warmup 也要用同一个位置：窗口索引从 _POS_BUF 读，旧值会让图内图外不一致。
+            try:
+                from . import nn as _nn2
+                if getattr(_nn2, "_POS_BUF", None) is not None and not torch.cuda.is_current_stream_capturing():
+                    _nn2._POS_BUF.fill_(int(start_pos))
+            except Exception:
+                pass
             snap = self.snapshot()
             try:
                 in_buf = ids.clone()
