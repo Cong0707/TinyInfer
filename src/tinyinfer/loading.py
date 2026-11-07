@@ -2447,7 +2447,7 @@ class VramSlotCache:
         for idx in range(self.slots):
             if self._state[idx] == self.FREE:
                 return idx
-        for idx in self._lru:
+        for idx in range(self.slots):   # 扫全池：_lru 可能缺掉早先的槽位
             if self._state[idx] in (self.STAGED, self.IN_USE) and self._refs[idx] == 0:
                 if self._key[idx] in self._pinned:
                     continue          # 热点专家：永不淘汰
