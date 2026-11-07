@@ -481,6 +481,10 @@ class TinyModel:
                     for _e in getattr(block.ffn, "_last_ids", []):
                         try:
                             _sl.release(block.ffn.layer_id, int(_e))
+                        if __import__("os").environ.get("TI_GPUDBG") == "1":
+                            print(f"[rel] L{block.ffn.layer_id} e={_e} "
+                                  f"has={_sl.has(block.ffn.layer_id, int(_e))} "
+                                  f"staged={_sl.is_staged(block.ffn.layer_id, int(_e))}", flush=True)
                         except Exception:
                             pass
         from .hc import hc_split_sinkhorn  # noqa: F401  (kept importable for users)
