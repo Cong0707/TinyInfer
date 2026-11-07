@@ -3209,7 +3209,12 @@ class ExpertStore:
             # 原来看都不看槽位，只查 ram，于是每个命中槽位的专家仍然去读一次盘
             # （cProfile：6 个 token 里 readinto 占 1.83s，而 copy_in 是 0 次）。
             _slot_have = set()
-            if (self.slots is not None and self.slots.slots > 0 and cache):
+            # 注意：这里不能加 and cache。# cache 的语义是「本次允许不允许往池里
+            # admit 新专家」，和「能不能先看看槽位里有没有」是两回事 —— 之前
+            # decode 传 cache=False，于是已经驻留在槽位里的专家照样被判定成 miss，
+            # 每层六个专家每次都重新走一遍读盘/搬运，白白多出六个
+            # cudaStreamWaitEvent。查槽位是只读操作，任何时候都该做。
+            if (self.slots is not None and self.slots.slots > 0):
                 for _e in experts:
                     try:
                         if self.slots.has(layer, _e):
