@@ -2397,6 +2397,11 @@ class Engine:
         # 要开必须先把这些 buffer 全部改成「捕获前预分配、捕获期只写不分配」。
         # 捕获期禁止 H2D 互拷，而慢路径里就有 indices.tolist()。纯 GPU 路径
         # 不含这种调用，所以只在槽位表就绪（pin 之后）才允许捕获。
+        # 捕获期会打出粘性 CUDA_ERROR_ILLEGAL_ADDRESS（cuMemcpyDtoDAsync_v2），
+        # 把整个 context 弄坏，比不 graph 更糟。当前 attention/hc 段有分配和
+        # 环形槽写入不在 graph pool 里，必须先把它们改成「捕获前预分配、
+        # 捕获期只写不分配」才能开。在那之前关死。
+        return False
         _slots0 = getattr(getattr(self, "expert_store", None), "slots", None)
         if getattr(_slots0, "_slot_tab", None) is None:
             return False
