@@ -2102,8 +2102,7 @@ class Engine:
         h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
         if __import__("os").environ.get("TI_GPUDBG") == "1":
             print("[trace] embed done", flush=True)
-        # expand：0 拷贝、无 kernel（原来 repeat 在 graph 捕获期会新建 tensor）
-        h = h.unsqueeze(2).expand(-1, -1, self.cfg.hc_mult, -1)
+        h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
         if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
@@ -2219,10 +2218,6 @@ class Engine:
                 if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
                     print(f"[capt] layer {i}", flush=True)
                 h, pre_mix = b.forward(h, start_pos, pre_mix, positions=positions)
-                if torch.cuda.is_current_stream_capturing() and i == 4:
-                    continue
-                if torch.cuda.is_current_stream_capturing() and i >= 4:
-                    break
                 _dh = getattr(self, "_dump_h", None)
                 if _dh is not None:
                     _dh.append((i, h_in.clone(), h.clone()))
@@ -2466,7 +2461,7 @@ class Engine:
         if not self._graph_capture_shape(ids, start_pos):
             return
         try:
-            snap = None  # 捕获期不 snapshot：restore 的 DtoD 会掩盖真正的错误
+            snap = self.snapshot()
             try:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
@@ -2476,7 +2471,7 @@ class Engine:
                     out = self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
             finally:
-                pass
+                self.restore(snap)
             self._graph = {"graph": g, "in": in_buf, "out": out, "start_pos": start_pos}
             self._graph_start_pos = start_pos
             print(f"[tinyinfer] decode CUDA graph captured at pos={start_pos}", flush=True)
