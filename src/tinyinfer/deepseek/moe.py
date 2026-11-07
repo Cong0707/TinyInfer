@@ -387,8 +387,9 @@ class MoE:
             print(f"[capt] L{self.layer_id}", flush=True)
         if not xf.is_cuda:
             raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
-        # prefill 多行：按 3 行一批算。整批 6 行要 1440 个 (layer, expert) 槽位，
-        # 池子只有 1359；3 行一批是 720，装得下。
+        # 多行 prefill 分批：整批 6 行要 1440 个 (layer, expert) 槽位，8GB 卡的
+        # 池子撑不住，3 行一批（720）才放得下。这是小卡能跑起来的前提，不能去掉。
+        # 每批之间必须先同步再换参数（见下），否则异步 kernel 会读到被复用的显存。
         if xf.size(0) > 3:
             _outs = []
             for _s0 in range(0, xf.size(0), 3):
@@ -400,12 +401,10 @@ class MoE:
                         f"MoE layer {self.layer_id}: rows {_s0}-{_s1} unavailable "
                         f"[{getattr(self, '_gpu_fail', '?')}]")
                 # _o 是 _gpu_y_buf 的 view（.to(bf16) 对 bf16 是 no-op）；下一批
-                # 换形状会重建并释放那块 buffer，前面几批的 view 就全悬空了，
-                # torch.cat 一读就是非法地址。clone 一次把结果脱开共享 buffer。
+                # 换形状会重建并释放那块 buffer，前面几批的 view 就全悬空了。
                 _outs.append(_o.clone())
-                # 每批都换了 sids/weights：driver-API 的 kernel 不等 Python 引用，
-                # 下一批覆盖 _launch_keep 会把它们回收掉，异步中的 kernel 就读到
-                # 被复用的显存（compute-sanitizer 里那个 4e16 的偏移）。先同步再换。
+                # 下一批会覆盖 _sids_buf / _launch_keep：driver-API 的 kernel 不
+                # 认 Python 引用，这里的等待是所有跨批共享状态的唯一屏障。
                 torch.cuda.synchronize()
             return torch.cat(_outs, dim=1)
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
@@ -534,9 +533,21 @@ class MoE:
             # 只有「多行 prefill 分批」才需要腾槽位：那样一批就要 18 个专家，不还回去
             # 会把池子占满。逐 token 的 prefill 和 decode 每步每层只要 6 个，还回去
             # 等于让下一步全部 miss —— 那是每 token 重读 4.5GB、0.7 tok/s 的来源。
+            # 自适应：多行 prefill 每层要 rows*topk 个槽位，必须还；decode 只有
+            # topk 个，能不能留住取决于池子装不下整步（40 层 x topk）。8GB 卡的
+            # 271 个装不下 240，必须继续 evict；L20 的 1359 装得下，就不 evict，
+            # 让专家常驻 —— 同一份代码，规模由 slots 自己决定。
+            _need_step = int(getattr(self.cfg, "n_layers", 40)) * int(
+                getattr(self.cfg, "n_activated_experts", 6))
+            _pool = int(getattr(getattr(getattr(self, "_expert_store", None), "slots", None),
+                                "slots", 0) or 0)
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()
-                    and xf.size(0) > 3):
+                    and (xf.size(0) > 1 or _pool < _need_step * 2)):
+                # fd 是异步 launch 的：槽位一还给池子，下一个 acquire 立刻就能覆盖
+                # 这块显存，而 kernel 可能还在读它。先同步再还（只有多行 prefill
+                # 走这里，这个等待本来就藏着 IO）。
+                torch.cuda.synchronize()
                 _sl1 = getattr(getattr(self, "_expert_store", None), "slots", None)
                 if _sl1 is not None:
                     _tab1 = getattr(_sl1, "_slot_tab", None)

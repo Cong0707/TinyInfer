@@ -1210,7 +1210,7 @@ class Engine:
             self.predictor = None
         return n
 
-    def pin_hot_experts(self, per_layer: int = 34) -> int:
+    def pin_hot_experts(self, per_layer: int = 0) -> int:
         """把每层最常路由的专家固定进显存槽位（永不淘汰）。
 
         槽位是引擎的「手搓 manage」：1359 个 x 18.8MB 的固定区，谁在哪个槽位由
@@ -1223,17 +1223,34 @@ class Engine:
         slots = getattr(getattr(self, "expert_store", None), "slots", None)
         if slots is None or getattr(slots, "slots", 0) <= 0:
             return 0
-        pinned = 0
+        # 按「全局频率」而不是每层固定配额挑选：槽位总数就是预算。8GB 卡的 271 个
+        # 和 L20 的 1359 个走同一套代码，规模由 slots 自己决定，不需要调用方知道。
+        _cand = []
         for lid, b in self._blocks.items():
-            ffn = getattr(b, "ffn", None)
-            counts = getattr(ffn, "_route_counts", None) if ffn is not None else None
-            if not counts:
-                continue
-            _top = [e for e, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:per_layer]]
-            # pin() 只固定「已经在槽位里」的专家（key in _by_key），而 prefill 收尾
-            # 会把每层用过的槽位全部 evict 掉 —— 所以直接 pin 永远返回 False、
-            # pinned=0，槽位表和图捕获条件跟着一起失效。先把热点搬进槽位再固定。
-            _miss = [e for e in _top if not slots.has(lid, e)]
+            counts = getattr(getattr(b, "ffn", None), "_route_counts", None)
+            if counts:
+                for _e, _c in counts.items():
+                    _cand.append((_c, lid, _e))
+        if not _cand:
+            return 0
+        _cand.sort(key=lambda t: -t[0])
+        if per_layer:
+            _seen: dict[int, int] = {}
+            _sel = []
+            for _c, _l, _e in _cand:
+                if _seen.get(_l, 0) < per_layer:
+                    _sel.append((_c, _l, _e))
+                    _seen[_l] = _seen.get(_l, 0) + 1
+            _cand = _sel
+        _sel = _cand[: int(slots.slots)]
+        _by_layer: dict[int, list[int]] = {}
+        for _c, _l, _e in _sel:
+            _by_layer.setdefault(_l, []).append(_e)
+        pinned = 0
+        for lid, es in _by_layer.items():
+            # pin() 只固定「已在槽位里」的专家，而 prefill 收尾会清掉槽位，
+            # 所以先把选中的搬进来，再固定。
+            _miss = [e for e in es if not slots.has(lid, e)]
             if _miss:
                 try:
                     self.expert_store.fetch(lid, _miss)
@@ -1245,7 +1262,7 @@ class Engine:
                             slots.acquire(lid, _e)
                         except Exception:
                             pass
-            for _expert in _top:
+            for _expert in es:
                 if slots.pin(lid, _expert):
                     pinned += 1
         # 把所有 pin 的结果一次性刷进 device 侧的槽位表（table_sync 内部是主机侧
