@@ -440,6 +440,10 @@ class HCBlockMixin:
                     return (_pre.view(b, s, self.hc_mult), _post.view(b, s, self.hc_mult),
                             _comb.view(b, s, self.hc_mult, self.hc_mult))
                 if bfs:
+                    # bf16 但 j_dim/hc_mult 不是融合 kernel 覆盖的组合：仍用两段式
+                    _launch(_kern("hc_mixes_bf_j"), (j_dim, b * s), (256,),
+                            [x2.contiguous(), fn32, out, b * s, k_dim, j_dim,
+                             float(self.hc_eps)])
                 else:
                     # fp32 通道（非 bf16 的 tier）仍走原 kernel：并行版只写了 bf16，
                     # 把 fp32 降成 bf16 再算会改精度，那不是优化而是换算法。
