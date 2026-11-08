@@ -2152,6 +2152,10 @@ class VramSlotCache:
         self.hits = 0
         self.loads = 0
         self.evictions = 0
+        # 「兜底时抢走了正在计算的那个层自己的槽位」的次数。>0 意味着**那一次',
+        # MoE 的输入可能不精确** —— kernel 读到的是别的专家的字节。
+        # 8GB 卡上只要有超过 14 个 (layer, expert) 需求就必然发生。
+        self.urgent_evictions = 0
         # set while a prefill wave owns the card: the pool must not re-create itself
         # behind its back (it is 1.2GB at 64 slots and the prefill workspace OOMs)
         self._paused = False
@@ -2712,6 +2716,15 @@ class VramSlotCache:
                         continue
                     if key is not None and key[0] == want_layer:
                         continue
+                else:
+                    # mode == "any"：兜底，连 urgent 也抢。这是必要的（否则池子
+                    # 爆掉时整个卡死），但**它会破坏正在计算的层的正确性**：
+                    # 那层的 kernel 正在读被抢走的槽位，之后读到的是新专家的字节。
+                    # 实测：8 行 batch 需要 48 个槽位、池子只有 14 个，
+                    # 跑完之后 6 个专家里只剩 1 个还在，MoE 输出偏差 20%。
+                    # 这里记下次数，让上层能知道「这一层可能算歪了」。
+                    if i in self._urgent:
+                        self.urgent_evictions += 1
                 self._cur = (i + 1) % n
                 return i
         return None
@@ -2784,6 +2797,8 @@ class VramSlotCache:
             "loads": _loads,
             "hit_rate": (_hits / float(total)),
             "evictions": int(getattr(self, "evictions", 0)),
+            # >0 说明兜底抢走过正在计算的层的槽位 —— 那几次 MoE 的数值可能不精确。
+            "urgent_evictions": int(getattr(self, "urgent_evictions", 0)),
             "pinned": self.pinned_count(),
             "urgent": len(self._urgent),
             "dirty": len(self._dirty),
