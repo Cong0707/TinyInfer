@@ -616,22 +616,20 @@ class MoE:
             # 主机在这里不做任何同步：不 item()、不 tolist()、不拿中间产物。
             # 这是用户要的「买家下单，卖家发货，买家自己等货」—— 以前每层
             # 要把 miss 计数拉回主机（40 层 x 3.3ms = 130ms/token）。
-            _ring = _async.ring if (_async is not None and _async.enabled) else None
-            if _ring is not None:
-                _ring.wait_ready(sids, int(indices.numel()), self.layer_id,
-                                 int(self._req_epoch()))
-            else:
-                # 没有环（CPU-only / 捕获期）：退回主机侧同步补缺。
-                _nmiss = 0
-                if (not getattr(self, "_all_pinned", False)
-                        and not torch.cuda.is_current_stream_capturing()):
-                    _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
-                if _nmiss:
-                    _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
-                    if _miss:
-                        _mgr.need(self.layer_id, _miss)
-                        _mgr.commit(self.layer_id)
-                        _mgr.ready(self.layer_id, _miss)
+            # 判断缺谁：GPU 侧扫（kernel），但**不在 GPU 上等** ——
+            # 自旋等待会和主线程的 commit 互相等死（GPU 等就绪，就绪要 commit，
+            # commit 排在自旋后面）。所以这里只取回「缺了哪几个」（一次小 D2H，
+            # 只有真有缺失时才发生），由主线程备货后放行。
+            _nmiss = 0
+            if (not getattr(self, "_all_pinned", False)
+                    and not torch.cuda.is_current_stream_capturing()):
+                _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
+            if _nmiss:
+                _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
+                if _miss:
+                    _mgr.need(self.layer_id, _miss)
+                    _mgr.commit(self.layer_id)
+                    _mgr.ready(self.layer_id, _miss)
             tab = sl._slot_tab
             torch.index_select(tab[self.layer_id], 0,
                                indices.view(-1).clamp_(0, 383), out=sids)
