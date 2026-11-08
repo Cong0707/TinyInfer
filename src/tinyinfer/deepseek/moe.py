@@ -532,10 +532,13 @@ class MoE:
         # 多行 prefill 分批：整批 6 行要 1440 个 (layer, expert) 槽位，8GB 卡的
         # 池子撑不住，3 行一批（720）才放得下。这是小卡能跑起来的前提，不能去掉。
         # 每批之间必须先同步再换参数（见下），否则异步 kernel 会读到被复用的显存。
-        if xf.size(0) > 3:
+        # 分批阈值。3 是小卡能跑起来的前提（见下），但 TI_MOE_BATCH 可以调大，
+        # 用来排查「分批是否是某个行位置出错的成因」。
+        _moe_bs = int(__import__("os").environ.get("TI_MOE_BATCH", "3") or "3")
+        if xf.size(0) > _moe_bs:
             _outs = []
-            for _s0 in range(0, xf.size(0), 3):
-                _s1 = min(_s0 + 3, xf.size(0))
+            for _s0 in range(0, xf.size(0), _moe_bs):
+                _s1 = min(_s0 + _moe_bs, xf.size(0))
                 # x 一定是 [rows, dim]（forward 里 view(-1, dim) 之后才进来），
                 # 所以按第一维切就行。以前写的是 x[:, a:b]，那是按第二维切 ——
                 # 多行时切错轴，输出形状对不上（shape [2,3,5120] invalid）。
