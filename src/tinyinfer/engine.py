@@ -2084,9 +2084,17 @@ class Engine:
         """Layers that are re-copied every token (the tail beyond the resident set)."""
         if getattr(self, "_stream_set", None) is None:
             if self.layer_ids is not None:
-                self._stream_set = set(self.layer_ids[self.gpu_layers:])
+                # gpu_layers 是 planner 按显存算出来的「能常驻几层」，而 layer_ids
+                # 是调用方实际要建的层（8GB 卡上常常只有 4 层）。两者不一致时，
+                # 直接用 gpu_layers 当切片下标是错的：layer_ids=[0..3] 配
+                # gpu_layers=11 会切出空集（恰好对），但配 gpu_layers=2 就会
+                # 把 [2,3] 当成 streamed —— 而它们其实常驻。
+                # 正确语义：常驻的是 layer_ids 的前 min(gpu_layers, len) 个。
+                _n_res = min(int(self.gpu_layers), len(self.layer_ids))
+                self._stream_set = set(self.layer_ids[_n_res:])
             else:
-                self._stream_set = set(range(self.gpu_layers, self.max_layers))
+                self._stream_set = set(range(min(int(self.gpu_layers), self.max_layers),
+                                             self.max_layers))
         return self._stream_set
 
     def _stream_prefetch(self, layer_id: int, stream):
