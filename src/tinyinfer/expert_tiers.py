@@ -95,11 +95,15 @@ class ExpertTierManager:
                     pass
         return out
 
-    def need(self, layer: int, experts: Iterable[int]) -> int:
+    def need(self, layer: int, experts: Iterable[int], *, urgent: bool = True) -> int:
         """备货（可以在任何线程）：把缺失的专家字节取出来、挑好槽位。
 
         只做主机侧的事：查内存、读盘、挑槽位、把字节拷进 pinned 中转区。
         **不发任何 CUDA 调用** —— 卖家线程跨线程发 CUDA 会和主线程互等死锁。
+
+        urgent=False 是预取：**只在有空槽位时**才占位，绝不为它覆盖别人正在用的
+        槽位。这一条是必须的 —— 预取和当前层抢槽位时，输的必须是预取：实测
+        不加区分地预取会让当前层自己都装不进去（"still not resident"）。
         """
         if self.slots is None or not self.slots.slots:
             return 0
@@ -114,7 +118,8 @@ class ExpertTierManager:
             return 0
         staged = self.slots.stage(
             layer, list(data.keys()),
-            lambda lay, want_e: {e: data[e] for e in want_e if e in data})
+            lambda lay, want_e: {e: data[e] for e in want_e if e in data},
+            urgent=urgent)
         self.stats["placed"] += int(staged)
         return int(staged)
 

@@ -2085,6 +2085,39 @@ class Engine:
         # being executed, and this thread just warms the RAM cache ahead of it.
         b.ffn.prefetch(experts)
 
+    def _warm_next_layer(self, layer_id: int, experts) -> int:
+        """把下一层要用的专家**搬进槽位**（不是只预热 RAM）。
+
+        这是整条 decode 流水线能不能藏住 IO 的关键。当前的做法是「算到哪一层
+        才去搬那一层的专家」——MoE 一开始就得等 6 个专家到齐，40 层叠加起来
+        就是每步 800ms 的等待（实测：一层 80ms，其中 78ms 是等专家）。
+
+        改成在前一层的 attention 还在算的时候就把下一层的专家发出去：搬运和
+        计算重叠，等真正进到那一层的 MoE 时数据已经到了。
+
+        返回真正发起的搬运个数。
+        """
+        if not experts:
+            return 0
+        b = self.block(layer_id)
+        ffn = getattr(b, "ffn", None)
+        if ffn is None:
+            return 0
+        st = getattr(ffn, "_expert_store", None)
+        if st is None or getattr(st, "slots", None) is None:
+            return 0
+        if int(getattr(st.slots, "slots", 0) or 0) <= 0:
+            return 0
+        try:
+            mgr = ffn._tier_manager()
+        except Exception:
+            return 0
+        try:
+            # urgent=False：预取只填空槽位，绝不和当前层抢
+            return int(mgr.need(layer_id, list(experts), urgent=False) or 0)
+        except Exception:
+            return 0
+
     # -- forward -----------------------------------------------------------
     def _head_logits(self, h: torch.Tensor) -> torch.Tensor:
         # The released ParallelHead projects in fp32. Copying the 129k x 5120 bf16 head to
@@ -2303,6 +2336,20 @@ class Engine:
                 _ev_done = torch.cuda.Event()
                 _ev_done.record()
                 self._flat_done[i] = _ev_done
+            # 滚动预取第 k+1 层的专家（搬进槽位，不是只预热 RAM）。
+            # 放在这里是因为此刻本层 kernel 已经排进流里、还在算，正好的空档：
+            # 搬运和计算重叠，下一层的 MoE 就不用等 IO。
+            # 预测用上一轮的路由 —— 相邻 token 的专家集合重合度很高，命中就是
+            # 白赚；没中也只是多搬一次后面会被覆盖，不额外消耗算力。
+            if (self.enable_prefetch and pos_i + 1 < len(layer_seq)
+                    and not torch.cuda.is_current_stream_capturing()):
+                _nxt = layer_seq[pos_i + 1]
+                _pred = self._last_routing.get(_nxt)
+                if _pred:
+                    try:
+                        self._warm_next_layer(_nxt, _pred)
+                    except Exception:
+                        pass
             if __import__("os").environ.get("TI_DEBUG_NAN"):
                 _fin = bool(torch.isfinite(h).all())
                 if (not _fin) or __import__("os").environ.get("TI_DEBUG_NAN") == "all":

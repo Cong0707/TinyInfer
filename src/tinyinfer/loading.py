@@ -2488,7 +2488,7 @@ class VramSlotCache:
             if ev is not None and not ev.query():
                 stream.wait_event(ev)
 
-    def stage(self, layer: int, experts, loader) -> int:
+    def stage(self, layer: int, experts, loader, *, urgent: bool = True) -> int:
         """只做主机侧：挑槽位、记归属、把字节拷到 pinned staging。**不碰 CUDA**。
 
         为什么拆成两段：卖家线程跨线程发 CUDA 调用会和主线程的 cuModuleLoad /
@@ -2511,7 +2511,19 @@ class VramSlotCache:
             if data is None:
                 continue
             with self._lock:
-                idx = self._reserve_locked((layer, e))
+                if urgent:
+                    idx = self._reserve_locked((layer, e))
+                else:
+                    # 预取：只吃真正空着的槽位。缓存命中（已在池里）直接跳过，
+                    # 绝不能为它把别人正在用的槽位顶掉 —— 当前层才是必须的。
+                    idx = self._free.pop() if self._free else None
+                    if idx is not None:
+                        self._key[idx] = (int(layer), int(e))
+                        self._by_key[(int(layer), int(e))] = idx
+                        self._gen += 1
+                        self._lru.append(idx)
+                        self.loads += 1
+                        self._tab_dirty.append((int(layer), int(e), int(idx)))
                 if idx is None:
                     continue
                 self._refs[idx] = 1
