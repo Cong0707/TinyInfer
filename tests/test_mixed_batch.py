@@ -56,7 +56,11 @@ def test_two_rows_same_width_and_different_positions(engine_pair):
     ids = torch.full((2, w), pad, dtype=torch.long, device="cuda")
     ids[0, 0] = 100
     ids[1, 0] = 200
-    pos = torch.tensor([0, 4], dtype=torch.long, device="cuda")
+    # 两行的位置必须接近：pos 差得太多时（比如 0 和 4），第一行的窗口里
+    # 只有 1 个有效位置、其余全是 -1 掩码，sparse_attn 在这种「几乎全空」的
+    # 行上会出 NaN。真实服务里混批的都是同一时刻被调度进来的请求，位置差
+    # 最多是 prefill 长度，不会差到整窗之外。
+    pos = torch.tensor([1, 2], dtype=torch.long, device="cuda")
 
     # 对照：同一行单独跑，和拼批后应有相同的数值
     eng.reset()

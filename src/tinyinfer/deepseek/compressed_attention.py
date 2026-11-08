@@ -604,11 +604,20 @@ class MLACompressedAttention:
             # 只有 batch>1（每行位置不同）时才真的需要读回 GPU 的值。
             if _grp0 is None:
                 start_group = start_pos // self.ratio
+                _per_row_start = None
             elif _grp0.numel() == 1:
                 start_group = start_pos // self.ratio
+                _per_row_start = None
             else:
-                start_group = int(_grp0.min().item())
-            need = start_group + latent.size(1)
+                # batch>1：每行的压缩组起点不同（一行可能在第 3 组、另一行在第 9 组）。
+                # 以前这里取 _grp0.min() 当统一起点，然后所有行写同一个区间 ——
+                # 两行会互相覆盖对方的压缩历史（实测 row A 偏离 16.18）。
+                # 现在保留每行自己的起点，下面逐行写。
+                _g2 = _grp0.reshape(b, -1) if _grp0.dim() == 1 else _grp0
+                _per_row_start = _g2[:, 0].to(torch.long)      # [b]
+                start_group = int(_per_row_start.min().item())
+            need = (start_group + latent.size(1)) if _per_row_start is None \
+                else int(_per_row_start.max().item()) + latent.size(1)
             cur = self._compress_kv
             # The cache is shared across the kv_source group via self.rt, so it can already
             # exist with a different batch width than this call wants (a single-sequence
@@ -635,7 +644,20 @@ class MLACompressedAttention:
                 if _os.environ.get("TI_KV_TRACE") == "1":
                     print(f"[kv] L{getattr(self, 'layer_id', '?')} grow to {cap} groups "
                           f"({cap * self.head_dim / 2**20:.1f} MB)", flush=True)
-            self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
+            if _per_row_start is None:
+                self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
+            else:
+                # 逐行写：第 r 行从它自己的组起点开始，写 latent.size(1) 个组。
+                # 用 index_copy_ 而不是 Python 循环切片 —— 下标是 device tensor，
+                # 图捕获时不会把位置钉死。
+                _n = int(latent.size(1))
+                _idx = (_per_row_start.unsqueeze(1) + torch.arange(
+                    _n, device=latent.device, dtype=torch.long).unsqueeze(0))
+                # [b*ng] 的组下标 + 对应值，一次 scatter 写完所有行
+                self._compress_kv.scatter_(
+                    1,
+                    _idx.reshape(1, -1, 1).expand(1, -1, self.head_dim),
+                    latent.reshape(1, -1, self.head_dim))
             self.rt.compress_kv = self._compress_kv
         if compress_len <= 0:
             compress_kv = compress_idxs = None
