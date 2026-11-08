@@ -503,6 +503,22 @@ class Engine:
                 if _mgr.start_warm():
                     print(f"[tinyinfer] warming {_nl}x{_ne} experts into RAM "
                           f"(background, not on the critical path)", flush=True)
+                # 把「这套配置够不够」直接说出来。这是用户判断该不该调 topk 的
+                # 唯一依据 —— 引擎不替他降质量，但必须告诉他现状：
+                # 一层的并集装不下时，decode 的每一步都在搬专家。
+                _cap = _mgr.capabilities()
+                # 用「一步 decode 需要的专家数」（n_layers*topk=240），
+                # 不是「全部专家」（15360）—— 后者没人能达到，说出来没有意义。
+                _need_step = _cap["slots_needed_a_step"]
+                _have = _cap["slots"]
+                if _have and not _cap["can_hold_a_step"]:
+                    _pct = 100.0 * _have / max(1, _need_step)
+                    print(f"[tinyinfer] expert slots cover {_pct:.0f}% of one decode "
+                          f"step ({_have}/{_need_step}); every step re-fetches experts. "
+                          f"TI_TOP_K=N can trade quality for IO here", flush=True)
+                elif _have:
+                    print(f"[tinyinfer] expert slots cover a full decode step "
+                          f"({_have}/{_need_step}); steady-state fetch is zero", flush=True)
             except Exception as _we:
                 print(f"[tinyinfer] warm-up skipped ({_we!r})", flush=True)
         if __import__("os").environ.get("TI_NO_SLOTS") == "1":

@@ -164,14 +164,33 @@ class ExpertTierManager:
         不写死任何数字：槽位数、内存容量、是否多卡，全问实际对象。
         """
         devices = list(getattr(self.slots, "devices", None) or []) if self.slots else []
+        _slots = int(getattr(self.slots, "slots", 0) or 0)
+        # 三个不同量级的「需要多少槽位」，别混用：
+        #   slots_needed_all        全部专家（40x384=15360），理论上限，没人能达到
+        #   slots_needed_a_step     一步 decode 要用的专家（n_layers x topk = 240）
+        #                           —— **这才是「稳态零搬运」的真实门槛**
+        _need_all = self.n_layers * self.n_experts
+        _topk = max(1, int(getattr(self, "topk", 6) or 6))
+        _need_step = self.n_layers * _topk
+        _one_layer = self.n_experts
         return {
-            "slots": int(getattr(self.slots, "slots", 0) or 0),
+            "slots": _slots,
             "blob_bytes": self.blob_bytes,
-            "vram_gb": int(getattr(self.slots, "slots", 0) or 0) * self.blob_bytes / 2**30,
+            "vram_gb": _slots * self.blob_bytes / 2**30,
             "devices": devices,
             "n_devices": max(1, len(devices)),
             "ram_entries": int(getattr(self.ram, "capacity_entries", 0) or 0)
                             if self.ram is not None else 0,
+            # ---- 这层配置「够不够」的判断依据，给上层自适应用 ----
+            # 全驻留需要的槽位：一层如果用 topk 个专家，n_layers*topk 就是下限
+            "slots_needed_all": _need_all,
+            "slots_needed_a_step": _need_step,
+            "slots_needed_one_layer": _one_layer,
+            # 能不能让**一步 decode** 需要的 n_layers*topk 个专家同时驻留。
+            # False 意味着 decode 每步都要搬（8GB 卡的 14 槽位 < 240）。
+            "can_hold_a_step": bool(_slots >= _need_step),
+            # 能不能让**一层**的专家全驻留（更弱的要求）
+            "can_hold_a_layer": bool(_slots >= _one_layer),
         }
 
     def ready(self, layer: int, experts: Iterable[int]) -> None:
