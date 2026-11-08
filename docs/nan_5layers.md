@@ -1,64 +1,72 @@
-# 8GB 卡的可运行层数：n=4 正常，n>=5 输出 NaN（未解决）
+# NaN 的确切边界：含 kv_source 层或 engram 层组合（2026-11-08 12:13）
 
-## 现象（已用「一进程一引擎」的纪律复测，排除测量污染）
-
-```
-RESULT n= 4 finite=True  absmax=  17.704 free= 1973MB chunk=8
-RESULT n= 5 finite=False absmax=     nan free= 1298MB chunk=8
-RESULT n= 6 finite=False absmax=     nan free= 1007MB chunk=8
-RESULT n= 8 finite=False absmax=     nan free=  547MB chunk=8
-```
-
-**不是显存不足**：n=5 时还有 1298MB 空闲。是计算产生了 NaN。
-
-## 已经定位到的
-
-`_forward_chunk` 返回的 `_last_hidden` 已经是 NaN：
+## 用「一进程一引擎」的纪律测出的边界
 
 ```
-last_hidden finite=False absmax=nan shape=(1, 11, 4, 5120)
+layers=0            finite=True
+layers=0,1          finite=True
+layers=0,1,2        finite=True
+layers=0,1,2,3      finite=True
+layers=0,1,2,3,4    finite=False      <- 分界
+
+layers=3,4          finite=True       <- 两条 consumer，正常
+layers=2,3          finite=False      <- 含 kv_source (layer 2)
+layers=2,4          finite=False
+layers=2,3,4        finite=False
 ```
 
-但**逐层直接调 `block.forward` 时每一层都有限**：
+两个现象：
+
+1. `[0..3]` 正常，`[0..4]` NaN —— **多一层就坏**
+2. 只要含 layer 2（`kv_source`）就 NaN，但**必须同时有 layer 0/1**？不：
+   `[2,3]` 直接 NaN，`[3,4]` 正常。
+
+## 逐层手调全部正常
 
 ```
-input   finite=True  absmax=0.453
-layer 0 finite=True  absmax=1.273
-layer 1 finite=True  absmax=230.000     <- 跳了 180 倍
-layer 2 finite=True  absmax=208.000
-layer 3 finite=True  absmax=202.000
-layer 4 finite=True  absmax=188.000
+layer 0 finite=True absmax=1.273
+layer 1 finite=True absmax=230.000
+pre-attn  finite=True absmax=0.7773      (layer 2 入口)
+attn out  finite=True absmax=8.312       (layer 2 出口)
+  rt.compress_kv  finite=True absmax=1.6875
+  rt.index_k      finite=True absmax=2.1406
+  rt.topk_idxs    finite=True absmax=132.0
 ```
 
-所以问题不在「某一层算坏了」，而在 `_forward_chunk` 与「逐层手调」之间的**差异**：
+**手调 `block.forward` 逐层跑没有任何 NaN**，而 `engine.forward` → `_forward_chunk`
+就 NaN。差异在 `_forward_chunk` 额外做的事：
 
-1. `_forward_chunk` 里 `pre_mix` 是每步重新构造的（`zeros` + `[:, :, 0] = 1.0`），
-   手调时我也这么做 —— 这一项一致。
-2. **engram**：`engram_layer_ids = [1, 14]`。第 1 层是 engram 层，而它的 absmax
-   从 1.27 跳到 230，是明显的异常点。`_forward_chunk` 会走 engram 的完整路径
-   （包括 host 侧的投影），手调 `block.forward` 时未必走同一条。
-3. `_forward_chunk` 有 `hashes` / `hash_ids` 的额外输入。
+## 差异点：engram
 
-## 配置里顺带确认的事实
+`engine._forward_chunk` 第 2360 行：
 
-```json
-"rms_norm_eps": 1e-20,
-"compress_ratios": [0, 0, 2, 2, 2, ...]      // 不是 0x5，只有前两层是 0
-"engram_layer_ids": [1, 14],
-"kv_source_layer_ids": [2, 8, 14, 20],
-"index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
-"sliding_window": 128,
-"tie_word_embeddings": false,
-"rope_scaling": {"rope_type": "yarn", "factor": 16, "original_max_position_embeddings": 65536}
+```python
+h = b.engram.forward(h, hash_ids[b.engram.hash_index])
 ```
 
-注意 `rms_norm_eps = 1e-20` 极小：任何接近 0 的方差都会放大成 inf/NaN。
-这是高优先级嫌疑 —— 第 1 层 absmax 230 就是「范数被压得极小」的典型表现。
+- `engram_layer_ids = [1, 14]`（config.json 确认）
+- 我的逐层手调**没走这一行**
+- `engram(h, None)` 直接抛 `NoneType has no attribute reshape` —— 它强依赖 hash_ids
 
-## 下一步
+所以：**手调与整段的差别就是 engram 层是否被执行**。
 
-1. 对比 `_forward_chunk` 与手调在**第 1 层（engram 层）**的输入输出差异。
-2. 检查 `engram` 的投影在序列长度为 11 时是否走了未覆盖的分支。
-3. 单独测「ayers=[0,1]」（不含第 2 层）看是否已经 NaN —— 那就能确定是 engram。
+## 另一个可疑点：第 1 层 absmax 230
 
-**在那之前：8GB 卡上能可靠跑的是 4 层，5 层起输出 NaN。**
+```
+layer 0 -> 1.273
+layer 1 -> 230.000      <- 181 倍跳变
+layer 2 -> 208.000
+```
+
+正常 transformer 的残差流不会在一层内跳 181 倍。这一层正是 engram 层。
+`rms_norm_eps = 1e-20` 意味着范数接近 0 时除法会炸成 inf，
+而 bf16 的 inf 再参与后续运算就是 NaN。
+
+## 还没做
+
+1. 在 `_forward_chunk` 里对第 1 层前后打点，确认 NaN 首次出现在 engram 之后。
+2. 检查 `hash_ids` 在只跑 4 层时是否为 None（`hashes` 需要完整层表？）。
+3. 如果 engram 是根因：8GB 卡上要么关掉 engram（需确认不影响正确性），
+   要么修 engram 的数值。
+
+**当前可靠结论：8GB 卡上 4 层正常，5 层起 NaN，根因指向 engram 层。**
