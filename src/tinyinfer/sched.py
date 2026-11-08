@@ -325,7 +325,12 @@ class ServingEngine:
                 self._inbox.put(seq)
                 break
             self._running.append(seq)
-            self._fresh.add(seq.id)
+            # 只有「从没跑过」的会话才是 fresh（要送整个 prompt 做 prefill）。
+            # 被 park 换出又回来的会话已经产过 token，必须按 decode 送最后那个 ——
+            # 否则它会从头重放 prompt，out 里已有的 token 被忽略（实测单槽位下
+            # 第二条会话反复拿到同一个 token：[2, 2, 2]）。
+            if not seq.out:
+                self._fresh.add(seq.id)
 
     def _make_room(self, exclude: int | None = None) -> bool:
         """换出一个还在跑但进展最少的会话，腾出槽位（KV 留在 pool 里）。
