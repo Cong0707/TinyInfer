@@ -65,13 +65,42 @@ class Engine:
         self.pending.append(seq)
 
     def _admit(self) -> None:
-        while self.pending and self.pool.free > 0:
-            seq = self.pending.pop(0)
+        while self.pending:
+            seq = self.pending[0]
+            if self.pool.free <= 0:
+                # 槽位满了。腾一个给**别的**会话用 —— 绝不腾给队首自己
+                # （否则 park 完立刻又把它取出，无限循环）。
+                if not self._make_room(exclude=seq.id):
+                    break
+            self.pending.pop(0)
             if self.pool.acquire(seq) is None:
                 self.pending.insert(0, seq)
                 break
             self.running.append(seq)
             self._fresh.add(seq.id)
+
+    def _make_room(self, exclude: int | None = None) -> bool:
+        """把一个「还在跑但很久没进展」的会话换出，给新请求让位。
+
+        换出的是整条会话的 KV（KVPool.park 只保留历史，不切段），所以它
+        回来时不用重新 prefill —— 1M 上下文重新 prefill 是几分钟。
+        返回是否真的腾出了一个槽位。
+        """
+        candidates = [s for s in self.running if s.id != exclude]
+        if not candidates:
+            return False
+        # 挑最早提交的（最可能已经跑完大部分），换出去最划算
+        victim = min(candidates, key=lambda s: (s.n_out, s.id))
+        try:
+            nbytes = self.pool.park(victim)
+        except Exception:
+            return False
+        self.running = [s for s in self.running if s.id != victim.id]
+        self._fresh.discard(victim.id)
+        # 它没跑完，放回等待队列（历史已经在 pool 里）
+        victim.done = False
+        self.pending.append(victim)
+        return nbytes >= 0
 
     def _retire(self) -> list:
         out = []
@@ -183,6 +212,16 @@ class ServingEngine:
         self.tokens = 0
         self._running: list = []
         self._fresh: set[int] = set()
+        # 槽位池：决定「这一步能装几条会话」，也是 park/resume 的落点。
+        # 文档里一直写着「KVPool decides how many can share a step」，但类里
+        # 从来没有它 —— 只有「运行数 >= max_batch」的条数上限。于是
+        # 「槽位不够时换出旧会话」这条策略根本没生效过。
+        from .sequence import KVPool
+
+        self.pool = KVPool(self.max_batch)
+        # 被换出、等槽位的会话。不放进 _inbox：放进去的话本次 _admit 的 while
+        # 会立刻又把它取出来、又换出去，无限循环（实测直接超时）。
+        self._parked_wait: list = []
         # What the device can actually hold, not what the caller asked for. A sequence
         # needs its window ring plus its compressed groups in VRAM for the whole life of
         # the batch (they cannot be swapped out per step without defeating the point), and
@@ -266,16 +305,48 @@ class ServingEngine:
         return seq
 
     def _admit(self) -> None:
+        # 上一轮换出去的会话再试一次（槽位可能已经空出来了）
+        while self._parked_wait:
+            self._inbox.put(self._parked_wait.pop(0))
         while True:
             try:
                 seq = self._inbox.get_nowait()
             except self._queue_mod.Empty:
                 break
-            if len(self._running) >= self.max_batch:
-                self._inbox.put(seq)      # no room this step; try again next boundary
+            # 槽位满时先试着换出一个旧会话（KV 沉到内存），而不是让新请求干等。
+            # 以前这里只有条数判断：running 满就塞回队列，队列里所有请求要等
+            # 正在跑的全部结束 —— 对「几个长会话轮流推进」的服务来说等于卡死。
+            if self.pool.free <= 0:
+                if not self._make_room(exclude=getattr(seq, "id", None)):
+                    self._inbox.put(seq)
+                    break
+            slot = self.pool.acquire(seq)
+            if slot is None:
+                self._inbox.put(seq)
                 break
             self._running.append(seq)
             self._fresh.add(seq.id)
+
+    def _make_room(self, exclude: int | None = None) -> bool:
+        """换出一个还在跑但进展最少的会话，腾出槽位（KV 留在 pool 里）。
+
+        被换出的会话进 `_parked_wait`，不回到 `_inbox` —— 回 inbox 的话
+        本次 _admit 的 while 会立刻把它取出来，又换出，无限循环（实测超时）。
+        `_admit` 开头先把 `_parked_wait` 挪回 inbox，轮到它时自然会拿到槽位。
+        """
+        candidates = [s for s in self._running
+                      if getattr(s, "id", None) != exclude]
+        if not candidates:
+            return False
+        victim = min(candidates, key=lambda s: (s.n_out, s.id))
+        try:
+            self.pool.park(victim)
+        except Exception:
+            return False
+        self._running = [s for s in self._running if s.id != victim.id]
+        self._fresh.discard(victim.id)
+        self._parked_wait.append(victim)
+        return True
 
     # ---- the loop ----
     def _loop(self):
@@ -345,6 +416,12 @@ class ServingEngine:
             q = getattr(s, "queue", None)
             if q is not None:
                 q.put(None)          # end marker
+            # 会话跑完：槽位还回池子，下一步就能接新请求。
+            # 以前没有这一句（那时类里根本没有 pool）。
+            try:
+                self.pool.release(s)
+            except Exception:
+                pass
         self._running = [s for s in self._running if not s.done]
         return True
 
