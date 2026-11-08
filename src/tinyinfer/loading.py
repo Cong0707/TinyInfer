@@ -2534,7 +2534,17 @@ class VramSlotCache:
         loader(layer, [expert, ...]) -> {expert: bytes-like}。
         返回本次新占用的槽位数。
         """
-        miss = [int(e) for e in experts if (layer, int(e)) not in self._by_key]
+        _all = [int(e) for e in experts]
+        miss = [int(e) for e in _all if (layer, int(e)) not in self._by_key]
+        # 命中计数就在这里补：引擎的 decode 路径走 stage() + _miss_scan，
+        # **不经过 VramSlotCache.acquire()**，所以那里的 `hits += 1` 从来没
+        # 被执行过。于是 hits 恒为 0，而它正是判断「稳态是否零搬运」的唯一
+        # 指标 —— 我之前据此得出「100% miss，必须全量搬运」的结论是错的。
+        # loads 在下面每个新槽位自增，hits 在这里按「已驻留的个数」自增，
+        # 两者口径一致（都按专家个数）。
+        _hit = len(_all) - len(miss)
+        if _hit > 0:
+            self.hits += _hit
         if not miss:
             return 0
         if getattr(self, "_staging", None) is None:
