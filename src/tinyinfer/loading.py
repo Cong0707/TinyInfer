@@ -2129,6 +2129,9 @@ class VramSlotCache:
         # 真正的写发生在调用方的 stream 上（见 table_flush）—— reserve 会在
         # 卖家线程里被调用，跨线程发 kernel 会和主线程的 cuModuleLoad 死锁。
         self._tab_dirty: list[tuple[int, int, int]] = []
+        # 当前层（urgent）占住的槽位：别的 urgent 请求也不能把它们顶掉，
+        # 否则一层 6 个专家会互相覆盖（实测 hits=0，每步重搬 768 次）。
+        self._urgent: set[int] = set()
         # 卖家线程把字节拷进这里（纯主机 memcpy），主线程的 commit() 负责 DMA。
         self._stage_bufs: dict[int, memoryview] = {}
         # 槽位分配代次：每次 _by_key 变动就 +1。kernel 侧按槽位编号寻址，编号一变
@@ -2512,7 +2515,8 @@ class VramSlotCache:
                 continue
             with self._lock:
                 if urgent:
-                    idx = self._reserve_locked((layer, e))
+                    # 当前层：可以覆盖非 urgent 的槽位（预取/历史），但优先空槽。
+                    idx = self._reserve_locked((layer, e), protect_urgent=True)
                 else:
                     # 预取：只吃真正空着的槽位。缓存命中（已在池里）直接跳过，
                     # 绝不能为它把别人正在用的槽位顶掉 —— 当前层才是必须的。
@@ -2528,20 +2532,25 @@ class VramSlotCache:
                     continue
                 self._refs[idx] = 1
                 self._state[idx] = self.RESERVED
-            # 拷进 pinned 中转区（纯主机 memcpy，不碰 CUDA API）。主线程的
-            # commit() 会把它 DMA 上去。
+                if urgent:
+                    self._urgent.add(idx)
+            # 不再往中转区拷一份：RAM 缓存里的字节本来就是 pinned 的
+            # memoryview，DMA 可以直接从它读。原先把每个 18.8MB 的 blob 再
+            # memcpy 一遍（每层 6 次 = 113MB/token，还是串行的），实测 stage
+            # 每步 175ms，而真正的 DMA 只要 63ms。
             try:
-                buf = self._stage_bufs.get(idx)
-                if buf is None:
-                    buf = memoryview(bytearray(self.blob_bytes))
-                    self._stage_bufs[idx] = buf
-                buf[:] = memoryview(data)[: self.blob_bytes]
+                self._stage_bufs[idx] = memoryview(data)[: self.blob_bytes]
             except Exception:
                 with self._lock:
                     self._evict_locked(idx)
                 continue
             staged += 1
         return staged
+
+    def clear_urgent(self) -> None:
+        """一层算完了：它的槽位降级成「历史」，可以被后续层覆盖。"""
+        with self._lock:
+            self._urgent.clear()
 
     def commit(self, layer: int | None = None) -> int:
         """主线程：把 staged 的槽位 DMA 上去并发布，然后写表。
@@ -2579,7 +2588,7 @@ class VramSlotCache:
         placed = self.commit(layer)
         return n, placed
 
-    def _claim_slot_locked(self) -> int | None:
+    def _claim_slot_locked(self, *, protect_urgent: bool = False) -> int | None:
         """拿一个槽位：先掏空的，掏不到就环形覆盖一个没人在用的。
 
         这里没有「释放」这个动作 —— 槽位在池子里转圈，被覆盖即回收。
@@ -2597,11 +2606,16 @@ class VramSlotCache:
             i = self._cur + k
             if i >= n:
                 i %= n
-            if (self._refs[i] == 0
-                    and self._state[i] != self.COPYING
-                    and (self._key[i] is None or self._key[i] not in self._pinned)):
-                self._cur = (i + 1) % n
-                return i
+            if (self._refs[i] != 0
+                    or self._state[i] == self.COPYING
+                    or self._key[i] in self._pinned):
+                continue
+            # 分级覆盖：当前层（urgent）只能抢非 urgent 的槽位，
+            # 否则它会把同一步里自己刚搬进来的专家顶掉（实测 hits=0）。
+            if protect_urgent and i in self._urgent:
+                continue
+            self._cur = (i + 1) % n
+            return i
         return None
 
     def _find_victim_locked(self) -> int | None:
@@ -2743,10 +2757,11 @@ class VramSlotCache:
         self._dirty.add(idx)
         self.evictions += 1
 
-    def _reserve_locked(self, key: tuple[int, int]) -> int | None:
+    def _reserve_locked(self, key: tuple[int, int], *,
+                        protect_urgent: bool = False) -> int | None:
         if key in self._by_key:
             return self._by_key[key]
-        idx = self._claim_slot_locked()
+        idx = self._claim_slot_locked(protect_urgent=protect_urgent)
         if idx is None:
             return None
         if self._state[idx] != self.FREE:

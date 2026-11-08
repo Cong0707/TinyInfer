@@ -601,6 +601,10 @@ class MoE:
             # 备货：卖家线程已经把字节放进 pinned staging（上一次 post 之后
             # 它就一直在做），这里在主线程把它 DMA 上卡并写表 —— 只碰本线程的
             # stream，不会和谁死锁。
+            # 本层的专家开始当「当前单」处理：它们的槽位不许被别的层顶掉，
+            # 直到本层算完（否则同一层 6 个专家会互相覆盖，实测 hits=0）。
+            if not torch.cuda.is_current_stream_capturing():
+                sl.clear_urgent()
             _async = self._async_experts()
             _mgr = self._tier_manager()
             if _async is not None and _async.enabled:
