@@ -370,6 +370,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     embed_b = float(model.get("embed_bytes", 1.32 * GB))
     head_b = float(model.get("head_bytes", 1.32 * GB))
     expert_b = float(model.get("expert_bytes", 18.8 * MB))
+    n_experts = int(model.get("n_experts", 0) or 384)
     n_layers = int(model.get("n_layers", 0) or n_layers)
 
     V = hw.vram_budget_gb * GB
@@ -668,14 +669,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # 改法：**只要装得下就装全部**。判据用「全部专家字节 <= 剩余预算的 92%」，
     # 那个 8% 留给预热过程中的临时 buffer 和页缓存抖动。装不下时才退回 0.8。
     _room = max(0.0, host - slab_b - cpu_tables - page_cache_b)
-    _all_experts_b = float(n_layers) * float(getattr(hw, "n_experts", 0) or 0) * 0.0
-    try:
-        _eb = float(getattr(hw, "expert_b", 0) or 0)
-        _ne = float(getattr(hw, "n_experts", 0) or 0)
-        if _eb > 0 and _ne > 0:
-            _all_experts_b = float(n_layers) * _ne * _eb
-    except Exception:
-        _all_experts_b = 0.0
+    _all_experts_b = float(n_layers) * float(n_experts) * float(expert_b)
     if _all_experts_b > 0 and _all_experts_b <= _room * 0.92:
         # 装得下全部：给足，让 decode 稳态零读盘
         cache_b = int(max(256 * MB, _all_experts_b * 1.02))
