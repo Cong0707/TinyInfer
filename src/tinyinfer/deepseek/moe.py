@@ -536,7 +536,11 @@ class MoE:
             _outs = []
             for _s0 in range(0, xf.size(0), 3):
                 _s1 = min(_s0 + 3, xf.size(0))
-                _o = self._forward_gpu_only(x[:, _s0:_s1], xf[_s0:_s1],
+                # x 一定是 [rows, dim]（forward 里 view(-1, dim) 之后才进来），
+                # 所以按第一维切就行。以前写的是 x[:, a:b]，那是按第二维切 ——
+                # 多行时切错轴，输出形状对不上（shape [2,3,5120] invalid）。
+                _x = x[_s0:_s1] if x.dim() == 2 else x.reshape(-1, x.shape[-1])[_s0:_s1]
+                _o = self._forward_gpu_only(_x, xf[_s0:_s1],
                                             indices[_s0:_s1], weights[_s0:_s1])
                 if _o is None:
                     raise RuntimeError(
@@ -548,7 +552,14 @@ class MoE:
                 # 下一批会覆盖 _sids_buf / _launch_keep：driver-API 的 kernel 不
                 # 认 Python 引用，这里的等待是所有跨批共享状态的唯一屏障。
                 torch.cuda.synchronize()
-            return torch.cat(_outs, dim=1)
+            # 每批的形状是 [rows_i, dim]（x 在 forward 里已经 view(-1, dim)），
+            # 所以按第 0 维拼回 [rows, dim]。以前写的是 dim=1（那是 [b, s, d]
+            # 时代的形状），多行时直接 RuntimeError: Sizes of tensors must match。
+            _cat = torch.cat(_outs, dim=0)
+            # 还原成调用方给的形状：forward 里 xf = x.view(-1, dim)，但上层
+            # （hc_post 等）按四维 [b, s, hc, d] 处理 residual/x，形状不一致
+            # 会抛 "size of tensor a (2) must match ... (4)"。
+            return _cat.view(x.shape[:-1] + (_cat.shape[-1],))
         sl = getattr(getattr(self, "_expert_store", None), "slots", None)
         if sl is not None and not getattr(sl, "_arena", None):
             try:
