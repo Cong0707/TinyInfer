@@ -541,25 +541,6 @@ class HCBlockMixin:
             except Exception as _exc:
                 raise RuntimeError(f"hc_post native kernel failed: {_exc!r}") from _exc
         import os as _os
-        if x.is_cuda and _FUSED_POST_OK and _os.environ.get("TI_HC_NOFUSE") != "1":
-            try:
-                from .hc_fused import fused_hc_post
-                if _os.environ.get("TI_HC_T") == "1":
-                    import time as _t
-                    _t0 = _t.perf_counter()
-                    y = fused_hc_post(x, residual, post, comb)
-                    self._hc_f = getattr(self, "_hc_f", [0.0, 0])
-                    self._hc_f[0] += (_t.perf_counter() - _t0) * 1e3
-                    self._hc_f[1] += 1
-                    if self._hc_f[1] == 8 and getattr(self, "layer_id", -1) == 5:
-                        print(f"[hc_post fused] mean={self._hc_f[0]/self._hc_f[1]:.2f}ms", flush=True)
-                    return y
-                return fused_hc_post(x, residual, post, comb)
-            except Exception as _e:
-                _FUSED_POST_OK = False
-                import os as _os
-                if _os.environ.get("TI_HC_DEBUG"):
-                    print(f"[hc_post] fused kernel disabled ({_e!r})", flush=True)
         import os as _os
         if _os.environ.get("TI_HC_T") == "1":
             import time as _t
