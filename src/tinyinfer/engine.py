@@ -2453,8 +2453,16 @@ class Engine:
             try:
                 if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
                     print(f"[capt] layer {i}", flush=True)
-                if torch.cuda.is_current_stream_capturing() and i >= int(__import__('os').environ.get('TI_GRAPH_CHUNK', '4')):
-                    break
+                if torch.cuda.is_current_stream_capturing():
+                    # **用 _graph_hi 收口，不是 TI_GRAPH_CHUNK。**
+                    # 这里以前是 `i >= TI_GRAPH_CHUNK`：分块捕获时外层把
+                    # _graph_lo 设成 0/4/8/.../36，但 break 条件仍然拿 i（绝对层号）
+                    # 跟 chunk 比，于是第 2 块起 `i=4 >= 4` 立刻 break —— 每块图只
+                    # 捕到 _graph_lo 那一层，剩下 3 层没进图。10 块图里 9 块是残的，
+                    # replay 时每块都要重新进出一次 _forward_impl，白白多出开销。
+                    # 正确条件：跑完 [_graph_lo, _graph_hi) 就停。
+                    if i >= getattr(self, "_graph_hi", 1 << 30):
+                        break
                 h, pre_mix = b.forward(h, start_pos, pre_mix, positions=positions)
                 _dh = getattr(self, "_dump_h", None)
                 if _dh is not None:
@@ -2745,6 +2753,33 @@ class Engine:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
+                # **捕获前这次完整 forward 产出的 _rt 必须留住。**
+                #
+                # 分块捕获时每块只跑 [_graph_lo, _graph_hi) 那几层，前面层的
+                # continue 掉。但 compress_kv / index_k / topk_idxs / candidates
+                # 是 kv_source 层（L2/L8/L14/L20）产出的**跨层共享状态**，后面
+                # 34 层都直接读它。第 2 块起既然跳过了 L2，index_k 就没人建，
+                # 于是随后的层拿到 None：
+                #   compressor.py:285  index_k = self.rt.index_k[:, :t]
+                #   TypeError: NoneType object is not subscriptable
+                # 以前这里被 except 吞掉、静默回落 eager，所以看不出来；删掉
+                # 回落之后它立刻现形。
+                #
+                # 上面这次完整 forward 已经把 _rt 建好了，别让后面的 restore(snap)
+                # 把它清回 None（snap 是跑之前拍的，里面 _rt 就是 None）。
+                _keep_rt = None
+                try:
+                    from .deepseek.compressor import shared_attn as _sa_k
+                    _keep_rt = {
+                        "compress_kv": getattr(_sa_k, "compress_kv", None),
+                        "index_k": getattr(_sa_k, "index_k", None),
+                        "topk_idxs": getattr(_sa_k, "topk_idxs", None),
+                        "candidates": getattr(_sa_k, "candidates", None),
+                        "candidates_by_chunk": dict(getattr(_sa_k, "candidates_by_chunk", {}) or {}),
+                        "src_ratio": getattr(_sa_k, "src_ratio", None),
+                    }
+                except Exception:
+                    _keep_rt = None
                 # 分块捕获：每 TI_GRAPH_CHUNK 层一张图，所有图共享同一个 graph pool。
                 # 块与块之间的 h/pre_mix 都在 pool 内、地址固定，replay 时依次执行。
                 _chunk = max(1, int(__import__("os").environ.get("TI_GRAPH_CHUNK", "4")))
@@ -2761,6 +2796,16 @@ class Engine:
                 torch.cuda.synchronize()
             finally:
                 self.restore(snap)
+                # 把捕获前那次完整 forward 建好的跨层共享状态放回去（见上面
+                # _keep_rt 的注释）。restore(snap) 会把 _rt 清成 None，那会让
+                # 随后 replay 出来的图在 compressor 里拿到 None。
+                if _keep_rt is not None:
+                    try:
+                        from .deepseek.compressor import shared_attn as _sa_r
+                        for _k, _v in _keep_rt.items():
+                            setattr(_sa_r, _k, _v)
+                    except Exception:
+                        pass
             self._graph = {"graphs": _graphs, "in": in_buf, "out": out,
                            "start_pos": start_pos}
             self._graph_start_pos = start_pos
