@@ -2746,10 +2746,15 @@ class Engine:
         except Exception as exc:
             self._graph_failed = True
             self._graph = None
-            if __import__("os").environ.get("TI_GRAPHDBG") == "1":
-                import traceback as _tb
-                _tb.print_exc()
-                raise RuntimeError(f"decode CUDA graph failed ({exc!r}); no eager fallback") from exc
+            # **捕获失败必须炸，不能静默降级。**
+            # 以前这里只置 _graph_failed=True，然后 forward() 回落到 eager，
+            # 于是「graph 从来没成功过」这件事只能靠翻代码发现 —— 实测在 L20
+            # 上跑了整轮才看出来。一条路径要么成立，要么明确失败。
+            import traceback as _tb
+            _tb.print_exc()
+            raise RuntimeError(
+                f"decode CUDA graph capture failed ({exc!r}); there is no eager fallback"
+            ) from exc
 
 
     def warm_graph_catalog(self) -> None:
@@ -2827,10 +2832,15 @@ class Engine:
                     hit = self._graph_run(ids, start_pos)
                     if hit is not None:
                         return hit
-                    if start_pos > 0:
-                        g = getattr(self, "_graph", None)
-                    # 实战优先：graph 建不起来时先用 eager 出字（性能稍后再说）。
-                    return self._forward_impl(ids, start_pos, chunk, positions=positions)
+                    # **没有 eager 回落。**
+                    # decode 单步必须走 graph：捕获失败时 _graph_try_capture 已经
+                    # 抛异常了，走到这里只能是「形状不满足捕获条件」，那也是错，
+                    # 不是「先用 slow path 出字」。留着回落等于留一条没人验证的实现，
+                    # 和 MoE 那边「eager/serve 已整段删除」的规矩自相矛盾。
+                    raise RuntimeError(
+                        f"decode step has no CUDA graph and cannot capture one "
+                        f"(ids={tuple(ids.shape)} start_pos={start_pos} "
+                        f"gpu_layers={self.gpu_layers}/{self.max_layers})")
                 return self._forward_impl(ids, start_pos, chunk, positions=positions)
             except Exception as exc:
                 # torch raises OutOfMemoryError, while some CUDA paths surface a plain

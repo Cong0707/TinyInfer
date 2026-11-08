@@ -1054,10 +1054,26 @@ class ShardReader:
         pread 在 C 侧释放 GIL，所以线程数真的决定并行度；上限 32 是因为单块 NVMe
         超过这个深度只增加队列开销。"""
         import os as _os
-        # 用满所有 vCPU。原来除以 2，在 32 物理核 + 超线程的机器上只铺满
-        # 物理核、逻辑核全空（top 里一半核 0%）；pread 是 IO 等待型，逻辑核
-        # 也能贡献吞吐，而 decode 的瓶颈恰恰是调用者被 IO 拖住。
-        return max(6, min(64, _os.cpu_count() or 8))
+        # **搬数据不需要这么多 CPU。**
+        #
+        # 这里曾经返回 min(64, cpu_count)，理由是「pread 是 IO 等待型，逻辑核
+        # 也能贡献吞吐」。那是把 CPU 当成了可无限榨取的资源，而预算是「CPU 不
+        # 做事」。实测 L20：预热期间 64 核全 100%、GPU 0%，两个数字同时成立，
+        # 说明所有线程都在抢同一把池子锁（_insert_locked 持 self._lock），
+        # 不是在读盘。线程越多，锁争用越重，吞吐反而下降。
+        #
+        # 真正的上限是 SSD 的队列深度：单块 NVMe 在 QD=8..16 就饱和了
+        # （本文件 _read_many_pooled 的注释实测 4.6GB/s @ QD=8..16）。超过这个
+        # 数只是增加排队和上下文切换。
+        #
+        # 默认 16，可用 TI_READ_THREADS 覆盖（那是给多盘 RAID 的机器）。
+        _env = _os.environ.get("TI_READ_THREADS")
+        if _env:
+            try:
+                return max(1, min(32, int(_env)))
+            except Exception:
+                pass
+        return max(4, min(16, (_os.cpu_count() or 8) // 2))
 
     def __init__(self, index: ShardIndex, threads: int = 0, direct: bool = False):
         if not threads:
