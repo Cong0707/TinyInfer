@@ -2782,6 +2782,52 @@ class Engine:
             _gr.replay()
         return out.clone()
 
+    def _pregrow_graph_buffers(self, ids: torch.Tensor) -> None:
+        """把捕获期要用的常驻 buffer 提前建好，避开 graph pool。
+
+        hc.py 里那几个环（hc_pre_rms_norm 的 out / pre_mix、hc_post 的 out、
+        hc_split_sinkhorn 的 pre/post/comb）原本是在 is_current_stream_capturing()
+        为 True 时第一次分配的。那等于把它们分配进了 graph pool —— pool 认为这些
+        是「可以复用的中间张量」，几次 kernel 之后同一块地址就被别的算子拿走，
+        于是同一个地址先被写成 A、再被读成 B。
+
+        实测：hc_pre_rms_norm 写进 12922255360 的是 [0.032715, -0.005859, ...]，
+        紧接着 wqkv 从同一个地址读到 [0.039551, 0.011047, ...]，差 0.017；一路传到
+        最终 argmax 都不同。eager 没这问题，因为它每次都是新显存。
+
+        在捕获窗口外先按捕获期的形状各建一次，地址就落在普通显存上。
+        """
+        from .deepseek import hc as _hc
+
+        b, s = int(ids.shape[0]), int(ids.shape[1])
+        d = int(self.cfg.dim)
+        hc_mult = int(self.cfg.hc_mult)
+        dev = self.device
+        dtype = torch.bfloat16
+
+        # 每个环预先备好和捕获期同样数量的块：捕获期按调用顺序轮转取值，
+        # 这里只要保证第一次分配发生在窗口外，后续复用就是同一批地址。
+        for _ in range(2):
+            _hc._CAP_PRE_OUT.setdefault(
+                (b * s, d, dtype),
+                [torch.empty((b * s, d), dtype=dtype, device=dev) for _ in range(64)])
+            _hc._CAP_PRE_MIX.setdefault(
+                (b * s, hc_mult),
+                [torch.empty((b * s, hc_mult), dtype=torch.float32, device=dev)
+                 for _ in range(64)])
+            _hc._CAP_POST_OUT.setdefault(
+                (b * s, hc_mult, d, dtype),
+                [torch.empty((b * s, hc_mult, d), dtype=dtype, device=dev)
+                 for _ in range(64)])
+            _hc._CAP_MIX_OUT.setdefault(
+                (b, s, hc_mult, dtype),
+                [(torch.empty((b, s, hc_mult), dtype=dtype, device=dev),
+                  torch.empty((b, s, hc_mult), dtype=dtype, device=dev),
+                  torch.empty((b, s, hc_mult, hc_mult), dtype=dtype, device=dev),
+                  torch.empty((b, s, hc_mult, hc_mult), dtype=dtype, device=dev))
+                 for _ in range(64)])
+        torch.cuda.synchronize()
+
     def _graph_force_load_routes(self, slots) -> None:
         """把「已经路由过、但此刻不在槽位」的专家全部装进来。
 
@@ -2849,6 +2895,19 @@ class Engine:
             except Exception:
                 pass
             _pinned_on = []
+            # **捕获期要用的"常驻 buffer"必须在进入捕获窗口之前分配。**
+            #
+            # hc.py 里那些环是在 is_current_stream_capturing() 为 True 时第一次建的
+            # —— 也就是说它们本身就落在 graph pool 里，pool 把它们当成可复用的中间
+            # 张量，几个 kernel 之后同一块地址就归了别人。
+            # 实测：hc_pre_rms_norm 写进 12922255360 的是 [0.032715, ...]，紧接着
+            # wqkv 从同一个地址读到 [0.039551, ...]。
+            #
+            # 这里在窗口外预热一次，让地址落到普通显存上。
+            try:
+                self._pregrow_graph_buffers(ids)
+            except Exception:
+                pass
             snap = self.snapshot()
             # 捕获流程内部的 restore(snap) 必须保留图内 buffer（见 restore 里的注释）
             self._graph_just_captured = True
