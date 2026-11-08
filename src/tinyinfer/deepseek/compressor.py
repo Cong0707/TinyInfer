@@ -187,6 +187,9 @@ class Indexer:
         self.index_topk = cfg.index_topk
         self.softmax_scale = self.head_dim ** -0.5
         self.owns_k = layer_id in cfg.kv_source_layer_ids
+        # 每层自己的 mask 缓存：(key, mask, compress_lens)。
+        # 曾经挂在共享的 shared_attn 上，ratio 不同的层会撞 key 拿到错宽度的 mask。
+        self._mask_cache = None
         self.is_candidate_source = layer_id == cfg.candidate_source_layer_id
         self.uses_candidates = 0 <= cfg.candidate_source_layer_id < layer_id
         self.candidate_topk_blocks = cfg.candidate_topk_blocks
@@ -275,14 +278,24 @@ class Indexer:
         # a query at global p can see compressed positions < (p+1)//ratio.
         # The mask depends only on (start_pos, s, t), and every compressed layer in one
         # forward builds it again: cache it on the handoff slot.
-        key = (start_pos, s, t, ratio)
-        cached = None if __import__("os").environ.get("TI_NO_MASK_CACHE") else getattr(self.rt, "_mask_cache", None)
+        # **mask 缓存必须每层独立。**
+        # 以前挂在 self.rt（跨层共享的 shared_attn）上，只用 (start_pos,s,t,ratio)
+        # 当 key。但 t = end_pos // ratio 只在「这一层自己的 ratio」下有那个宽度，
+        # 而 ratio=1 的层和 ratio=2 的层在同一个 start_pos 上会算出不同的 t ——
+        # 一旦某次 key 撞上（比如 decode 时 s=1、start_pos 递增），就会拿到
+        # 上一层留下的 mask，宽度与 score 不匹配：
+        #   RuntimeError: size of tensor a (37) must match tensor b (33)
+        # 实测这条错误直接打断 decode 的每一步（位置递增时必现）。
+        # 挂在 self 上（每层一个）语义正确，且省掉了跨层的 key 比较。
+        key = (start_pos, s, t)
+        cached = (None if __import__("os").environ.get("TI_NO_MASK_CACHE")
+                  else getattr(self, "_mask_cache", None))
         if cached is None or cached[0] != key:
             qpos = torch.arange(start_pos, end_pos, device=x.device).unsqueeze(-1)  # [s,1]
             per_query_lens = (qpos + 1) // ratio  # [s,1]
             ar = torch.arange(t, device=x.device).view(1, t)  # [1, t]
             cached = (key, (ar >= per_query_lens).unsqueeze(0), per_query_lens.squeeze(-1))
-            self.rt._mask_cache = cached
+            self._mask_cache = cached
         mask = cached[1]
         score = score.masked_fill(mask, -torch.inf)
         compress_lens = cached[2]  # [s]

@@ -1,0 +1,1 @@
+compressor: keep the indexer mask cache per layer instead of on the shared handoff slot -- two layers with different compress ratios can produce the same key while needing different mask widths, which raised a tensor-size mismatch on every decode step once the position advanced
