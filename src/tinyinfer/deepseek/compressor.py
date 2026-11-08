@@ -129,7 +129,6 @@ class Compressor:
         # the torch expression below is the reference it implements
         pooled = None
         if body.is_cuda and body.size(0) == 1:
-            from .deepseek_kernels import compress_pool
             pooled = compress_pool(gscore.reshape(-1, gscore.size(-1)),
                                    groups.reshape(-1, groups.size(-1)), self.ratio)
             if pooled is not None:

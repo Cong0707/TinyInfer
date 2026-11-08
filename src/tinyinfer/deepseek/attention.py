@@ -325,12 +325,10 @@ class MLAWindowAttention:
             # DeepSeek's fused norm+rope (deepseek_kernels.norm_rope): one kernel instead
             # of two torch ops. Off by default: the kernel's reduction order differs from
             # torch's by ~4e-3, and levels 0-2 must stay bit-comparable to the reference.
-            from .deepseek_kernels import norm_rope as _fused_norm_rope
             kv = _fused_norm_rope(_kv_raw, self.kv_norm, freqs, self.eps, self.rope_dim)
         if kv is None and __import__("os").environ.get("TI_FUSED_KV2", "1") != "0":
             # CUDA fusion, bit-identical to the pair (the tilelang norm_rope above is the
             # one that was ~4e-3 off and could not be enabled)
-            from .deepseek_kernels import norm_rope_cuda
 
             kv = norm_rope_cuda(_kv_raw, self.kv_norm, freqs, self.eps, self.rope_dim)
         if kv is None:
@@ -343,7 +341,6 @@ class MLAWindowAttention:
                     and __import__("os").environ.get("TI_FUSED_KV") == "1"):
                 # rope + fp8 round trip in one kernel (deepseek_kernels.rope_quant):
                 # exact against the two-op reference (verified 0.0)
-                from .deepseek_kernels import rope_quant_roundtrip
                 _fused = rope_quant_roundtrip(kv, freqs, self.rope_dim)
             if _fused is not None:
                 kv = _fused

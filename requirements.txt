@@ -5,6 +5,3 @@ safetensors>=0.4
 huggingface-hub>=0.24
 numpy>=1.26
 psutil>=5.9
-# tilelang 是硬依赖：kernels/sparse_attn.py 和 fp8/fp4 quant 走官方 kernel.py
-# 它会 JIT 编译，所以运行时也要有 CUDA toolkit
-tilelang>=0.1.15

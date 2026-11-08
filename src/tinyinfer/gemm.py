@@ -409,26 +409,7 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
                 return _marlin_gemv(x, w_fp4, w_scale, key=key)
             except Exception:
                 pass
-    if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
-        try:
-            from .deepseek import fp4_native
-
-            aq, asc = fp4_native.quantize_act(x, x.size(-1))
-            if aq.size(0) > 1:
-                out = [fp4_native.gemv_fp4_pq(aq[i], asc[i], w_fp4, w_scale)
-                       for i in range(aq.size(0))]
-                return torch.cat(out, 0)
-            return fp4_native.gemv_fp4_pq(aq[0], asc[0], w_fp4, w_scale)
-        except Exception:
-            pass
-    if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
-        try:
-            from .deepseek import fp4_native
-            rows = [fp4_native.gemv_fp4_pq(*fp4_native.quantize_act(x[i:i + 1], x.size(-1)),
-                                           w_fp4, w_scale) for i in range(x.size(0))]
-            return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
-        except Exception:
-            pass
+    # fp4_native（tilelang）已删除：M<=8 的 fp4 GEMV 走 native gemv_fp4_w4a8。
     # No tensor-core path for fp4. There was a call to mma_gemm.fp4_gemm_mma here, but
     # that function does not exist (mma_gemm only exports fp8_gemm_mma), so the try/except
     # below silently swallowed the AttributeError and every M fell through to the row
@@ -442,11 +423,13 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
     #
     # Any remaining M: row by row on the native GEMV.
     if x.is_cuda and x.dim() == 2:
-        from .deepseek import fp4_native
+        from .kernels.fp4q import fp4_act_quant
+        from .kernels.native import gemv_fp4_w4a8
 
-        rows = [fp4_native.gemv_fp4_pq(*fp4_native.quantize_act(x[i:i + 1], x.size(-1)),
-                                       w_fp4, w_scale)
-                for i in range(x.size(0))]
+        rows = []
+        for i in range(x.size(0)):
+            aq, asc = fp4_act_quant(x[i:i + 1], act_block)
+            rows.append(gemv_fp4_w4a8(aq[0], asc[0], w_fp4, w_scale))
         return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
     with _bf16_default():
         x_fp8, x_s = _act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)

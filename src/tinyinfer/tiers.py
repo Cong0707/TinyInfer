@@ -32,7 +32,6 @@ class OptLevel(IntEnum):
 @dataclass
 class TierConfig:
     level: OptLevel
-    use_tilelang_attn: bool
     use_fp8_gemm: bool
     use_fp4_gemm: bool
     keep_weights_quantized: bool
@@ -66,7 +65,7 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
     if level == OptLevel.CONSERVATIVE:
         # reference: bf16 weights, plain torch ops, no speculation -- correctness baseline
         return TierConfig(
-            level=level, use_tilelang_attn=False, use_fp8_gemm=False, use_fp4_gemm=False,
+            level=level, use_fp8_gemm=False, use_fp4_gemm=False,
             keep_weights_quantized=False, expert_cache_gb=cache, kv_bits=16,
             prefetch=False, prefetch_k=0, mtp=False, head_on_cpu=False,
             approximations={}, notes="reference: bf16 weights + plain torch ops (framework-average)")
@@ -79,7 +78,7 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
         # It was True at this level, which made tier 1 and tier 2 disagree on precision
         # even though both are supposed to be the same faithful run of the checkpoint.
         return TierConfig(
-            level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=False,
+            level=level, use_fp8_gemm=True, use_fp4_gemm=False,
             # kv_bits=8 is what this tier actually ran before kv_bits was wired: KV
             # precision rode on keep_weights_quantized, which is True here. 16 (bf16)
             # doubles the KV cache and pushed the 40-layer plan into an OOM.
@@ -95,7 +94,7 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
     if level == OptLevel.AGGRESSIVE:
         # OUR engine optimizations (main production target): streaming + caches + prefetch + MTP
         return TierConfig(
-            level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=False,
+            level=level, use_fp8_gemm=True, use_fp4_gemm=False,
             # kv_bits matches BALANCED exactly: the two tiers are the SAME precision and
             # the SAME capabilities; only the mechanisms differ (tier 1 uses what ships
             # in the reference stack, tier 2 uses this engine's own dynamic loading).
@@ -114,7 +113,7 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
     # per-layer error with a different answer on every run, so it demonstrably DEGRADES the
     # model. It is opt-in (TI_MOE_FP4=1) and must never be the default of any tier.
     return TierConfig(
-        level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=True,
+        level=level, use_fp8_gemm=True, use_fp4_gemm=True,
         keep_weights_quantized=True, expert_cache_gb=cache, kv_bits=4,
         prefetch=True, prefetch_k=3, mtp=True, head_on_cpu=True,
         expert_topk=4,

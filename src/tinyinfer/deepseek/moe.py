@@ -179,7 +179,6 @@ class Expert:
         if x.size(0) > 8 and x.is_cuda:
             # chunked prefill: one fused kernel does gate+up+silu, another does down+scale
             try:
-                from .moe_fused import fused_fp4_expert_ffn
                 w = None if weights is None else weights.reshape(-1)
                 return fused_fp4_expert_ffn(x, w1, s1, w3, s3, w2, s2, w,
                                             limit=float(self.swiglu_limit))
@@ -219,7 +218,6 @@ class Expert:
         # all: its module-level tilelang import was the thing that failed on a deployment
         # without tilelang, and its kernel computes a different quantisation scheme
         # (w4a16) from the one the checkpoints define.
-        from .fp4_native import gemv_fp4_pq
 
         gemv_fp4_m8 = None
 
@@ -621,7 +619,6 @@ class MoE:
             # 表是懒建的。warmup 阶段还没有路由统计，先建全 -1，miss 分支会填。
             tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
         try:
-            from .fp4_native import quantize_act
             from ..kernels import native
 
             aq, asc = quantize_act(xf, xf.size(-1))
