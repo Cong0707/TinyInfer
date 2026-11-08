@@ -747,14 +747,19 @@ class MoE:
                n_exp, nmid, int(self.cfg.dim), blob,
                off[0], off[1], off[2], off[3], float(self.swiglu_limit), stream=None)
 
-            fd = _MOE_FUSED.get("down")
+            # 同上：grid 的 y 维是 `_rows`，随输入长度变化，**不能按名字缓存**。
+            # 缓存会让 11 行 prefill 之后的所有 1 行 decode 都用 11 行的 grid，
+            # kernel 按 row_d = blockIdx.y 去写 y[row_d * n_down_rows + n]，
+            # 越界写 11 行 —— 和 fa 是同一类错误。
+            _fd_key = ("down", int(_rows), int(self.cfg.dim))
+            fd = _MOE_FUSED.get(_fd_key)
             if fd is None:
                 # grid 的 y 维度是「行」：kernel 里 row_d = blockIdx.y，
                 # 每行只累加自己那 topk 个专家。原来只有一维，多行时只算第 0 行。
                 fd = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_down"),
                                         ((int(self.cfg.dim) + 15) // 16, _rows), (512,),
                                         "TTTTOiiiiiiii")
-                _MOE_FUSED["down"] = fd
+                _MOE_FUSED[_fd_key] = fd
             fd(scr[:n_exp * nmid].view(torch.float8_e4m3fn), scr[n_exp * nmid:],
                arena[0], sids, y,
                n_exp, int(self.cfg.dim), nmid, blob, off[4], off[5], 0, _rows, stream=None)
