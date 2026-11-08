@@ -180,12 +180,12 @@ def test_async_posts_and_waits_without_host_sync():
         slot_ids = torch.tensor([-1, 1, -1], dtype=torch.int32, device="cuda")
         ea.step_begin()
         ea.post(slot_ids, 3, layer=2)
-        ea.wait(layer=2)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()          # 只等发布 kernel（不是等就绪）
         deadline = time.time() + 5.0
         while not mgr.seen and time.time() < deadline:
             time.sleep(0.005)
         assert mgr.seen == [(2, [0, 2])], mgr.seen
+        assert ea.ready.value >= 1, "the seller never bumped the ready counter"
         ea.step_end()
         assert ea.stats()["posted"] == 1
     finally:

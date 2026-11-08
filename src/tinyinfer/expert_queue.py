@@ -117,8 +117,11 @@ class ReadyFlag:
 
         优先用 cuStreamWaitValue32：不占 SM、纯硬件等待。Windows/WDDM 上
         这个 API 常常不支持（返回 801 CUDA_ERROR_NOT_SUPPORTED），那就退到
-        自旋 kernel —— 语义一样，代价是一个 SM 被占住，而且只在数据确实还没
-        到位时才真的转满。
+        自旋 kernel。
+
+        自旋 kernel 有个前提：target 必须是「还没到的」那一格。计数器只会增加，
+        如果 CPU 已经 bump 到比 target 更大，GEQ 语义下立刻通过；而自旋版的
+        实现是 `< target` 才转，同样立刻通过 —— 两种实现都要求 target 单调。
         """
         from .kernels import native
 
@@ -202,9 +205,13 @@ class ExpertServer:
                 except Exception:
                     self.errors += 1
             self.batches += 1
-            # 备完了就通知 GPU：它可以继续读这一批。注意 bump 是 pure-host
-            # 写一个 int32（host-mapped），不发 CUDA 调用 —— 卖家线程绝不碰
-            # CUDA，否则会和主线程的 cuModuleLoad/cuLaunchKernel 互等死锁。
+            # 备完了就通知 GPU：它可以继续读这一批。bump 是纯主机写一个 int32
+            # （host-mapped），不发 CUDA 调用 —— 卖家线程绝不碰 CUDA，否则会和
+            # 主线程的 cuModuleLoad/cuLaunchKernel 互等死锁。
+            try:
+                self.ready.bump()
+            except Exception:
+                self.errors += 1
 
     def pending(self) -> int:
         try:
