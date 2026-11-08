@@ -2791,9 +2791,11 @@ class Engine:
                 # 要真正分块，得让块与块之间显式传递 h/pre_mix（各存一块固定
                 # buffer，块内只写它们）。在那之前，一块图跑完全部 40 层是唯一
                 # 正确的做法：捕获一次，replay 一次。
-                _chunk = max(1, int(__import__("os").environ.get("TI_GRAPH_CHUNK", "0") or 0))
-                if _chunk <= 0 or _chunk >= self.max_layers:
+                _env_chunk = int(__import__("os").environ.get("TI_GRAPH_CHUNK", "0") or 0)
+                if _env_chunk <= 0 or _env_chunk >= self.max_layers:
                     _chunk = int(self.max_layers)
+                else:
+                    _chunk = _env_chunk
                 _pool = torch.cuda.graph_pool_handle()
                 _graphs = []
                 out = None
