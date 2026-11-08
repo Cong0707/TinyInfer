@@ -616,17 +616,25 @@ class MLACompressedAttention:
             # letting the slice assignment broadcast-fail; the content of the old rows is
             # still valid, so carry it over when the old width fits.
             if cur is None or cur.shape[0] != b or cur.shape[1] < need:
-                # pre-allocate a decode-sized run of groups so the buffer address stays
-                # fixed for the lifetime of the conversation (CUDA graph capture needs
-                # it); a long prompt still grows once, outside the captured step.
-                cap = max(need, int(self.cfg.max_position_embeddings // max(1, self.ratio)))
-                cap = min(cap, max(need, 4096))
+                # 按需增长，不再「一上来就按 max_position_embeddings 预分配」。
+                # 1M 上下文的压缩 KV 是 6.92GB（实测）：一条请求就把 44GB 的卡的
+                # 并发打成 1。这里改成「够用就行、按倍数增长」，增长是几何的，
+                # 1M 只增长十来次，而省下的是整个「并发能力」。
+                # CUDA graph 要求地址固定 —— 所以增长只在 prefill（s > 1）阶段
+                # 发生，decode 阶段已经不再增长（need 只随 token +1，几何增长
+                # 给的余量足够）。
+                cap = max(need, int(cur.shape[1] * 2) if cur is not None else 1024)
                 grown = torch.zeros(b, cap, self.head_dim,
                                     dtype=latent.dtype, device=latent.device)
                 if cur is not None:
                     keep = min(cur.shape[1], cap)
                     grown[:, :keep] = cur[:, :keep].expand(b, -1, -1)[:, :keep]
                 self._compress_kv = grown
+                self._kv_cap_reported = False
+                import os as _os
+                if _os.environ.get("TI_KV_TRACE") == "1":
+                    print(f"[kv] L{getattr(self, 'layer_id', '?')} grow to {cap} groups "
+                          f"({cap * self.head_dim / 2**20:.1f} MB)", flush=True)
             self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
             self.rt.compress_kv = self._compress_kv
         if compress_len <= 0:
