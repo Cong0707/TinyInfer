@@ -2132,6 +2132,10 @@ class VramSlotCache:
         # 当前层（urgent）占住的槽位：别的 urgent 请求也不能把它们顶掉，
         # 否则一层 6 个专家会互相覆盖（实测 hits=0，每步重搬 768 次）。
         self._urgent: set[int] = set()
+        # 每层保留配额（0 = 关闭）。小卡上池子装不下全部专家时，按层分一小份
+        # 保住复用；大的池子用不着，走全场轮转就够。
+        self._quota = 0
+        self._quota_used: dict[int, int] = {}
         # 卖家线程把字节拷进这里（纯主机 memcpy），主线程的 commit() 负责 DMA。
         self._stage_bufs: dict[int, memoryview] = {}
         # 槽位分配代次：每次 _by_key 变动就 +1。kernel 侧按槽位编号寻址，编号一变
@@ -2547,10 +2551,44 @@ class VramSlotCache:
             staged += 1
         return staged
 
+    def plan_quota(self, n_layers: int, topk: int) -> int:
+        """按池子大小给「每层保留几个槽位」（0 表示不设配额）。
+
+        池子装不下 n_layers x topk 时，全场轮转等于 0 命中：每个专家搬进来就
+        被下一个顶掉（实测 14 槽位 8 层：loads=768 evict=754 hits=0）。
+        这时候正确的做法是「每层保住一小份」—— 相邻 token 的路由重合 42%，
+        保住的那份能立刻复用，剩下的走共享池。
+        """
+        need = int(n_layers) * int(topk)
+        if need <= 0 or self.slots <= 0:
+            return 0
+        if self.slots >= need:
+            return int(topk)
+        share = max(0, int(self.slots * 3 // 4))
+        return max(0, min(int(topk), share // max(1, int(n_layers))))
+
     def clear_urgent(self) -> None:
         """一层算完了：它的槽位降级成「历史」，可以被后续层覆盖。"""
         with self._lock:
             self._urgent.clear()
+
+    def reset_counts(self) -> None:
+        """只清缓存和计数，不动槽位（热重启时用）。
+
+        实测（8GB，14 槽位，8 层）：一步里 loads=768 evict=754 hits=0 —— 因为
+        8 层 x 6 个专家要 48 个位，池子只有 14 个，谁先到谁占，下一个来了就
+        覆盖，必然 0 命中。而相邻 token 的路由重合 42%（实测 L0 40% / L1 50%
+        / L2 38% / L3 38%）—— 只要保住那些，下一步就能省掉 42% 的 DMA。
+        """
+        with self._lock:
+            self.hits = 0
+            self.loads = 0
+            self.evictions = 0
+            self._urgent.clear()
+            self._stage_bufs.clear()
+            self._tab_dirty.clear()
+            self._dirty.clear()
+
 
     def commit(self, layer: int | None = None) -> int:
         """主线程：把 staged 的槽位 DMA 上去并发布，然后写表。
@@ -2597,7 +2635,8 @@ class VramSlotCache:
         placed = self.commit(layer)
         return n, placed
 
-    def _claim_slot_locked(self, *, protect_urgent: bool = False) -> int | None:
+    def _claim_slot_locked(self, *, protect_urgent: bool = False,
+                           want_layer: int = -1) -> int | None:
         """拿一个槽位：先掏空的，掏不到就环形覆盖一个没人在用的。
 
         这里没有「释放」这个动作 —— 槽位在池子里转圈，被覆盖即回收。
@@ -2620,15 +2659,28 @@ class VramSlotCache:
         # 这样同一层刚搬进来的 6 个专家不会被它自己的下一个请求顶掉 ——
         # 那是 hits=0 的直接原因。第一轮找不到才退一步允许覆盖 urgent，
         # 否则池子一到紧急状态就整个卡死（没有兜底时实测会 still not resident）。
-        for allow_urgent in ((not protect_urgent), True):
+        # 三轮优先级：
+        #   1. 空槽（上面已经找过）
+        #   2. 别的层的槽位 —— 本层要的专家优先抢别人的，绝不抢自己的
+        #   3. 本层但已算完的（非 urgent）
+        #   4. 兜底：urgent 也抢（否则池子一到紧急状态就整个卡死）
+        # 「本层不抢自己」是关键：一层 6 个专家互相顶掉就是 hits=0 的直接原因。
+        for mode in ("other", "stale", "any"):
             for k in range(n):
                 i = self._cur + k
                 if i >= n:
                     i %= n
                 if not _evictable(i):
                     continue
-                if not allow_urgent and i in self._urgent:
-                    continue
+                key = self._key[i]
+                if mode == "other":
+                    if protect_urgent and i in self._urgent:
+                        continue
+                elif mode == "stale":
+                    if i in self._urgent:
+                        continue
+                    if key is not None and key[0] == want_layer:
+                        continue
                 self._cur = (i + 1) % n
                 return i
         return None
@@ -2776,7 +2828,8 @@ class VramSlotCache:
                         protect_urgent: bool = False) -> int | None:
         if key in self._by_key:
             return self._by_key[key]
-        idx = self._claim_slot_locked(protect_urgent=protect_urgent)
+        idx = self._claim_slot_locked(protect_urgent=protect_urgent,
+                                      want_layer=int(key[0]))
         if idx is None:
             return None
         if self._state[idx] != self.FREE:
