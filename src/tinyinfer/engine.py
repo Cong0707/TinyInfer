@@ -2948,6 +2948,29 @@ class Engine:
             except Exception:
                 pass
 
+    def _restore_active_layers(self) -> None:
+        """把每个 attention 模块的 _active_layer 还原成它构造时的层号。
+
+        捕获期 _forward_chunk 会把它改成「正在跑的那一层」，因为图里的常驻
+        buffer（_graph_kv_buf / _graph_freqs）都挂在 _st() 里、按 _active_layer
+        取槽。捕获结束必须还原：restore() 会逐层写 a._kv_window / a._kv_buf，
+        那两个 property 也走 _st()，键还是 _active_layer；停在上次的层号上，
+        40 层的 KV 历史会全写进同一层的槽，其余层继续引用图专用 buffer ——
+        实测捕获后紧接着跑 eager，absmax=nan、argmax=0，而同一个 eager 在没
+        捕获过的进程里是完整通顺的中文。
+        """
+        for _bb in getattr(self, "_blocks", {}).values():
+            for _mm in (getattr(_bb, "attn", None), getattr(_bb, "ffn", None)):
+                if _mm is None:
+                    continue
+                for _sub in (_mm, getattr(_mm, "compressor", None),
+                             getattr(_mm, "indexer", None)):
+                    if _sub is None:
+                        continue
+                    _lid = getattr(_sub, "layer_id", None)
+                    if _lid is not None:
+                        _sub._active_layer = int(_lid)
+
     def _graph_try_capture(self, ids: torch.Tensor, start_pos: int) -> None:
         if getattr(self, "_graph", None) is not None or getattr(self, "_graph_failed", False):
             return
@@ -3134,6 +3157,13 @@ class Engine:
                 except Exception:
                     pass
             finally:
+                # **必须先还原 _active_layer，再 restore(snap)。**
+                #
+                # restore 里对每一层写 a._kv_window / a._kv_buf，而那两个 property
+                # 都走 _st()，键就是 _active_layer。捕获期最后一层是 L39，若不先
+                # 还原，40 层的 KV 历史会全部写进 L39 的 state 槽，其余 39 层的
+                # _kv_buf 保持捕获期那块图专用 buffer —— eager 接着用就是 NaN。
+                _restore_active_layers()
                 self.restore(snap)
                 self._graph_just_captured = False
                 self._graph_captured_done = False
@@ -3147,22 +3177,6 @@ class Engine:
                 # 是完整通顺的中文。
                 #
                 # 还原成构造时的层号（每个模块自己记着的那一个）。
-                for _bb in getattr(self, "_blocks", {}).values():
-                    for _mm in (getattr(_bb, "attn", None), getattr(_bb, "ffn", None)):
-                        if _mm is None:
-                            continue
-                        for _sub in (_mm, getattr(_mm, "compressor", None),
-                                     getattr(_mm, "indexer", None)):
-                            _lid = getattr(_sub, "layer_id", None)
-                            if _sub is not None and _lid is not None:
-                                _sub._active_layer = int(_lid)
-                        # 捕获期建的 _graph_kv_buf / _graph_freqs 是图专用的常驻
-                        # 张量，eager 不能继续用它们：图会往 _graph_kv_buf 里写
-                        # KV，eager 接着读同一块就是别人的历史。把它们从 state
-                        # 槽里摘掉，eager 下一层会按自己的形状重新分配。
-                        for _stt in getattr(_mm, "_states", {}).values():
-                            _stt.pop("buf", None)
-                            _stt.pop("kv", None)
                 # 把捕获前那次完整 forward 建好的跨层共享状态放回去（见上面
                 # _keep_rt 的注释）。restore(snap) 会把 _rt 清成 None，那会让
                 # 随后 replay 出来的图在 compressor 里拿到 None。
