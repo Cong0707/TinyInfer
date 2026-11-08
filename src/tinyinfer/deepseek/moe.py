@@ -419,6 +419,11 @@ class MoE:
                 st._expert_async = ea
         return ea
 
+    def _req_epoch(self) -> int:
+        """本层的请求序号（每次发请求 +1）。只用来说明新旧，不影响正确性。"""
+        self._epoch = int(getattr(self, "_epoch", 0)) + 1
+        return self._epoch
+
     def _tier_manager(self):
         """分级管理器：一个 store 只有一个，全部 40 层共用。
 
@@ -607,26 +612,29 @@ class MoE:
                 sl.clear_urgent()
             _async = self._async_experts()
             _mgr = self._tier_manager()
-            if _async is not None and _async.enabled:
-                _mgr.commit(self.layer_id)
-            # 本层还缺的（staging 还没备到的，或根本没启异步的），当场补：
-            # 判断由 GPU 做（moe_miss_scan），CPU 只拿回缺的那几个 id。
-            _nmiss = 0
-            if (not getattr(self, "_all_pinned", False)
-                    and not torch.cuda.is_current_stream_capturing()):
-                _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
-            if _nmiss:
-                _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
-                if _miss:
-                    _mgr.need(self.layer_id, _miss)
-                    _mgr.commit(self.layer_id)
-                    _mgr.ready(self.layer_id, _miss)
-                    tab = sl._slot_tab
-                    torch.index_select(tab[self.layer_id], 0,
-                                       indices.view(-1).clamp_(0, 383), out=sids)
-                    if bool((sids < 0).any().item()):
-                        raise RuntimeError(
-                            f"MoE layer {self.layer_id}: {_miss} still not resident")
+            # GPU 侧一次性完成「检查缺谁 + 发布请求 + 等 CPU 备好」。
+            # 主机在这里不做任何同步：不 item()、不 tolist()、不拿中间产物。
+            # 这是用户要的「买家下单，卖家发货，买家自己等货」—— 以前每层
+            # 要把 miss 计数拉回主机（40 层 x 3.3ms = 130ms/token）。
+            _ring = _async.ring if (_async is not None and _async.enabled) else None
+            if _ring is not None:
+                _ring.wait_ready(sids, int(indices.numel()), self.layer_id,
+                                 int(self._req_epoch()))
+            else:
+                # 没有环（CPU-only / 捕获期）：退回主机侧同步补缺。
+                _nmiss = 0
+                if (not getattr(self, "_all_pinned", False)
+                        and not torch.cuda.is_current_stream_capturing()):
+                    _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
+                if _nmiss:
+                    _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
+                    if _miss:
+                        _mgr.need(self.layer_id, _miss)
+                        _mgr.commit(self.layer_id)
+                        _mgr.ready(self.layer_id, _miss)
+            tab = sl._slot_tab
+            torch.index_select(tab[self.layer_id], 0,
+                               indices.view(-1).clamp_(0, 383), out=sids)
             # 把本层路由告诉卖家，让它提前备下一层要用的（不阻塞）。
             # 这里不再主动「还槽位」。
             # 原来按「池子装不下整步（40 层 x topk）」判断，小卡每步把整层用过的

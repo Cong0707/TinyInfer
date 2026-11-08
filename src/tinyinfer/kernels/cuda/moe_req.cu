@@ -34,6 +34,49 @@ extern "C" __global__ void moe_miss_count(
     *out = n;
 }
 
+// GPU 自己检查「本层缺不缺专家」，缺就写进 host-mapped 环，然后等 CPU 备好。
+//
+// 这样一处改动去掉的是每层一次 D2H 同步（40 层 x 3.3ms = 130ms/token）：
+// 以前 CPU 每层把 miss 计数拉回主机才知道要不要搬，现在是 GPU 在流里等
+// 一个 host-mapped 计数器 —— 主机侧完全不需要知道「缺没缺」。
+//
+// q 的布局（int32，host-mapped）：
+//   [0]  发布计数（atomicAdd）
+//   [1]  最新序号
+//   [2]  就绪计数（CPU 写，GPU 等）
+//   [3..] 请求记录，每条 34 个 int: [layer, n, e0..e31, epoch]
+extern "C" __global__ void moe_wait_ready(
+    const int* __restrict__ slot_ids,
+    int n_exp,
+    int layer,
+    int epoch,
+    volatile int* __restrict__ q,
+    int cap) {
+    if (threadIdx.x != 0) return;
+    // 1) 扫出本层缺的专家（slot_ids 本来就是 device 上的）
+    int n = 0;
+    int miss[32];
+    for (int e = 0; e < n_exp && n < 32; ++e) {
+        if (slot_ids[e] < 0) miss[n++] = e;
+    }
+    if (n == 0) return;              // 全在显存里：直接走，不等任何人
+    // 2) 发布请求给 CPU（host-mapped，写完 CPU 立刻看得到）
+    int idx = atomicAdd((int*)&q[0], 1);
+    __threadfence();
+    int* rec = (int*)q + 3 + (idx % cap) * 34;
+    rec[0] = layer;
+    rec[1] = n;
+    for (int i = 0; i < n; ++i) rec[2 + i] = miss[i];
+    rec[33] = epoch;
+    __threadfence();
+    q[1] = idx + 1;
+    // 3) 等 CPU 把这一批备好（就绪计数 >= 请求序号 + 1）
+    int target = idx + 1;
+    while (*(volatile int*)&q[2] < target) {
+        __nanosleep(128);
+    }
+    __threadfence();
+}
 extern "C" __global__ void moe_req_post(
     const int* __restrict__ slot_ids,
     int n_exp,

@@ -28,12 +28,13 @@ class ExpertRequestRing:
     布局（int32，全部 host-mapped）：
       [0]           发布计数（GPU atomicAdd）
       [1]           最新一条的序号（GPU 写，CPU 只读，用来判断有没有新东西）
-      [2..]         每条请求 34 个 int：[layer, n, e0..e31, epoch]
+      [2]           就绪计数（CPU 写、GPU 等）—— 备好第 k 批就写到 k
+      [3..]         每条请求 34 个 int：[layer, n, e0..e31, epoch]
     """
 
     SLOTS = 64
     STRIDE = 34
-    HEAD = 2
+    HEAD = 3
 
     def __init__(self, device: str = "cuda"):
         import ctypes
@@ -65,6 +66,29 @@ class ExpertRequestRing:
 
     def posts_so_far(self) -> int:
         return int(self.host[0])
+
+    # -- GPU 侧：一次搞定「检查 + 发布 + 等就绪」 -------------------------
+    def wait_ready(self, slot_ids, n_exp: int, layer: int, epoch: int) -> None:
+        """排一个 kernel：GPU 自己判断缺谁、发布、并在流里等 CPU 备好。
+
+        这是整条链路的关键一步。以前是 CPU 每层把 miss 计数 item() 回来
+        （40 层 x 3.3ms = 130ms/token），现在判断和等待都在 GPU 上，
+        主机侧连「缺没缺」都不需要知道。
+        """
+        from .kernels import native
+
+        fn = getattr(self, "_wait_ln", None)
+        if fn is None:
+            # 签名：T(张量) i i i p(裸指针) i
+            fn = self._wait_ln = native.BoundLaunch(
+                native.kernel("moe_req", "moe_wait_ready"),
+                (1,), (32,), "Tiiipi")
+        fn(slot_ids, int(n_exp), int(layer), int(epoch),
+           int(self.dev_ptr), int(self.SLOTS))
+
+    def set_ready(self, n: int) -> None:
+        """CPU 备好第 n 批：写就绪计数（纯主机写，GPU 侧在自旋等）。"""
+        self.host[2] = int(n)
 
     # -- CPU 侧 ----------------------------------------------------------
     def drain(self) -> list[tuple[int, list[int]]]:
@@ -209,7 +233,11 @@ class ExpertServer:
             # （host-mapped），不发 CUDA 调用 —— 卖家线程绝不碰 CUDA，否则会和
             # 主线程的 cuModuleLoad/cuLaunchKernel 互等死锁。
             try:
-                self.ready.bump()
+                # 同时更新两处就绪：
+                #   ready.bump()      —— 老路径（cuStreamWaitValue32 用）
+                #   ring.set_ready(n) —— GPU 侧自旋等待用（moe_wait_ready）
+                n = self.ready.bump()
+                self.ring.set_ready(n)
             except Exception:
                 self.errors += 1
 
