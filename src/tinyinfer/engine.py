@@ -2754,24 +2754,15 @@ class Engine:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
-                # **warmup 这次要带 miss 扫描跑，把表按真实路由填满**（上面那次
-                # forward 时 _all_pinned 还是关的，MoE 会走 _miss_scan → need →
-                # commit，把本步需要的专家装进槽位并写进 tab）。
+                # **warmup 这次带 miss 扫描跑，把本步真实需要的专家装进槽位、写进表。**
                 #
-                # 然后才打开 _all_pinned：图里的 MoE 只认 tab[layer][expert] 直通，
-                # 而捕获期会跳过 _miss_scan / need / commit（它们要 D2H，图内做不了），
-                # 表里的 -1 就永远补不上，kernel 拿到 -1 是非法地址 —— 实测 L20 上
-                # 3 层（路由恰好全 pin）正确、第 5 层起 NaN，就是这个原因。
+                # 图里的 MoE 只认 tab[layer][expert] 查到的槽位号直通 kernel，而
+                # 捕获期会跳过 _miss_scan / need / commit（要 D2H，图内做不了），
+                # 表里的 -1 就永远补不上，kernel 拿到 -1 是非法地址 —— 实测 L20
+                # 上 3 层正确、第 5 层起 NaN，就是这个原因。
                 #
-                # 所以 _all_pinned 不是性能开关，是 CUDA graph 的硬性前置条件：
-                # 捕获时的路由必须固定，replay 时也必须是同一批。
-                for _b in self._blocks.values():
-                    _ffn = getattr(_b, "ffn", None)
-                    if _ffn is not None and not getattr(_ffn, "_all_pinned", False):
-                        _ffn._all_pinned = True
-                        _pinned_on.append(_ffn)
-                # 表按真实路由重建一次（上面的 _all_pinned 只是让 MoE 不再扫描，
-                # 表本身要在这里落定）
+                # 所以这里只有一件事：确保刚跑完的这一次把表落定。不再打开
+                # _all_pinned —— 它会让 MoE 跳过扫描，而扫描正是填表的唯一途径。
                 _sl_cap = getattr(getattr(self, "expert_store", None), "slots", None)
                 if _sl_cap is not None:
                     try:

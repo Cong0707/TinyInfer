@@ -2878,19 +2878,17 @@ class VramSlotCache:
 
     def table_sync(self) -> None:
         """把 Python 侧的 key->slot 一次性同步到 device 表。
-        # 捕获期禁止任何 H2D（pinned 中转也算），而 pin 之后表内容固定。
-        _t = self._torch
-        if _t is not None and _t.cuda.is_available() and _t.cuda.is_current_stream_capturing():
-            return
-        # 捕获期禁止 H2D；pin 之后表内容固定，捕获时不需要重刷。
-        if (self._torch is not None and self._torch.cuda.is_available()
-                and self._torch.cuda.is_current_stream_capturing()):
-            return
 
         不要逐条 tab[layer, expert] = idx —— 那是每次一个 GPU 写 kernel，240 条
         就是 240 个 kernel，比它省下的那些还多。这里在主机侧攒一个 numpy 数组，
         一次 copy_ 上去。
+
+        捕获期禁止任何 H2D（pinned 中转也算），而 pin 之后表内容固定，
+        所以捕获期直接返回。
         """
+        if (self._torch is not None and self._torch.cuda.is_available()
+                and self._torch.cuda.is_current_stream_capturing()):
+            return
         tab = getattr(self, "_slot_tab", None)
         if tab is None or self._torch is None:
             return
