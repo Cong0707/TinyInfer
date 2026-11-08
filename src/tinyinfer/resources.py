@@ -124,6 +124,9 @@ class Plan:
     expert_slots: int
     cache_bytes: int
     prefill_chunk: int
+    # 会被 streaming 的层数 = n_layers - resident。**没有消费者**：
+    # engine 用 _stream_layers() 从 gpu_layers 自己推，不看这个字段。
+    # 保留它是给 reason 文本和外部观察用的。
     stream_layers: int
     reason: str
     # False when even the streaming skeleton (ring + workspace + tables) does not fit
@@ -131,6 +134,9 @@ class Plan:
     fits: bool = True
     # layer -> CUDA index, and per-card expert slot counts. Single-GPU boxes get
     # {layer: 0} and {0: slots} and the engine behaves exactly as before.
+    # 每层放在哪张卡。**没有消费者**：多卡时层放置由 engine 自己的
+    # _layer_dev 决定，这个字段只在 plan 内部用来算 card_slots。
+    # 和 card_slots 一样，不要以为它生效。
     layer_card: dict[int, int] = dataclasses.field(default_factory=dict)
     # 每张卡分到多少专家槽位。**目前没有消费者**：decode 的槽位分配由
     # VramSlotCache.set_devices 按设备实际余量自己做，不读这个字段。
