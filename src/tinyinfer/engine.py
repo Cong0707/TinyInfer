@@ -1421,20 +1421,19 @@ class Engine:
                             _ffn._all_pinned = True
             except Exception:
                 self._slot_tab_ready = False
-        # **槽位表就绪后立刻捕获 decode graph。**
+        # 槽位表就绪 = 可以捕获 decode graph 了。
         #
-        # 捕获的前置条件里有一条是「_slot_tab 已建」，而它只在 pin 之后才存在。
-        # 删掉 eager 回落之后，第一次 decode 若还没捕获就直接报错 —— 那不是
-        # 「图坏了」，是「启动顺序里少了一步」。服务端的 warmup() 会走 pin，
-        # 所以在那之后把图建好，请求进来就是 replay，不用等第一次捕获的 11 秒。
-        if self._slot_tab_ready and getattr(self.tier, "cuda_graph", False):
-            try:
-                import torch as _t
-                _ids = _t.zeros((1, 1), dtype=_t.long, device=self.device)
-                self._graph_try_capture(_ids, 1)
-            except Exception:
-                # 捕获失败就在这里炸，让启动阶段暴露问题，而不是等第一个请求
-                raise
+        # **但这里不立刻捕获。** 捕获需要捕获前先跑一次完整 forward 来建立
+        # compress_kv / index_k（kv_source 层产出，后面 34 层直接读）；在 pin
+        # 这一步跑的那次只有 1 个 token、位置 1，compressor 连一个完整分组都
+        # 凑不齐，index_k 仍是 None，于是捕获时 compressor.py:285 直接抛
+        #   TypeError: NoneType object is not subscriptable
+        # 实测（L20）撞的就是这个。
+        #
+        # 真正的捕获交给第一次 decode：那时 prefill 已经跑过，_rt 里的状态是
+        # 真实形状的。服务端 warmup() 之后紧接着就会有一次真实请求，代价只是
+        # 第一个请求多花约 11 秒，换来正确性。
+        self._graph_needed = bool(getattr(self.tier, "cuda_graph", False))
         return pinned
 
     def reset(self) -> None:
