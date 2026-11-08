@@ -702,21 +702,12 @@ class MoE:
             # 而 aq 只有 6*5120 字节 —— 越界读 10 倍，读回来的是别的专家的激活，
             # 结果就是 NaN。这正是「引擎跑过一次之后，短输入必 NaN」的根因。
             # 现在按 (device, grid) 作键缓存，不同 grid 各建一个。
-            # **捕获期不复用 launcher。**
-            # BoundLaunch 内部只有一个参数块（self._raw），同一层内反复调用没问题；
-            # 但捕获期 L0、L1 交替调用同一个 launcher 时，图里两次 launch 可能共用
-            # 同一块参数 —— 实测 L1 的 ffn 输出 absmax 2.09e37，而 gate 和输入都正常。
-            # 捕获期每次现建一个，参数块互不干扰。
             _fa_key = ("act", int(n_exp), int(nmid))
-            if torch.cuda.is_current_stream_capturing():
+            fa = _MOE_FUSED.get(_fa_key)
+            if fa is None:
                 fa = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_act"),
                                         ((nmid + 31) // 32, n_exp, 1), (512,), "TTTTTOOiiiiiiiif")
-            else:
-                fa = _MOE_FUSED.get(_fa_key)
-                if fa is None:
-                    fa = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_act"),
-                                            ((nmid + 31) // 32, n_exp, 1), (512,), "TTTTTOOiiiiiiiif")
-                    _MOE_FUSED[_fa_key] = fa
+                _MOE_FUSED[_fa_key] = fa
             # kernel 按 [row, expert] 索引激活，所以这里把每行的激活铺成 n_exp 份。
             # 之前只传了一行（5120 字节），e=1..5 时读的是越界地址 —— 不报错但数值是垃圾。
             _k = int(self.cfg.dim)
