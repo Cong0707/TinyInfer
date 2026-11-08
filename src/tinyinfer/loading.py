@@ -2165,7 +2165,6 @@ class VramSlotCache:
         self._cond = threading.Condition(self._lock)
         self._staging_lock = threading.Lock()
         self._staging_lock_b = threading.Lock()
-        self.hits = 0
         self.loads = 0
         self.evictions = 0
         # 「兜底时抢走了正在计算的那个层自己的槽位」的次数。>0 意味着**那一次',
@@ -2631,7 +2630,6 @@ class VramSlotCache:
         / L2 38% / L3 38%）—— 只要保住那些，下一步就能省掉 42% 的 DMA。
         """
         with self._lock:
-            self.hits = 0
             self.loads = 0
             self.evictions = 0
             self._urgent.clear()
@@ -2796,11 +2794,11 @@ class VramSlotCache:
         for k in self._by_key:
             lid = int(k[0])
             by_layer[lid] = by_layer.get(lid, 0) + 1
-        # 池子只记 hits 和 loads（每次真正搬一次算一个 load），
-        # miss = loads；命中率 = hits / (hits + loads)。
+        # 这里不报命中率。槽位池只知道「搬了多少次」，不知道「有多少个专家本来
+        # 就够用」——后者要按专家数数，只有 ExpertTiers.need() 拿得到完整的
+        # want 列表。两处各算一遍就是两个对不上的数，所以统一到
+        # ExpertTiers.stats["vram_hit"]，这里只留下搬运侧的实测量。
         _loads = int(getattr(self, "loads", 0))
-        _hits = int(getattr(self, "hits", 0))
-        total = max(1, _hits + _loads)
         return {
             "slots": int(self.slots),
             "blob_bytes": int(self.blob_bytes),
@@ -2815,9 +2813,7 @@ class VramSlotCache:
             "fill_ratio": len(self._by_key) / float(n),
             "layers_present": len(by_layer),
             "busiest_layers": sorted(by_layer.items(), key=lambda t: -t[1])[:5],
-            "hits": _hits,
             "loads": _loads,
-            "hit_rate": (_hits / float(total)),
             "evictions": int(getattr(self, "evictions", 0)),
             # >0 说明兜底抢走过正在计算的层的槽位 —— 那几次 MoE 的数值可能不精确。
             "urgent_evictions": int(getattr(self, "urgent_evictions", 0)),
@@ -3005,13 +3001,11 @@ class VramSlotCache:
                     st = self._state[idx]
                     if st in (self.STAGED, self.IN_USE):
                         self._refs[idx] += 1
-                        self.hits += 1
                         self._state[idx] = self.IN_USE
                         return idx, True
                     if st == self.COPYING:
                         # consume immediately; the compute stream waits on the slot event
                         self._refs[idx] += 1
-                        self.hits += 1
                         self._state[idx] = self.IN_USE
                         return idx, True
                     # RESERVED: prefetch has not started the copy yet; wait for publish
@@ -3049,7 +3043,6 @@ class VramSlotCache:
                         out.append(None)  # prefetch in flight: let acquire() wait
                         continue
                     self._refs[idx] += 1
-                    self.hits += 1
                     self._state[idx] = self.IN_USE
                     out.append((idx, True))
                     continue
@@ -3192,9 +3185,19 @@ class VramSlotCache:
         return getattr(self, "_copy_stream", None)
 
     def stats(self) -> dict[str, float]:
+        """槽位池自身的容量与搬运统计。
+
+        **命中率不在这里。** 「命中」有两种口径：槽位被 acquire 了几次（这里原来数
+        的），和有多少个专家不需要搬（ExpertTiers.need 数的）。前者在批量路径下
+        会漏、在预取路径下会虚高，同一个 token 的两个数对不上。
+
+        所以命中统一由 ExpertTiers.stats['vram_hit'] 提供，这里只报「搬了多少次、
+        换出多少次、当前各状态多少格」——这些都是从实际数据结构能直接算出来的，
+        不会和别的口径打架。
+        """
         with self._lock:
             return {"slots": self.slots, "blob_bytes": self.blob_bytes,
-                    "hits": self.hits, "loads": self.loads, "evictions": self.evictions,
+                    "loads": self.loads, "evictions": self.evictions,
                     "staged": sum(1 for s in self._state if s == self.STAGED),
                     "copying": sum(1 for s in self._state if s == self.COPYING),
                     "gb": self.slots * self.blob_bytes / 1e9}
