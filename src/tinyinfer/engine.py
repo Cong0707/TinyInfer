@@ -2789,6 +2789,27 @@ class Engine:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
+                # **warmup 之前必须把所有层的权重都搬上 device。**
+                #
+                # 量化路径下 wq_a / wkv 这类小矩阵是懒搬的（QuantLinear 在
+                # forward 里做 .to(device)）。那意味着捕获期第一次搬运会新建一块
+                # 显存，其地址被写进图中的 kernel 参数；捕获结束后那块临时内存
+                # 被 allocator 回收，replay 时读到的就是别人的字节 —— 实测 L1
+                # 输出 absmax 2.36e37，正是 bf16 把任意 16 位当数值解释的量级。
+                #
+                # eager 每步都重新搬一次，所以永远看不出问题；layers=[0,0] 也是
+                # 对的（同一个 Block，第二次已经是热权重）。只有「不同层 + graph」
+                # 这个组合才暴露。
+                _moved = []
+                for _b in self._blocks.values():
+                    try:
+                        _r = _b.to(self.device)
+                        if _r is not None:
+                            _moved.append(_b)
+                    except Exception:
+                        pass
+                if _moved:
+                    torch.cuda.synchronize()
                 # **warmup 这次带 miss 扫描跑，把本步真实需要的专家装进槽位、写进表。**
                 #
                 # 图里的 MoE 只认 tab[layer][expert] 查到的槽位号直通 kernel，而
