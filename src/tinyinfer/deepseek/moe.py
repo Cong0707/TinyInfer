@@ -738,26 +738,13 @@ class MoE:
             # index_select 的临时输出，函数一返回就释放，显存立刻被别的层复用 ——
             # 异步执行中的 kernel 于是从「槽位号」里读到 2^31 之类的垃圾，算出来的
             # 权重地址偏 4e16（compute-sanitizer 实测），多行 prefill 必崩。
-            # **捕获期不能让 kernel 拿到临时张量。**
-            # weights.reshape(-1) 对非连续张量会复制，那份新显存只在本次调用期间
-            # 有效；捕获期它的地址被记进图里，捕获取结束后即被回收，replay 时
-            # kernel 从已释放内存里读路由权重 —— 实测 L1 的 ffn 输出 absmax 2.09e37。
-            # 捕获期把它拷进持久 buffer（同一块地址每轮重写），replay 就稳定了。
-            _wflat = weights.reshape(-1)
-            if torch.cuda.is_current_stream_capturing():
-                _wb = getattr(self, "_wgt_buf", None)
-                if _wb is None or _wb.numel() != _wflat.numel() or _wb.device != _wflat.device:
-                    _wb = torch.empty_like(_wflat).contiguous()
-                    self._wgt_buf = _wb
-                _wb.copy_(_wflat)
-                _wflat = _wb
-            self._launch_keep = (sids, weights, _wflat)
+            self._launch_keep = (sids, weights)
             if __import__("os").environ.get("TI_MOE_CHK") == "1":
                 print(f"[moechk] L{self.layer_id} rows={_rows} n_exp={n_exp} "
                       f"sids=[{int(sids.min())},{int(sids.max())}] "
                       f"arena={tuple(arena[0].shape)} blob={blob} off={off} "
                       f"cuda={sids.is_cuda} contig={sids.is_contiguous()}", flush=True)
-            fa(_aqx, _ascx, arena[0], sids, _wflat,
+            fa(_aqx, _ascx, arena[0], sids, weights.reshape(-1),
                scr[:n_exp * nmid], scr[n_exp * nmid:],
                n_exp, nmid, int(self.cfg.dim), blob,
                off[0], off[1], off[2], off[3], float(self.swiglu_limit), stream=None)
