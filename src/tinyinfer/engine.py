@@ -3137,6 +3137,25 @@ class Engine:
                 self.restore(snap)
                 self._graph_just_captured = False
                 self._graph_captured_done = False
+                # **捕获期把 _active_layer 逐层改成 layer_id，必须还原。**
+                #
+                # _st() 以 _active_layer 为键，所有常驻 buffer（_kv_buf /
+                # _graph_freqs / wo_a_bf）都挂在里面。捕获结束后如果不还原，
+                # 每个模块的 _active_layer 都停在最后一层的编号上，此后 eager
+                # 的每一层都去读写同一层的 state —— 实测捕获过图之后紧接着跑
+                # eager，absmax=nan、argmax=0。而同一个 eager 在没捕获过的进程里
+                # 是完整通顺的中文。
+                #
+                # 还原成构造时的层号（每个模块自己记着的那一个）。
+                for _bb in getattr(self, "_blocks", {}).values():
+                    for _mm in (getattr(_bb, "attn", None), getattr(_bb, "ffn", None)):
+                        if _mm is None:
+                            continue
+                        for _sub in (_mm, getattr(_mm, "compressor", None),
+                                     getattr(_mm, "indexer", None)):
+                            _lid = getattr(_sub, "layer_id", None)
+                            if _sub is not None and _lid is not None:
+                                _sub._active_layer = int(_lid)
                 # 把捕获前那次完整 forward 建好的跨层共享状态放回去（见上面
                 # _keep_rt 的注释）。restore(snap) 会把 _rt 清成 None，那会让
                 # 随后 replay 出来的图在 compressor 里拿到 None。
