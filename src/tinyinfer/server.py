@@ -1548,12 +1548,34 @@ class TinyModelBackend(BaseBackend):
         if loop is None:
             from .sched import ServingEngine
 
-            # Batch width follows the device: enough sequences to amortise a weight read,
-            # capped by what the host asked for. The loop itself decides how many can
-            # actually be in flight from the KV pool, so this is a ceiling, not a promise.
+            # 批宽跟着硬件走，不写死 8：和槽位数用同一个推导（真实的剩余显存
+            # + 上下文长度），所以 8GB 卡是 1、44GB 卡是 5 上下、141GB 卡是几十。
+            # 显式设了 TI_MAX_BATCH 就以它为准（压测要能固定住）。
             import os as _os_w
 
-            want = int(_os_w.environ.get("TI_MAX_BATCH", "8"))
+            _env = _os_w.environ.get("TI_MAX_BATCH")
+            if _env is not None:
+                want = max(1, int(_env))
+            else:
+                want = 1
+                try:
+                    from .kv_tiers import plan_slots
+
+                    _free = 0
+                    try:
+                        import torch as _t
+
+                        if _t.cuda.is_available():
+                            _free = int(_t.cuda.mem_get_info()[0])
+                    except Exception:
+                        _free = 0
+                    if _free > 0:
+                        want = max(1, plan_slots(
+                            vram_free_bytes=_free,
+                            context_tokens=int(getattr(self._cfg, "max_position_embeddings",
+                                                        1_048_576) or 1_048_576)))
+                except Exception:
+                    want = 1
             loop = ServingEngine(self._model, max_batch=max(1, want)).start()
             self._batch_loop = loop
         return loop
