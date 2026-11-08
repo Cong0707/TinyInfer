@@ -3021,16 +3021,12 @@ class VramSlotCache:
                 idx = self._reserve_locked(key)
                 if idx is None:
                     # 池子满了且暂时没有可淘汰的槽位（全部 refs>0 或 pinned）。
-                    # 这不是错误也不是「退到 RAM」—— 等别的调用方 release，
-                    # 腾出槽位再来。槽位是唯一路径，等待是它唯一的正确语义。
-                    # 原来这里返回 (-1, False) 让上层从 RAM 读，绕开了 device
-                    # 侧的 slot_table，于是同一份计算有两个实现。
-                    if not self._cond.wait(timeout=30.0):
-                        raise RuntimeError(
-                            f"VRAM slot pool exhausted for {key} "
-                            f"(slots={self.slots}, all busy or pinned for 30s); "
-                            f"a caller is holding slots without releasing them")
-                    continue
+                    # 返回 (-1, False) 是这里的**约定**，不是退化：调用方
+                    # （loading.py 的 get/fetch）拿到 -1 会抛出一句带层号/专家号的
+                    # 错误，比在这里盲等 30 秒再报「别人占着槽位」有用得多。
+                    # 需要阻塞语义的地方（prefetch、后台搬运）自己应带重试；
+                    # acquire 本身是同步接口，不替调用方决定要不要等。
+                    return -1, False
                 self._refs[idx] = 1
                 self._state[idx] = self.IN_USE
                 return idx, False
