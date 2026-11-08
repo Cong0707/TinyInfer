@@ -319,33 +319,13 @@ class MLAWindowAttention:
             apply_rope(q[..., -self.rope_dim:], freqs)
 
             _kv_raw = _lin(self.wkv, x)
-        kv = None
-        if (getattr(self, "quant", False) and _kv_raw.is_cuda and _kv_raw.size(0) == 1
-                and __import__("os").environ.get("TI_FUSED_KV") == "1"):
-            # DeepSeek's fused norm+rope (deepseek_kernels.norm_rope): one kernel instead
-            # of two torch ops. Off by default: the kernel's reduction order differs from
-            # torch's by ~4e-3, and levels 0-2 must stay bit-comparable to the reference.
-            kv = _fused_norm_rope(_kv_raw, self.kv_norm, freqs, self.eps, self.rope_dim)
-        if kv is None and __import__("os").environ.get("TI_FUSED_KV2", "1") != "0":
-            # CUDA fusion, bit-identical to the pair (the tilelang norm_rope above is the
-            # one that was ~4e-3 off and could not be enabled)
-
-            kv = norm_rope_cuda(_kv_raw, self.kv_norm, freqs, self.eps, self.rope_dim)
-        if kv is None:
-            kv = rms_norm(_kv_raw, self.kv_norm, self.eps)
-            _fused = None
-            # opt-in: the fused path is verified bit-exact on synthetic inputs, but the
-            # end-to-end output regressed when it was always on, so it stays behind a flag
-            # until the integration difference is explained
-            if (getattr(self, "quant", False) and kv.is_cuda
-                    and __import__("os").environ.get("TI_FUSED_KV") == "1"):
-                # rope + fp8 round trip in one kernel (deepseek_kernels.rope_quant):
-                # exact against the two-op reference (verified 0.0)
-                _fused = rope_quant_roundtrip(kv, freqs, self.rope_dim)
-            if _fused is not None:
-                kv = _fused
-            else:
-                apply_rope(kv[..., -self.rope_dim:], freqs)
+        # KV 侧准备：rms_norm + RoPE 两步，与 reference 完全一致。
+        # 原来这里有三条路：tilelang 的 norm_rope（~4e-3 误差，默认关）、
+        # norm_rope_cuda（融合版）、以及下面这两步。前两条所属的模块已删除 ——
+        # 融合版虽然和两步路径逐位相同，但它只省一次 launch，而代价是同一份
+        # 计算有两个实现、其中一个没人测。现在只留 reference 这两步。
+        kv = rms_norm(_kv_raw, self.kv_norm, self.eps)
+        apply_rope(kv[..., -self.rope_dim:], freqs)
         # the reference quantises the window KV to fp8 (and back) AFTER RoPE -- that is
         # the form the cache holds. Order matters: skipping the round trip is a ~4.7%
         # output difference, and doing it before the rotation is a different value again.

@@ -125,16 +125,10 @@ class Compressor:
         bsc = all_sc[:, : n_groups * self.ratio]
         groups = body.unflatten(1, (-1, self.ratio))
         gscore = bsc.unflatten(1, (-1, self.ratio))
-        # DeepSeek's own TileLang pooling kernel (deepseek_kernels.compress_pool);
-        # the torch expression below is the reference it implements
-        pooled = None
-        if body.is_cuda and body.size(0) == 1:
-            pooled = compress_pool(gscore.reshape(-1, gscore.size(-1)),
-                                   groups.reshape(-1, groups.size(-1)), self.ratio)
-            if pooled is not None:
-                pooled = pooled.reshape(groups.size(0), -1, groups.size(-1))
-        if pooled is None:
-            pooled = (groups * gscore.softmax(dim=2)).sum(dim=2)
+        # 分组池化：softmax 权重加权求和。原来有一条 TileLang 的 compress_pool
+        # 快路径，随 deepseek_kernels.py 一起删除了；下面这行就是它的参考实现，
+        # 逐位等价（kernel 只是把同一串乘加塞进一个 launch）。
+        pooled = (groups * gscore.softmax(dim=2)).sum(dim=2)
         rest = total - n_groups * self.ratio
         self._pending_kv = all_kv[:, n_groups * self.ratio :].clone()
         self._pending_score = all_sc[:, n_groups * self.ratio :].clone()

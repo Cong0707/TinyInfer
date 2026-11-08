@@ -294,19 +294,9 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     # ([989,43,4571,5958] -> [223,19,17,20]). Those rows now fall through to the row
     # loop below, which is the same kernel as M=1 -- fewer launches would be nicer, but
     # identical arithmetic matters more. TI_FP8_PQ=1 restores the old path.
-    if (x.dim() == 2 and 1 < x.size(0) <= 8 and x.is_cuda
-            and __import__("os").environ.get("TI_FP8_PQ") == "1"):
-        try:
-            from .gemv_fp8 import fused_fp8_gemv_pq
-            with _bf16_default():
-                x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
-            outs = []
-            for i in range(x.size(0)):
-                outs.append(fused_fp8_gemv_pq(
-                    x_fp8[i].reshape(-1), x_s[i].reshape(-1), w_fp8, w_scale).reshape(1, -1))
-            return torch.cat(outs, dim=0)
-        except Exception:
-            pass
+    # gemv_fp8.fused_fp8_gemv_pq（TileLang）随该模块一起删除。
+    # M=2..8 落到下面的逐行 GEMV，和 M=1 用同一个 kernel —— 分块 prefill 与
+    # decode 必须同算术，这条以前就是为了这个才默认关掉的。
     if x.is_cuda:
         # Prefill runs the SAME kernel as decode, one row at a time. That is what keeps a
         # prompt's prefill and its decode consistent: routing prefill through tilelang's
@@ -424,12 +414,12 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
     # Any remaining M: row by row on the native GEMV.
     if x.is_cuda and x.dim() == 2:
         from .kernels.fp4q import fp4_act_quant
-        from .kernels.native import gemv_fp4_w4a8
+        from .kernels.vllm_fp4_gemv import gemv_fp4_w4a8
 
         rows = []
         for i in range(x.size(0)):
             aq, asc = fp4_act_quant(x[i:i + 1], act_block)
-            rows.append(gemv_fp4_w4a8(aq[0], asc[0], w_fp4, w_scale))
+            rows.append(gemv_fp4_w4a8(aq, asc, w_fp4, w_scale))
         return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
     with _bf16_default():
         x_fp8, x_s = _act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)

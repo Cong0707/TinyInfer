@@ -176,14 +176,8 @@ class Expert:
         # the fused prefill kernel is built for chunk-sized M; at M=2..8 it measured
         # 7.5x slower per layer than the GEMV path (667ms vs 89ms), so only real
         # prefill shapes use it
-        if x.size(0) > 8 and x.is_cuda:
-            # chunked prefill: one fused kernel does gate+up+silu, another does down+scale
-            try:
-                w = None if weights is None else weights.reshape(-1)
-                return fused_fp4_expert_ffn(x, w1, s1, w3, s3, w2, s2, w,
-                                            limit=float(self.swiglu_limit))
-            except Exception:
-                pass
+        # prefill 的专家融合 kernel（TileLang 的 fused_fp4_expert_ffn）已删除：
+        # M>8 直接走下面的 fp4_linear 逐次 GEMV。
         gate = fp4_linear(x, w1, s1, key=_key)
         up = fp4_linear(x, w3, s3, key=_key)
         if self.swiglu_limit > 0:
@@ -218,6 +212,8 @@ class Expert:
         # all: its module-level tilelang import was the thing that failed on a deployment
         # without tilelang, and its kernel computes a different quantisation scheme
         # (w4a16) from the one the checkpoints define.
+
+        from ..kernels.vllm_fp4_gemv import gemv_fp4_w4a8 as gemv_fp4_pq
 
         gemv_fp4_m8 = None
 
@@ -620,8 +616,11 @@ class MoE:
             tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
         try:
             from ..kernels import native
+            from ..kernels.quant import act_quant as _act_q
 
-            aq, asc = quantize_act(xf, xf.size(-1))
+            # quantize_act（TileLang 的 fp4_native）已删除，改用 CUDA 的 act_quant：
+            # 同一个 ue8m0 分块量化，走 act_quant.cubin。
+            aq, asc = _act_q(xf, 32, "ue8m0", torch.float8_e8m0fnu, True)
             # 路由计数（pin 用）。原来在 serve() 里更新，那条路删掉后这里补上：
             # 只在还没 pin 的时候统计，pin 之后路由恒定，不必再花这次 D2H。
             if (not getattr(self, "_all_pinned", False)
