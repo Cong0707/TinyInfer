@@ -48,6 +48,7 @@ def test_kernel_writes_miss_list_to_the_ring():
     # GPU 侧已经写进 host-mapped 内存，CPU 直接读得到
     assert ring.posts_so_far() == 1
     assert int(ring.host[1]) == 1
+    # 环头是 3 个 int（发布计数 / 最新序号 / 就绪计数），记录从 host[3] 开始
     reqs = ring.drain()
     assert len(reqs) == 1
     layer, ids = reqs[0]

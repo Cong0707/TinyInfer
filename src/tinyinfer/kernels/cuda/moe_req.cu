@@ -84,9 +84,10 @@ extern "C" __global__ void moe_req_post(
     int epoch,
     int* __restrict__ q) {
     // q 的布局（int32，host-mapped）:
-    //   [0]            发布序号（每条请求一个，单调递增）
-    //   [1]            本批请求条数
-    //   [2..]          每条 34 个 int: [layer, n, e0..e31]
+    //   [0]            发布计数（atomicAdd）
+    //   [1]            最新一条的序号（CPU 只读）
+    //   [2]            就绪计数（CPU 写，GPU 等）
+    //   [3..]          每条 34 个 int: [layer, n, e0..e31, epoch]
     __shared__ int s_miss[32];
     if (threadIdx.x == 0) {
         int n = 0;
@@ -96,7 +97,9 @@ extern "C" __global__ void moe_req_post(
         if (n > 0) {
             int idx = atomicAdd(q, 1);          // 领一条槽
             __threadfence();
-            int* rec = q + 2 + (idx % 64) * 34;
+            // 环头 3 个 int（发布计数 / 最新序号 / 就绪计数），记录从第 4 个开始。
+            // 这个 3 必须和 expert_queue.ExpertRequestRing.HEAD 一致。
+            int* rec = q + 3 + (idx % 64) * 34;
             rec[0] = layer;
             rec[1] = n;
             for (int i = 0; i < n; ++i) rec[2 + i] = s_miss[i];
