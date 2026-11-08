@@ -617,8 +617,13 @@ class MLACompressedAttention:
                 elif start_pos == 0:
                     fr = self.freqs_cis[:_ng * self.ratio : self.ratio]
                 else:
-                    _g0 = start_pos // self.ratio
-                    _grp = torch.arange(_g0, _g0 + _ng, device=latent.device)
+                    # 组号必须来自 device（捕获期 Python int 会被折成常量）。
+                    if torch.cuda.is_current_stream_capturing():
+                        from ..nn import _pos_buf
+                        _g0 = (_pos_buf(latent.device) // self.ratio).to(torch.long)
+                    else:
+                        _g0 = start_pos // self.ratio
+                    _grp = _g0 + torch.arange(_ng, device=latent.device)
                     fr = self.freqs_cis[_grp * self.ratio]
                 # 旋转+fp4 往返直接做在 latent 上，不再 clone。数值原因：这次 forward
                 # 里 latent 在旋转之后只被当作「旋转+量化后的结果」使用（写共享 cache、
@@ -648,7 +653,19 @@ class MLACompressedAttention:
                 start_group = start_pos // self.ratio
                 _per_row_start = None
             elif _grp0.numel() == 1:
-                start_group = start_pos // self.ratio
+                # 单行：组号就是 position // ratio。
+                #
+                # **捕获期它必须从 device 读。** 这是个纯 Python 整数，图里会被折
+                # 成常量写进切片赋值（_compress_kv[:, g0:g0+n] = latent）—— replay
+                # 多少次都往同一组写，compressed history 从第二步起就是错的。
+                #
+                # 非捕获期保持整数写法：它省掉一次对 _POS_BUF 的依赖，而 decode
+                # 每层都要用。
+                if torch.cuda.is_current_stream_capturing():
+                    from ..nn import _pos_buf
+                    start_group = (_pos_buf(x.device) // self.ratio).to(torch.long)
+                else:
+                    start_group = start_pos // self.ratio
                 _per_row_start = None
             else:
                 # batch>1：每行的压缩组起点不同（一行可能在第 3 组、另一行在第 9 组）。
@@ -658,7 +675,12 @@ class MLACompressedAttention:
                 _g2 = _grp0.reshape(b, -1) if _grp0.dim() == 1 else _grp0
                 _per_row_start = _g2[:, 0].to(torch.long)      # [b]
                 start_group = int(_per_row_start.min().item())
-            need = (start_group + latent.size(1)) if _per_row_start is None \
+            # need 只用来说明「容量够不够」，与写入位置无关，所以始终用 Python
+            # 整数算：捕获期 start_group 是 device 张量，拿它算会把张量带进
+            # shape 比较。捕获那一轮的位置就是 start_pos，用它算出的容量对之后
+            # 每一步都成立（need 每步只 +1，几何增长给的余量足够）。
+            _g0_int = int(start_pos) // self.ratio
+            need = (_g0_int + latent.size(1)) if _per_row_start is None \
                 else int(_per_row_start.max().item()) + latent.size(1)
             cur = self._compress_kv
             # The cache is shared across the kv_source group via self.rt, so it can already
@@ -700,7 +722,18 @@ class MLACompressedAttention:
                     print(f"[kv] L{getattr(self, 'layer_id', '?')} grow to {cap} groups "
                           f"({cap * self.head_dim / 2**20:.1f} MB)", flush=True)
             if _per_row_start is None:
-                self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
+                # 捕获期 start_group 是 device 张量（见上），切片赋值拿张量当下标
+                # 会退化成 aten 的 index_put 路径，语义不稳定。统一用 index_copy_：
+                # 单行时下标就是 [g0, g0+1, ..., g0+n-1]，与切片等价。
+                if torch.is_tensor(start_group):
+                    _n2 = int(latent.size(1))
+                    _idx2 = (start_group.reshape(1) + torch.arange(
+                        _n2, device=latent.device, dtype=torch.long)).reshape(1, -1) \
+                        .expand(b, -1)
+                    for _r2 in range(b):
+                        self._compress_kv[_r2].index_copy_(0, _idx2[_r2], latent[_r2])
+                else:
+                    self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
             else:
                 # 逐行写：第 r 行从它自己的组起点开始，写 latent.size(1) 个组。
                 # 用 index_copy_ 而不是 Python 循环切片 —— 下标是 device tensor，
