@@ -89,3 +89,68 @@ def test_miss_count_kernel_matches_python():
     torch.cuda.synchronize()
     assert flag.host.value == 3, flag.host.value
     _ = ring
+
+
+def test_server_answers_requests_and_bumps_ready():
+    """卖家线程收到订单、备货、把就绪计数加一 —— 全程主机侧不等。"""
+    _cuda()
+    import time
+
+    from tinyinfer.expert_queue import ExpertServer
+
+    class Mgr:
+        def __init__(self):
+            self.seen = []
+            self.stats = {}
+
+        def need(self, layer, ids):
+            self.seen.append((layer, list(ids)))
+            return len(ids)
+
+    mgr = Mgr()
+    ring = ExpertRequestRing()
+    ready = ReadyFlag()
+    srv = ExpertServer(mgr, ring, ready, poll_us=1000)
+    srv.start()
+    try:
+        # GPU 侧排两条请求（这里用 python 直接写环，等价于 kernel 写完）
+        for seq, (layer, ids) in enumerate([(0, [1, 2]), (5, [7])]):
+            rec = ring.HEAD + (seq % ring.SLOTS) * ring.STRIDE
+            ring.host[rec] = layer
+            ring.host[rec + 1] = len(ids)
+            for i, e in enumerate(ids):
+                ring.host[rec + 2 + i] = e
+        ring.host[1] = 2
+        ring._seen = 0
+        deadline = time.time() + 5.0
+        while ready.value < 1 and time.time() < deadline:
+            time.sleep(0.005)
+        assert ready.value >= 1, "the server never acknowledged the batch"
+        assert mgr.seen == [(0, [1, 2]), (5, [7])], mgr.seen
+    finally:
+        srv.stop()
+
+
+def test_server_idles_without_spinning():
+    """没有请求时不该 100% 占一个核（空转是用户明确不要的东西）。"""
+    _cuda()
+    import time
+
+    from tinyinfer.expert_queue import ExpertServer
+
+    class Mgr:
+        stats = {}
+
+        def need(self, layer, ids):
+            raise AssertionError("no request was made")
+
+    srv = ExpertServer(Mgr(), ExpertRequestRing(), ReadyFlag(), poll_us=2000)
+    srv.start()
+    try:
+        t0 = time.process_time()
+        time.sleep(0.4)
+        used = time.process_time() - t0
+        assert used < 0.3, f"idle server burned {used:.2f}s of CPU"
+    finally:
+        srv.stop()
+

@@ -140,3 +140,82 @@ class ReadyFlag:
     def reset(self) -> None:
         self.value = 0
         self.host.value = 0
+
+
+class ExpertServer:
+    """GPU 是买家、CPU 是卖家：这个线程就是「卖家」。
+
+    它循环做一件事：把 GPU 通过 host-mapped 环丢过来的缺失表取走，按
+    显存 -> 内存 -> 磁盘 的顺序备货，每备好一批就把就绪计数加一。GPU 那边
+    在流里等这个计数，主机侧一次都不用等。
+
+    为什么是线程而不是在 forward 里同步做：forward 里同步做就是每层一次
+    停顿（实测 130ms/token）。放到线程里之后，上一层 kernel 还在跑，这一层
+    的专家已经在路上了 —— 这就是「CPU 不过多过问 GPU 干的活」。
+    """
+
+    def __init__(self, manager, ring: ExpertRequestRing, ready: ReadyFlag,
+                 *, poll_us: int = 200):
+        self.mgr = manager
+        self.ring = ring
+        self.ready = ready
+        self.poll_us = int(poll_us)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._idle = threading.Event()
+        self.served = 0
+        self.batches = 0
+        self.errors = 0
+
+    def start(self) -> bool:
+        if self._thread is not None:
+            return False
+        t = threading.Thread(target=self._run, name="expert-server", daemon=True)
+        t.start()
+        self._thread = t
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=5.0)
+        self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                batch = self.ring.drain()
+            except Exception:
+                batch = []
+            if not batch:
+                self._idle.set()
+                # 空闲时不要空转：CPU 该去把还没进内存的专家预热进来
+                self._stop.wait(self.poll_us / 1e6)
+                continue
+            self._idle.clear()
+            placed = 0
+            for layer, ids in batch:
+                try:
+                    placed += int(self.mgr.need(layer, ids) or 0)
+                    self.served += len(ids)
+                except Exception:
+                    self.errors += 1
+            self.batches += 1
+            # 备完了（不论是否真的搬了新的）就通知 GPU：它可以继续读这一批。
+            try:
+                self.ready.bump()
+            except Exception:
+                self.errors += 1
+
+    def pending(self) -> int:
+        try:
+            return len(self.ring.drain())
+        except Exception:
+            return 0
+
+    def stats(self) -> dict:
+        return {"served": self.served, "batches": self.batches,
+                "errors": self.errors, "ready": self.ready.value,
+                "tiers": dict(getattr(self.mgr, "stats", {}))}
+
