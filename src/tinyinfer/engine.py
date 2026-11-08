@@ -1594,11 +1594,26 @@ class Engine:
             # sids = [7, 6, 11, -1, -1, 13]，输出 absmax 2.36e37。
             _keep_buf = bool(getattr(self, "_graph_captured_done", False))
             if _keep_buf:
-                # 捕获刚结束：图已经把捕获期 buffer 的地址记进 kernel 参数了，
-                # 这里**什么都不能改** —— 包括不能把 _kv_window 设成 None。
-                # （上一版写成 _kv = None 再统一赋值，等于把 buffer 摘掉，
-                #   图里那些地址立刻成了已释放内存。）
-                _kv = "KEEP"
+                # 捕获刚结束：图里的 kernel 已经记下了捕获期那块 buffer 的地址，
+                # 而且那块显存属于 graph pool —— **必须留一份引用**，否则图里就是
+                # 已释放地址（实测输出 2.36e37）。
+                #
+                # 但不能像上一版那样让 _states 继续指向它：graph pool 的显存在图
+                # 之外读写是未定义行为，捕获之后 eager 再用同一块地址就会踩到
+                # 别人的内容 —— 实测捕获后 eager 直接出 nan（embedding 和 ids 都
+                # 校验过没变，坏的是 KV 状态）。
+                #
+                # 所以分家：图留池里的地址，Python 侧换成一块普通显存。
+                _gbufs = getattr(self, "_graph_bufs", None)
+                if _gbufs is None:
+                    _gbufs = {}
+                    self._graph_bufs = _gbufs
+                _cur = a._kv_window
+                if _cur is not None:
+                    _gbufs[i] = _cur          # 钉住，图退役前不许回收
+                    _kv = _cur.clone()        # eager 走这一份
+                else:
+                    _kv = None
             elif entry.get("kv") is None:
                 _kv = None
             else:
