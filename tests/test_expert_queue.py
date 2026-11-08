@@ -146,12 +146,23 @@ def test_server_idles_without_spinning():
             raise AssertionError("no request was made")
 
     srv = ExpertServer(Mgr(), ExpertRequestRing(), ReadyFlag(), poll_us=2000)
+    # 只数这个线程自己的 drain 次数，不要用 time.process_time() ——
+    # 那是整个进程的 CPU 时间，包含 torch 的 CUDA 后台线程，实测在跑过
+    # 模型之后会报到 1.8s，和这个服务器线程无关（单独量它是 0.000s）。
+    calls = {"n": 0}
+    _drain = srv.ring.drain
+
+    def _counted():
+        calls["n"] += 1
+        return _drain()
+
+    srv.ring.drain = _counted
     srv.start()
     try:
-        t0 = time.process_time()
         time.sleep(0.4)
-        used = time.process_time() - t0
-        assert used < 0.3, f"idle server burned {used:.2f}s of CPU"
+        # poll_us=2000 -> 400ms 里最多几百次；空转的话会是几十万次
+        assert calls["n"] < 1000, f"the idle server polled {calls['n']} times in 0.4s"
+        assert calls["n"] > 0, "the server never polled at all"
     finally:
         srv.stop()
 
