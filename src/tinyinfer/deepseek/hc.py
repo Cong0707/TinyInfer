@@ -73,9 +73,29 @@ def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
             _split = None
     if _split is not None:
         mx = mixes if mixes.is_contiguous() else mixes.contiguous()
-        pre = torch.empty((b, s, hc), dtype=mixes.dtype, device=mixes.device)
-        post = torch.empty_like(pre)
-        comb = torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device)
+        # **捕获期这四个输出必须常驻。**
+        # pre/post/comb/out 会被跨层使用：hc_mixes 返回的 attn_pre 要等本层的 ffn
+        # 那一步才用（Block.forward 第 393 行），post/comb 要喂给 hc_post。图里它们在
+        # graph pool 里分配，跨 kernel 存活时地址归谁取决于池里的残局。
+        if torch.cuda.is_current_stream_capturing():
+            _ring = _CAP_MIX_OUT.get((b, s, hc, mixes.dtype))
+            if _ring is None or _ring[0][0].device != mixes.device:
+                _ring = [(
+                    torch.empty((b, s, hc), dtype=mixes.dtype, device=mixes.device),
+                    torch.empty((b, s, hc), dtype=mixes.dtype, device=mixes.device),
+                    torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device),
+                    torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device),
+                ) for _ in range(8)]
+                _CAP_MIX_OUT[(b, s, hc, mixes.dtype)] = _ring
+                _CAP_MIX_IDX[(b, s, hc, mixes.dtype)] = 0
+            _i = _CAP_MIX_IDX[(b, s, hc, mixes.dtype)]
+            pre, post, comb, _outres = _ring[_i]
+            _CAP_MIX_IDX[(b, s, hc, mixes.dtype)] = (_i + 1) % len(_ring)
+        else:
+            pre = torch.empty((b, s, hc), dtype=mixes.dtype, device=mixes.device)
+            post = torch.empty_like(pre)
+            comb = torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device)
+            _outres = None
         _split(mx.reshape(n, 2 * hc + hc * hc), hc_scale.reshape(-1), hc_base.reshape(-1),
                pre.view(n, hc), post.view(n, hc), comb.view(n, hc * hc),
                n, float(eps), int(iters), stream=None)
@@ -85,7 +105,7 @@ def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
         post = 2.0 * torch.sigmoid(mixes[..., hc:2 * hc] * hc_scale[1] + hc_base[hc:2 * hc])
         comb = (mixes[..., 2 * hc:].view(b, s, hc, hc) * hc_scale[2]
                 + hc_base[2 * hc:].view(hc, hc)).contiguous()
-    out = torch.empty_like(comb)
+    out = _outres if _outres is not None else torch.empty_like(comb)
     # Bound launcher: sinkhorn_hc runs twice per layer (80 times per decode step) and the
     # generic launch path charges ~19 us of argument marshalling for a kernel that does a
     # 4x4 normalisation loop. Keyed on the geometry, which only depends on the batch shape.
@@ -258,6 +278,8 @@ _CAP_PRE_MIX: dict = {}
 _CAP_PRE_MIX_IDX: dict = {}
 _CAP_POST_OUT: dict = {}
 _CAP_POST_IDX: dict = {}
+_CAP_MIX_OUT: dict = {}
+_CAP_MIX_IDX: dict = {}
 # dynamic shared memory holds one fp32 row; beyond this the fused path is not worth the
 # opt-in attribute call, so the two-kernel chain stays in charge
 _PRE_NORM_MAX_D = 8192
@@ -433,19 +455,9 @@ class HCBlockMixin:
 
     def hc_mixes(self, x, hc_fn, hc_scale, hc_base):
         """x: [b,s,hc,d] -> pre/post/comb coefficients (fused kernel on CUDA)."""
-        global _FUSED_MIXES_OK
-        if x.is_cuda and _FUSED_MIXES_OK:
-            try:
-                from .hc_fused import fused_hc_mixes, fused_sinkhorn
-                b, s = x.shape[0], x.shape[1]
-                x2 = x.reshape(b * s, -1).to(torch.bfloat16)
-                raw = fused_hc_mixes(x2, hc_fn.float(), self.hc_eps)  # [b*s, 24] fp32
-                pre, post, comb = fused_sinkhorn(raw, hc_scale.float(), hc_base.float(),
-                                                 self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
-                return (pre.view(b, s, self.hc_mult), post.view(b, s, self.hc_mult),
-                        comb.view(b, s, self.hc_mult, self.hc_mult))
-            except Exception:
-                _FUSED_MIXES_OK = False
+        # hc_fused 这个模块已经随 tilelang 一起删掉了，原来这里还留着一段
+        # "from .hc_fused import ..." 靠 _FUSED_MIXES_OK 挡着。它每次首次进入都抛
+        # ImportError 再被 except 吞掉 —— 静默降级正好掩盖了「真正的实现被删了」。
         # NOTE: a fused hc_mixes kernel (native/hc.cu, hc_mixes_f/_bf) exists and matches the
         # eager projection to ~2.9e-6, but that is not bit-identical: the torch path goes
         # through F.linear (cuBLAS tile order) while the kernel reduces with a warp tree.

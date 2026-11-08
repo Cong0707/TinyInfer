@@ -2994,7 +2994,8 @@ class Engine:
                 # 和上一次捕获的位置错开，两张图共用池时会互相踩。
                 try:
                     from .deepseek import hc as _hcm
-                    for _nm in ("_CAP_PRE_IDX", "_CAP_PRE_MIX_IDX", "_CAP_POST_IDX"):
+                    for _nm in ("_CAP_PRE_IDX", "_CAP_PRE_MIX_IDX", "_CAP_POST_IDX",
+                                "_CAP_MIX_IDX"):
                         getattr(_hcm, _nm).clear()
                 except Exception:
                     pass
