@@ -1425,9 +1425,26 @@ class Engine:
             from .deepseek.compressor import shared_attn as _sa0
             for _attr in ("_mask_cache", "candidates_by_chunk", "candidates",
                           "compress_kv", "topk_idxs"):
-                if hasattr(_sa0, _attr):
+                if not hasattr(_sa0, _attr):
+                    continue
+                _v = getattr(_sa0, _attr)
+                if _v is None:
+                    continue
+                if torch.is_tensor(_v):
+                    # **不能把 tensor 设成 None**：它是压缩 KV 的存储，attention 的
+                    # consumer 层直接读它。以前这里对 tensor 调 .clear() —— tensor
+                    # 没有这个方法，AttributeError 被吞掉后走 setattr(..., None)，
+                    # 于是 reset() 之后 compress_kv 变成 None，而 decode 路径**不会
+                    # 重建它**：实测 prefill -> reset -> decode 得到全 NaN，且
+                    # decode 之后 compress_kv 仍然是 None。
+                    # 正确做法是清内容、保存储（槽位/形状不变，consumer 可直接读）。
                     try:
-                        getattr(_sa0, _attr).clear()
+                        _v.zero_()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        _v.clear()
                     except AttributeError:
                         setattr(_sa0, _attr, None)
         except Exception:
