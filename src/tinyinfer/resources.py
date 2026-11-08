@@ -542,8 +542,21 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # Slots are expert staging buffers. A model with no routed experts (Qwen, dense
     # models) must not reserve any: holding 12 x 18.8MB out of an 8GB card streamed 7 of
     # Qwen's 24 layers for nothing, and the model fits entirely.
-    has_experts = expert_b > 0.5 * MB and float(model.get("topk", 0) or 0) > 0
-    MIN_SLOTS = 12 if has_experts else 0
+    # **槽位是唯一路径，没有「无槽位」这个分支。**
+    #
+    # 原来的判据是 `expert_b > 0.5MB and topk > 0`，topk 从 model dict 里取，
+    # 默认 0。于是任何没显式传 topk 的调用方都会得到 has_experts=False，
+    # 进而 expert_b=0、slots=0，整个引擎退到「专家不进显存」的那条路 ——
+    # 实测 5060 上就是这样：vram 6.9GB、只驻留 12 层，却算出 slots=0。
+    #
+    # 有路由专家就必须有槽位：模型几何里 expert_b 就是专家的真实字节数，
+    # 它大于 0 就说明这个 checkpoint 有 routed experts，和 topk 传没传无关。
+    # topk 只用来算「一步要几个槽位」（need_slots），不用来决定有没有槽位。
+    _topk_hint = int(float(model.get("topk", 0) or 0))
+    has_experts = expert_b > 0.5 * MB
+    # 最少 1 个：再小的卡也要有一个能装专家的格子，计算时按需换进换出。
+    # 12 是「两层 x topk 6」的下限，够 decode 一步的 MoE 不中途换出。
+    MIN_SLOTS = max(1, min(12, 2 * _topk_hint)) if has_experts else 0
     if not has_experts:
         expert_b = 0.0
 

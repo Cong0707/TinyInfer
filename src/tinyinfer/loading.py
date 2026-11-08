@@ -2183,8 +2183,14 @@ class VramSlotCache:
 
     # -- infrastructure ---------------------------------------------------
     def _ensure(self):
-        if self._buffers or self.slots == 0 or getattr(self, "_paused", False):
+        if self._buffers or getattr(self, "_paused", False):
             return
+        if self.slots <= 0:
+            # 槽位池是唯一路径，0 个槽位没法走到任何地方。原来这里是静默 return，
+            # 于是引擎一路跑到「专家不进显存」，谁都没发现。
+            raise RuntimeError(
+                "VRAM slot pool has 0 slots; the planner must reserve at least one "
+                "(TI_SLOTS overrides)")
         import torch
         self._torch = torch
         # 记下 planner 给的保守值，reinit 失败时用它回退
@@ -3016,8 +3022,17 @@ class VramSlotCache:
                     continue
                 idx = self._reserve_locked(key)
                 if idx is None:
-                    # no evictable slot: degrade to the RAM record instead of blocking/crashing
-                    return -1, False
+                    # 池子满了且暂时没有可淘汰的槽位（全部 refs>0 或 pinned）。
+                    # 这不是错误也不是「退到 RAM」—— 等别的调用方 release，
+                    # 腾出槽位再来。槽位是唯一路径，等待是它唯一的正确语义。
+                    # 原来这里返回 (-1, False) 让上层从 RAM 读，绕开了 device
+                    # 侧的 slot_table，于是同一份计算有两个实现。
+                    if not self._cond.wait(timeout=30.0):
+                        raise RuntimeError(
+                            f"VRAM slot pool exhausted for {key} "
+                            f"(slots={self.slots}, all busy or pinned for 30s); "
+                            f"a caller is holding slots without releasing them")
+                    continue
                 self._refs[idx] = 1
                 self._state[idx] = self.IN_USE
                 return idx, False
@@ -3046,7 +3061,9 @@ class VramSlotCache:
                     continue
                 idx = self._reserve_locked(key)
                 if idx is None:
-                    out.append((-1, False))
+                    # 批量路径不能阻塞（它被 decode 的热路径调用）：把整批交给
+                    # 单条 acquire()，由那条路径等待并重试。
+                    out.append(None)
                     continue
                 self._refs[idx] = 1
                 self._state[idx] = self.IN_USE
@@ -3526,25 +3543,14 @@ class ExpertStore:
             return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors,
                                 self.device, self.slots.event(slot))
 
-        # 数据已经在 GPU 可寻址的内存里（cudaMallocManaged）：权重是常量、地址
-        # 永远不变，所以直接把这个地址交给 kernel，不再拷进显存槽位。
-        # 这才是「按地址寻专家」—— CPU 不再决定搬谁，也就没有那个每层 3.3ms
-        # 的 tolist 同步。热点页由驱动留在显存（661 GB/s）。
+        # **第三条绕过槽位的路也删掉了。**
+        # 原来这里有一段：数据若已在 cudaMallocManaged 的 GPU 可寻址内存里，
+        # 就直接把那个地址交给 kernel，不拷进槽位。它比 RAM 退化更隐蔽 ——
+        # 地址对 kernel 是合法的，结果也算得对，但这条路上没有 slot_table，
+        # 于是 CUDA graph 捕获时图里缺一个分支，replay 之后数值不一致。
+        # 按「槽位是唯一路径」处理：专家一律进槽位，地址永远由 slot_id 算出来。
         if data is None:
             data = self.ram.get(layer, expert) if cache else self.ram.get(layer, expert, admit=False)
-        if data is not None and _gpu_addressable(data):
-            # 接管缺页：页不在显存时驱动会逐页 fault（6.7 GB/s）。先显式批量迁移
-            # 整块（20.9 GB/s，3 倍），且异步 —— kernel 读的时候它已经在飞。
-            try:
-                import ctypes as _c
-                from .budget import _managed_prefetch
-                _nb = int(getattr(data, "nbytes", len(data)))
-                if _nb > 0:
-                    _managed_prefetch(
-                        _c.addressof(_c.c_char.from_buffer(data)), _nb)
-            except Exception:
-                pass
-            return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
 
         if data is not None:
             # the batch read already produced these bytes; looking them up in the RAM
@@ -3560,12 +3566,20 @@ class ExpertStore:
             with self._lock:
                 self._stream_reads += 1
                 self._stream_bytes += int(getattr(data, "nbytes", len(data)))
-        if self.slots is None or self.slots.slots == 0:
-            return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
+        # **槽位是唯一路径。**
+        # 原来这里有两处退化：没有槽位池就返回 CPU 记录；acquire 拿不到槽位
+        # （slot < 0）也返回 CPU 记录。两条都绕开了 device 侧的 slot_table，
+        # 意味着同一份计算存在「走槽位」和「不走槽位」两种实现，而后者在
+        # CUDA graph 里根本不存在 —— 图内只有间接寻址那一条。
+        # 删掉之后：槽位必须存在，拿不到就由 acquire 抛出来。
+        if self.slots is None or self.slots.slots <= 0:
+            raise RuntimeError(
+                f"expert slot pool is required but absent "
+                f"(layer={layer} expert={expert}); the planner must reserve slots")
         if slot is None:
             slot, ready = self.slots.acquire(layer, expert)
-        if slot < 0:  # no VRAM slot available: serve straight from the RAM cache
-            return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
+        if slot is None or slot < 0:
+            raise RuntimeError(f"no VRAM slot for layer {layer} expert {expert}")
         if ready:
             return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors,
                                 self.device, self.slots.event(slot))
@@ -3681,13 +3695,12 @@ class ExpertStore:
             # decode 传 cache=False，于是已经驻留在槽位里的专家照样被判定成 miss，
             # 每层六个专家每次都重新走一遍读盘/搬运，白白多出六个
             # cudaStreamWaitEvent。查槽位是只读操作，任何时候都该做。
-            if (self.slots is not None and self.slots.slots > 0):
-                for _e in experts:
-                    try:
-                        if self.slots.has(layer, _e):
-                            _slot_have.add(_e)
-                    except Exception:
-                        pass
+            for _e in experts:
+                try:
+                    if self.slots.has(layer, _e):
+                        _slot_have.add(_e)
+                except Exception:
+                    pass
             # 只要不在槽位里就要装（哪怕 RAM 里有）：RAM 命中只是「不用读盘」，
             # 不等于「已经在显存里」。原来的条件是「RAM 没有 且 槽位没有」，于是
             # RAM 全命中时一个槽位都不分配，表里全是 -1。
@@ -3797,7 +3810,7 @@ class ExpertStore:
         # 不涉及 admit；被 cache=False 挡掉的后果是 decode 每层六个专家全部走到
         # _materialize 重新 H2D 一遍，每次都带回一个 cudaEvent，于是每层多六次
         # cudaStreamWaitEvent（实测 6/层、240/token）。
-        if self.slots is not None and self.slots.slots > 0 and len(experts) > 1:
+        if len(experts) > 1:
             acquired = self.slots.acquire_many(layer, experts)
         by_expert = {b.key[1]: d for b, d in zip(blobs, datas)} if blobs and datas else {}
         records = []
@@ -3820,8 +3833,8 @@ class ExpertStore:
         Runs on a background thread: the RAM fetch and the copy-stream DMA proceed while
         the main thread keeps computing (acquire() waits on the per-slot event).
         """
-        if self.slots is None or self.slots.slots == 0:
-            return 0
+        if self.slots is None or self.slots.slots <= 0:
+            raise RuntimeError("vram_prefetch needs a slot pool; none was allocated")
         experts = [int(e) for e in experts]
         if getattr(self, "_vram_executor", None) is None:
             import concurrent.futures
