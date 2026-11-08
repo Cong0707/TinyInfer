@@ -1,36 +1,29 @@
-import sys, time, torch
+"""手动 chunk=32 且带 reset_prefill_pool，复现 cold NaN。"""
+import sys, torch
 sys.path.insert(0, r"E:\Develop\Deepseek\tinyinfer\src")
 from tinyinfer.engine import Engine
 from tinyinfer.tiers import OptLevel
-from tinyinfer.chat import encode_messages
 from transformers import AutoTokenizer
-
-MODEL = r"E:\models\DeepSeek-V4.1-Flash-1017"
-tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-e = Engine(MODEL, tier=OptLevel.AGGRESSIVE, device="cuda", layers=list(range(40)), tokenizer=tok)
-q = "1+1 等于几？只回答数字。"
+M = r"E:\models\DeepSeek-V4.1-Flash-1017"
+tok = AutoTokenizer.from_pretrained(M, trust_remote_code=True)
+e = Engine(M, tier=OptLevel.AGGRESSIVE, device="cuda", layers=[0], tokenizer=tok)
+base = tok.encode("你好今天天气不错", add_special_tokens=False)
+N = 2048
+ids = torch.tensor([(base*2000)[:N]], device="cuda")
+STEP = int(sys.argv[1])
+DORESET = sys.argv[2] == "1"
+print("STEP=%d reset=%s" % (STEP, DORESET), flush=True)
 e.reset()
-ids = torch.tensor([tok.encode(encode_messages([{"role": "user", "content": q}]),
-                    add_special_tokens=False)], dtype=torch.long, device="cuda")
-logits = None
-for p in range(ids.shape[1]):
-    logits = e.forward(ids[:, p:p+1], p)
-pos = ids.shape[1]
-# 逐步计时，看时间花在哪一层
-nxt = int(logits[0, -1].float().argmax())
-spans = []
-for i in range(6):
+store = getattr(e, "expert_store", None)
+bad = -1
+for off in range(0, N, STEP):
+    lg = e._forward_chunk(ids[:, off:off+STEP], off)
+    if DORESET and store is not None:
+        r = getattr(store, "reset_prefill_pool", None)
+        if r is not None:
+            r()
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    logits = e.forward(torch.tensor([[nxt]], dtype=torch.long, device="cuda"), pos)
-    torch.cuda.synchronize()
-    dt = (time.perf_counter() - t0) * 1e3
-    spans.append(dt)
-    nxt = int(logits[0, -1].float().argmax())
-    pos += 1
-print("STEP_MS " + " ".join("%.0f" % s for s in spans), flush=True)
-prof = getattr(e, "_expert_store", None)
-if prof is not None and getattr(prof, "slots", None) is not None:
-    sl = prof.slots
-    print("slot loads=%d evict=%d hits=%d bykey=%d" %
-          (sl.loads, sl.evictions, sl.hits, len(sl._by_key)), flush=True)
+    if not bool(torch.isfinite(lg).all()):
+        bad = off
+        break
+print("RESULT STEP=%d reset=%s bad_chunk=%d" % (STEP, DORESET, bad), flush=True)

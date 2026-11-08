@@ -100,7 +100,14 @@ def _cudart():
         import torch
 
         lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
-        for path in glob.glob(os.path.join(lib_dir, "cudart*.dll")):
+        # Windows 的 cudart 是 cudart64_XX.dll；Linux 是 libcudart.so.XX。
+        # 以前只 glob 了 .dll，于是**在 Linux（L20 部署机）上永远找不到 cudart**，
+        # async 专家流水线直接降级成逐层同步路径 —— 实测 L20 上刷了 20 行
+        # "[async] expert pipeline unavailable (cudart not found)"，
+        # 那正是「GPU 主动下单、CPU 立刻推送」这条设计的载体。
+        _cands = (glob.glob(os.path.join(lib_dir, "cudart*.dll"))
+                  + glob.glob(os.path.join(lib_dir, "libcudart*.so*")))
+        for path in _cands:
             try:
                 lib = ctypes.CDLL(path)
                 lib.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p),
