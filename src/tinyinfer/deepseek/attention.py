@@ -309,6 +309,21 @@ class MLAWindowAttention:
         if _pos2d is not None and b > 1:
             freqs = self.freqs_cis.index_select(0, _pos2d.reshape(-1))
             freqs = freqs.view(b, s, -1)
+        elif torch.cuda.is_current_stream_capturing():
+            # **捕获期不能用 self.freqs_cis[start_pos:start_pos+s] 这个切片。**
+            #
+            # 切片的 data_ptr 由 start_pos 决定，图里固化成常量地址；replay 时
+            # 无论真正的 position 是多少，RoPE 都用捕获那一刻那一段频率。位置
+            # 越往后错得越多，实测图里解码输出退化成 '<｜begin▁of▁sentence｜># 关于“
+            # 关于“ 关于“新' 这种复读。
+            #
+            # 这里改成一块挂在 self 上的常驻 buffer（形状 [s, rot/2] 的复数），
+            # 图内只读它的地址，_graph_run 每次 replay 前用 refresh_cos_sin 覆盖内容。
+            _fr = getattr(self, "_graph_freqs", None)
+            if _fr is None or _fr.shape[0] != s:
+                _fr = self.freqs_cis[:s].clone()
+                self._graph_freqs = _fr
+            freqs = _fr
         else:
             freqs = self.freqs_cis[start_pos:start_pos + s]
 

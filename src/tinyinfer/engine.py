@@ -2804,6 +2804,13 @@ class Engine:
                     continue
                 _seen.add(_k)
                 refresh_cos_sin(_tbl, start_pos, int(ids.shape[1]))
+                # 窗口层（MLAWindowAttention）捕获期把 freqs 换成了挂在 self 上的
+                # 常驻 _graph_freqs（普通切片会被图钉死成捕获那一刻的地址）。
+                # 这里把当前 position 的频率覆盖进去。
+                _gf = getattr(_att, "_graph_freqs", None)
+                if _gf is not None:
+                    _n = int(_gf.shape[0])
+                    _gf.copy_(_tbl[start_pos:start_pos + _n])
                 # 窗口索引用的位置 buffer：图外写值，图内读同一块地址。
                 from . import nn as _nnmod
                 if getattr(_nnmod, "_POS_BUF", None) is not None:
