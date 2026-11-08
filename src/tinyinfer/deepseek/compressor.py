@@ -267,7 +267,19 @@ class Indexer:
         q = F.linear(qr.float(), self.wq_b).view(b, s, self.n_heads, self.head_dim)
         apply_rope(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
 
+        # **t 必须由实际的 key 缓存宽度决定，不能只看 end_pos // ratio。**
+        # ratio 在非 kv_source 层来自共享的 self.rt.src_ratio，那个字段由**最近
+        # 跑过的 kv_source 层**写（kv_source_layer_ids=[2,8,14,20]，ratio 分别
+        # 2,2,2,1）。当层次序或复用顺序变化时，某一层可能拿到别组的 ratio，
+        # 于是 end_pos // ratio 算出一个宽度，与实际 index_k 里可用的组数不符；
+        # 随后 mask（按 t 建）与 score（按 index_k 的宽度建）对不上：
+        #   RuntimeError: size of tensor a (67) must match b (65)
+        # 实测这条错误打断 decode 的每一步（位置递增时必现）。
+        # 正确做法：t = min(理论组数, 缓存里真有这么多组)。
         t = end_pos // ratio
+        _kn = 0 if self.rt.index_k is None else int(self.rt.index_k.size(1))
+        if _kn > 0:
+            t = min(int(t), _kn)
         if t <= 0:
             return torch.empty(b, s, 0, dtype=torch.int32, device=x.device)
         index_k = self.rt.index_k[:, :t]
