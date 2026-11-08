@@ -319,10 +319,10 @@ class MLAWindowAttention:
             #
             # 这里改成一块挂在 self 上的常驻 buffer（形状 [s, rot/2] 的复数），
             # 图内只读它的地址，_graph_run 每次 replay 前用 refresh_cos_sin 覆盖内容。
-            _fr = getattr(self, "_graph_freqs", None)
+            _fr = self._st().get("_graph_freqs")
             if _fr is None or _fr.shape[0] != s:
-                _fr = self.freqs_cis[:s].clone()
-                self._graph_freqs = _fr
+                _fr = self.freqs_cis[start_pos:start_pos + s].clone().contiguous()
+                self._st()["_graph_freqs"] = _fr
             freqs = _fr
         else:
             freqs = self.freqs_cis[start_pos:start_pos + s]

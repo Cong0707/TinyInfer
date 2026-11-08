@@ -2805,24 +2805,32 @@ class Engine:
             # 其余层在 replay 里用的是捕获那一刻的 cos/sin —— 位置对不上，
             # 注意力权重全错。实测症状：L0 单独捕获数值逐位正确，加进 L1 之后
             # 整张图的输出恒为 0.0（精确的 0，不是垃圾值）。
-            _seen = set()
+            # **按 attn 实例刷，不能按表去重。**
+            #
+            # 40 层共用同一张 freqs_cis（get_table 按 _rope_key 缓存），所以
+            # 按 data_ptr 去重只会刷到第一层。但每层的 _graph_freqs 是各自独立的
+            # 常驻 buffer（图里引用的是各层自己那块地址），只刷一层等于其余 39 层
+            # 的 RoPE 一直停在捕获那一刻的位置上 —— 位置越往后错得越多。
+            _seen_tbl = set()
             for _b in _blocks:
                 _att = getattr(_b, "attn", None)
                 _tbl = getattr(_att, "freqs_cis", None)
                 if _tbl is None:
                     continue
                 _k = int(_tbl.data_ptr())
-                if _k in _seen:
-                    continue
-                _seen.add(_k)
-                refresh_cos_sin(_tbl, start_pos, int(ids.shape[1]))
+                if _k not in _seen_tbl:
+                    _seen_tbl.add(_k)
+                    refresh_cos_sin(_tbl, start_pos, int(ids.shape[1]))
                 # 窗口层（MLAWindowAttention）捕获期把 freqs 换成了挂在 self 上的
                 # 常驻 _graph_freqs（普通切片会被图钉死成捕获那一刻的地址）。
-                # 这里把当前 position 的频率覆盖进去。
-                _gf = getattr(_att, "_graph_freqs", None)
+                # 这里把当前 position 的频率覆盖进去 —— 每层各自刷。
+                _lid = getattr(_b, "layer_id", getattr(_att, "layer_id", None))
+                _stl = getattr(_att, "_states", {}).get(_lid) if _lid is not None else None
+                _gf = None if not _stl else _stl.get("_graph_freqs")
                 if _gf is not None:
                     _n = int(_gf.shape[0])
-                    _gf.copy_(_tbl[start_pos:start_pos + _n])
+                    if _n > 0 and start_pos + _n <= _tbl.shape[0]:
+                        _gf.copy_(_tbl[start_pos:start_pos + _n])
                 # 窗口索引用的位置 buffer：图外写值，图内读同一块地址。
                 from . import nn as _nnmod
                 if getattr(_nnmod, "_POS_BUF", None) is not None:
