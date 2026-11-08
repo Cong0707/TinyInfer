@@ -532,9 +532,32 @@ class MoE:
         # 多行 prefill 分批：整批 6 行要 1440 个 (layer, expert) 槽位，8GB 卡的
         # 池子撑不住，3 行一批（720）才放得下。这是小卡能跑起来的前提，不能去掉。
         # 每批之间必须先同步再换参数（见下），否则异步 kernel 会读到被复用的显存。
-        # 分批阈值。3 是小卡能跑起来的前提（见下），但 TI_MOE_BATCH 可以调大，
-        # 用来排查「分批是否是某个行位置出错的成因」。
-        _moe_bs = int(__import__("os").environ.get("TI_MOE_BATCH", "3") or "3")
+        # 分批阈值：**由槽位池容量决定，不写死**。
+        #
+        # 分批的初衷：一次 `rows * topk` 个专家请求如果超出槽位池，池子会在
+        # 这一批里反复覆盖，命中率归零。11 行 x 6 = 66 个请求 vs 8GB 卡的 14 个
+        # 槽位 —— 必须分；L20 的 1359 个槽位 —— 66 个绰绰有余，根本不需要分。
+        #
+        # 而且实测（docs/nan_batch_verdict.md）：**分批路径有多行 NaN bug**，
+        # 位置随批次大小移动、加任何 hook 就消失（数据竞争，打印法追不到）。
+        # 不分批时 N=8/11/12/16/20 全部正确。
+        #
+        # 所以默认策略是：槽位够就**整批跑**（正确且更快），不够才分批。
+        _env_bs = __import__("os").environ.get("TI_MOE_BATCH")
+        if _env_bs:
+            _moe_bs = max(1, int(_env_bs))
+        else:
+            _rows = int(xf.size(0))
+            _topk = max(1, int(indices.numel()) // max(1, _rows))
+            _sl = getattr(getattr(self, "_expert_store", None), "slots", None)
+            _cap = int(getattr(_sl, "slots", 0) or 0)
+            _need = _rows * _topk
+            if _cap <= 0 or _cap >= _need:
+                # 装得下（或没有槽位池）：整批，不分批
+                _moe_bs = max(_rows, 1)
+            else:
+                # 只装得下一部分：按「一批不超过容量」切
+                _moe_bs = max(1, _cap // _topk)
         if xf.size(0) > _moe_bs:
             _outs = []
             for _s0 in range(0, xf.size(0), _moe_bs):
