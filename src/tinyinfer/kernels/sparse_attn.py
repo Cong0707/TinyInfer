@@ -22,10 +22,17 @@ def sparse_attn_cuda(q, kv, sink, idxs, scale):
     b, m, h, d = q.shape
     n, k = kv.size(1), idxs.size(-1)
     out = torch.empty_like(q)
+    # kernel 用 extern __shared__：s_m / s_l 各 nwarps 个 float，s_out 是
+    # nwarps * kMaxLocal(=16) 个 float。不给 shared 大小，sm 就指向非法地址，
+    # cuLaunchKernel 直接报 700（illegal address）。
+    block = 128
+    nwarps = block // 32
+    shared = (2 * nwarps + nwarps * 16) * 4
     native.launch(
         native.kernel("sparse_attn_sink", "sparse_attn_sink"),
-        (b * m * h,), (128,),
+        (b * m * h,), (block,),
         [q, kv, sink, idxs, out, b, m, h, d, n, k, float(scale)],
+        shared=shared,
     )
     return out
 
