@@ -549,12 +549,17 @@ class MoE:
                     raise RuntimeError(
                         f"MoE layer {self.layer_id}: rows {_s0}-{_s1} unavailable "
                         f"[{getattr(self, '_gpu_fail', '?')}]")
-                # _o 是 _gpu_y_buf 的 view（.to(bf16) 对 bf16 是 no-op）；下一批
-                # 换形状会重建并释放那块 buffer，前面几批的 view 就全悬空了。
-                _outs.append(_o.clone())
-                # 下一批会覆盖 _sids_buf / _launch_keep：driver-API 的 kernel 不
-                # 认 Python 引用，这里的等待是所有跨批共享状态的唯一屏障。
+                # 顺序要紧：**先同步，再 clone**。
+                # _o 是 _gpu_y_buf 的 view（.to(bf16) 对 bf16 是 no-op），而写它的
+                # kernel 是异步 launch 的。之前写成 clone 在前、synchronize 在后，
+                # 克隆到的可能是写了一半的数据 —— 实测证据：同一份 11 行输入，
+                # 批次 3/4/6 出现 NaN（位置随批次移动：3->[10]、4->[8,9]、6->[10]），
+                # 而批次 2/8/11 完全干净。这是「跨批共享 buffer + 竞态」的典型指纹。
                 torch.cuda.synchronize()
+                # 下一批会覆盖 _sids_buf / _launch_keep：driver-API 的 kernel 不
+                # 认 Python 引用，这里的等待也是所有跨批共享状态的唯一屏障。
+                # 换形状会重建并释放 _gpu_y_buf，所以必须在这里就把数据拷走。
+                _outs.append(_o.clone())
             # 每批的形状是 [rows_i, dim]（x 在 forward 里已经 view(-1, dim)），
             # 所以按第 0 维拼回 [rows, dim]。以前写的是 dim=1（那是 [b, s, d]
             # 时代的形状），多行时直接 RuntimeError: Sizes of tensors must match。
