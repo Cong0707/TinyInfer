@@ -475,14 +475,32 @@ class MLACompressedAttention:
             # CatArrayBatchedCopy launch 加几次 host 侧 aten 调度），现在一次 step 一次。
             # 数值不变：cat 是纯函数，命中缓存返回的就是同样那 64 个数。
             _cs = _packed_cos_sin(self.freqs_cis, start_pos, s)
+            # **slot 是 kernel 的标量参数，捕获期会被钉成常量。**
+            #
+            # int(start_pos) % self.window 在捕获那一刻折进 kernel 参数，replay 多少次
+            # 都往同一格写 KV —— 历史 token 被反复覆盖。实测图里解码出来是
+            # '<｜begin▁of▁sentence｜>#-举报/ andfulproofed dangling ...' 这种噪声，
+            # eager 同一 prompt 是完整中文。
+            #
+            # 非捕获期保持原来的标量（快，且不依赖 _POS_BUF）；捕获期改传 device 侧
+            # 的槽位张量，由 _graph_run 在每次 replay 前写入。
+            # kernel 现在从 device 内存读 slot（值参数会被图钉死）。非捕获期也让
+            # 这块 _POS_SLOT 每次都写一遍：多一个 4 字节 H2D 之外的 DtoD，换的是
+            # 图内图外只有一条代码路径，不会出现「eager 对、graph 错」这种分裂。
+            from ..nn import _pos_buf
+            if torch.cuda.is_current_stream_capturing():
+                _slot_arg = (_pos_buf(x.device) % self.window).to(torch.int32).reshape(1)
+            else:
+                _slot_arg = torch.tensor([int(start_pos) % self.window],
+                                         dtype=torch.int32, device=x.device)
             _kvfn = _KV_PREP.get("fn")
             if _kvfn is None:
                 from ..kernels import native as _nat
                 _kvfn = _KV_PREP["fn"] = _nat.BoundLaunch(
                     _nat.kernel("kv_norm_rope_quant", "kv_norm_rope_quant"),
-                    (1,), (128,), "TTTTif")
+                    (1,), (128,), "TTTTTf")
             _kvfn(_kv_raw.reshape(-1), self.kv_norm.reshape(-1), _cs,
-                  _fb.reshape(-1), int(start_pos) % self.window,
+                  _fb.reshape(-1), _slot_arg.reshape(-1),
                   float(self.eps), stream=None)
             kv = _fb
             _kv_prepped = True

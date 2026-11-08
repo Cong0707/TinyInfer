@@ -1,4 +1,4 @@
-﻿// kv_norm_rope_quant —— MLA 每 token 的 KV 侧准备：把 kv_norm / apply_rope /
+// kv_norm_rope_quant —— MLA 每 token 的 KV 侧准备：把 kv_norm / apply_rope /
 // act_quant(inplace) 三步加一次 cache 写入压成一个 kernel（wkv 的 GEMV 仍在外面）。
 //
 // 原来每层每 token 跑四步，本文件复现其中三步的算术：
@@ -118,10 +118,17 @@ extern "C" __launch_bounds__(kThreads) __global__ void kv_norm_rope_quant(
     const __nv_bfloat16* __restrict__ norm_w,   // [512]   kv_norm 权重
     const float* __restrict__ cos_sin,          // [64]    cos[32] || sin[32]
     __nv_bfloat16* __restrict__ cache,          // [num_slots, 512]
-    int slot,                                   // 写哪一行
+    const int* __restrict__ slot_p,             // [1]     写哪一行（device 侧）
     float eps) {                                // RMSNorm 的 eps
     // 线程映射写死 128；block 传错就不做，免得悄悄越界写坏 cache。
     if (blockDim.x != kThreads) return;
+    // **slot 必须从 device 内存读，不能是 kernel 的值参数。**
+    //
+    // 值参数在捕获期被折进 kernel 参数块，图里固化成一个常量；而 decode 每步的
+    // 绝对位置都不同，replay 多少次都往同一格写 KV，历史 token 被反复覆盖。
+    // 实测图里解码出来是 '<｜begin▁of▁sentence｜>#-举报/ andfulproofed dangling ...'
+    // 这种噪声，eager 同一 prompt 是完整中文。
+    const int slot = *slot_p;
 
     const int tid = threadIdx.x;
     const int base = tid * kPerThread;  // 本线程负责的 4 个连续维的起点
