@@ -87,9 +87,19 @@ class MLAWindowAttention:
         self._rope_key = table_key(*_kargs)
         self._rope_factory = (lambda _a=tuple(_kargs): precompute_freqs_cis(*_a))
         self.freqs_cis = get_table(self._rope_key, self._rope_factory)
-        # per-layer runtime state; a shared streaming slot serves several layers
+        # per-layer runtime state，键是层号。
+        #
+        # **这个键必须按层分开。** 原来写死成 0，于是所有层共用 _states[0]：
+        # wo_a_bf（反量化后的分组矩阵）是第一个用到它的层算出来的，后面的层直接
+        # 拿去用 —— 形状恰好都是 [8192, 4096]，形状检查放行，权重是别人的。
+        # eager 下每层串行、算完就换，看起来正常；一旦进了 CUDA graph，图内串行
+        # replay 用的就是同一份错权重，数值直接崩（实测 L1 输出 absmax 2.36e37，
+        # 而 bf16 把别人字节当数值解释正是这个量级）。
+        #
+        # 决定性证据：layers=[0,0] 时 graph 与 eager 完全一致（同一个层，权重本来就
+        # 是同一份），layers=[0,1] 和 [1,0] 都是 0。
         self._states: dict[int, dict] = {}
-        self._active_layer = 0
+        self._active_layer = int(layer_id)
         if tp is not None and tp.world > 1:
             self._shard_for_tp(tp)
 

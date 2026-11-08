@@ -59,7 +59,7 @@ class Compressor:
         self.wkv = store.get(p + "wkv.weight").float()
         self.wgate = store.get(p + "wgate.weight").float() if self.ratio > 1 else None
         self._states: dict[int, dict] = {}
-        self._active_layer = 0
+        self._active_layer = int(layer_id)
 
     def _st(self) -> dict:
         st = self._states.get(self._active_layer)
@@ -194,7 +194,7 @@ class Indexer:
             self.wk = store.get(p + "wk.weight").float()
             self.k_norm = store.get(p + "k_norm.weight")
         self._states: dict[int, dict] = {}
-        self._active_layer = 0
+        self._active_layer = int(layer_id)
         self.eps = cfg.rms_norm_eps
 
     def _st(self) -> dict:

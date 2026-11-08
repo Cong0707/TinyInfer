@@ -126,7 +126,7 @@ class MLACompressedAttention:
         self.indexer = Indexer(store, layer_id, cfg, self.freqs_cis, rt=rt) if self.is_index_source else None
         # per-layer runtime state (shared streaming slots serve several layers)
         self._states: dict[int, dict] = {}
-        self._active_layer = 0
+        self._active_layer = int(layer_id)
 
     def _apply_plan(self, plan_fn) -> None:
         """Split this layer's projections across cards (same rule as the window path).
