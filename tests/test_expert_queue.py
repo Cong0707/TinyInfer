@@ -154,3 +154,41 @@ def test_server_idles_without_spinning():
     finally:
         srv.stop()
 
+
+def test_async_posts_and_waits_without_host_sync():
+    """完整链路：GPU 发布 -> 卖家备货 -> 流等就绪。主机侧全程没有 item()。"""
+    _cuda()
+    import time
+
+    from tinyinfer.expert_async import ExpertAsync
+
+    class Mgr:
+        stats = {}
+
+        def __init__(self):
+            self.seen = []
+            self.slots = object()
+
+        def need(self, layer, ids):
+            self.seen.append((layer, list(ids)))
+            return len(ids)
+
+    mgr = Mgr()
+    ea = ExpertAsync(mgr, enabled=True)
+    ea.start()
+    try:
+        slot_ids = torch.tensor([-1, 1, -1], dtype=torch.int32, device="cuda")
+        ea.step_begin()
+        ea.post(slot_ids, 3, layer=2)
+        ea.wait(layer=2)
+        torch.cuda.synchronize()
+        deadline = time.time() + 5.0
+        while not mgr.seen and time.time() < deadline:
+            time.sleep(0.005)
+        assert mgr.seen == [(2, [0, 2])], mgr.seen
+        ea.step_end()
+        assert ea.stats()["posted"] == 1
+    finally:
+        ea.stop()
+
+
