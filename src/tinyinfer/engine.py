@@ -2892,6 +2892,18 @@ class Engine:
                     # pin_hot_experts 是按覆盖率挑的热门专家，不保证覆盖这一轮的
                     # 真实路由，所以这里按「刚跑完这次 forward 记录到的路由」补装。
                     self._graph_force_load_routes(_sl_cap)
+                # **捕获必须从和 eager 相同的干净状态开始。**
+                #
+                # 上面那次 forward 是 warmup：它推进了 KV、填了 _decode_idxs、更新了
+                # 各层的 _kv_len。捕获紧接着跑，看到的是「已经走过一步」的残局 ——
+                # 而 eager 是从 reset() 后的零状态跑的。两边起点不同，L0 的 attention
+                # 就取出不同的值（实测 blk_out 1.055 vs 1.35），一路传到 MoE 的 gate，
+                # 路由从 [79,132,292,278,91,372] 漂成 [132,79,309,349,348,372]，
+                # 后两个从未进过槽位，表里是 -1。
+                #
+                # 所以 warmup 之后先把状态原样收回 snap，让捕获从同一起点重跑。
+                # 注意这一步**不能**碰 _rt：warmup 建好的跨层状态稍后要放回去。
+                self.restore(snap)
                 # **捕获前这次完整 forward 产出的 _rt 必须留住。**
                 #
                 # 分块捕获时每块只跑 [_graph_lo, _graph_hi) 那几层，前面层的
