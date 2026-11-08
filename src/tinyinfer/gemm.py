@@ -350,16 +350,36 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     # (it is the same maths, one row at a time), just slower.
     xf = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
     if xf.size(0) == 1:
-        # A single row got past every fp8 branch above: either the weight shape fails the
-        # %16 checks, the card has no native e4m3 converter, or x is not CUDA. Falling
-        # back to dequantise-then-matmul silently would produce different numbers than the
-        # fp8 path, so say which it is instead of recursing forever.
-        raise RuntimeError(
-            f"fp8_linear: no path for M=1 (is_cuda={x.is_cuda} dim={x.dim()} "
-            f"M={x.size(0)} block={block} w={tuple(w_fp8.shape)} "
-            f"K%16={(w_fp8.shape[1] % 16)} N%16={(w_fp8.shape[0] % 16)} "
-            f"native={_fp8_native()} k={_k is not None} "
-            f"xdt={x.dtype} wdt={w_fp8.dtype})")
+        # 走到这里说明 M=1 没有落到任何快速路径。**必须有一条正确的兜底**：
+        # 8192 token 的 prefill 被切成 prefill_chunk 大小的块，最后一块可能只有
+        # 1 行，而 wq_a 的 (32768, 1280) 在 M=1 时正好没有 kernel ——
+        # 以前这里直接抛 RuntimeError，于是**任何长度不是 chunk 整数倍的 prompt
+        # 都会在最后一块崩掉**。
+        #
+        # 兜底用「反量化 + bf16 matmul」：数值与 fp8 路径有一两个 ulp 的差，
+        # 但那是已知的、可接受的，总比直接失败好。慢，但只影响最后一块的 1 行。
+        try:
+            w_bf = w_fp8.to(torch.float32)
+            if w_scale is not None:
+                # e8m0 块缩放：[N/128, K/block] -> 展回 [N, K]
+                _n, _kk = w_fp8.shape
+                _sb = int(block)
+                _s = w_scale.to(torch.float32)
+                if _s.dim() == 2 and _s.shape[0] * 128 >= _n:
+                    _rows = _s.shape[0]
+                    _per = max(1, _n // _rows)
+                    _s = _s.repeat_interleave(_per, dim=0)[:_n]
+                    _s = _s.repeat_interleave(_sb, dim=1)[:, :_kk]
+                    w_bf = w_bf * _s
+            out = (xf.to(torch.float32) @ w_bf.t()).to(x.dtype)
+            return out.view(*x.shape[:-1], out.shape[-1])
+        except Exception as _exc:
+            raise RuntimeError(
+                f"fp8_linear: no path for M=1 and no fallback (is_cuda={x.is_cuda} "
+                f"dim={x.dim()} M={x.size(0)} block={block} "
+                f"w={tuple(w_fp8.shape)} K%16={(w_fp8.shape[1] % 16)} "
+                f"N%16={(w_fp8.shape[0] % 16)} native={_fp8_native()} "
+                f"k={_k is not None} xdt={x.dtype} wdt={w_fp8.dtype})") from _exc
     rows = [fp8_linear(xf[i:i + 1], w_fp8, w_scale, block) for i in range(xf.size(0))]
     out = torch.cat(rows, dim=0)
     return out.view(*x.shape[:-1], out.shape[-1])
