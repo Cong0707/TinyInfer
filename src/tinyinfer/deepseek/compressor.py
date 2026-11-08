@@ -273,7 +273,11 @@ class Indexer:
         _kn = 0 if self.rt.index_k is None else int(self.rt.index_k.size(1))
         if _kn > 0:
             t = min(int(t), _kn)
-        if t <= 0:
+        if t <= 0 or self.rt.index_k is None:
+            # index_k 还没有任何压缩组（kv_source 层尚未在本轮跑过）。
+            # 分块捕获 decode graph 时每块只跑自己的层，第 2 块起会跳过 L2/L8/L14/L20
+            # 这些源层，于是这里拿到 None。返回空的 top-k 结果是正确语义：
+            # 这一层此刻看不到任何被压缩的位置。
             return torch.empty(b, s, 0, dtype=torch.int32, device=x.device)
         index_k = self.rt.index_k[:, :t]
         weights = F.linear(x.float(), self.weights_proj) * (self.softmax_scale * self.n_heads ** -0.5)
