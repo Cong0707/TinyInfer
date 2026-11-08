@@ -2733,6 +2733,54 @@ class VramSlotCache:
         with self._lock:
             return len(self._pinned)
 
+
+    def snapshot(self) -> dict:
+        """池子当前状态的快照，供运维和自适应决策读。
+
+        为什么要它：线上出问题时（命中率突然掉、开始换出、内存里全是同一层的
+        专家），光看一个 miss 数字分不清是「路由变了」还是「池子被某个长会话
+        占死了」。这里把每个状态的数量、命中率、最老/最新的槽位都摊开。
+
+        全部从实际数据结构算，不缓存 —— 快照是诊断工具，不是热路径。
+        """
+        from collections import Counter
+
+        # _state 是 Python list（不是 device tensor）：诊断在主机侧做就够了，
+        # 不要为了看一眼状态去碰 GPU。
+        st = Counter(int(v) for v in self._state)
+        n = max(1, int(self.slots))
+        by_layer: dict[int, int] = {}
+        for k in self._by_key:
+            lid = int(k[0])
+            by_layer[lid] = by_layer.get(lid, 0) + 1
+        # 池子只记 hits 和 loads（每次真正搬一次算一个 load），
+        # miss = loads；命中率 = hits / (hits + loads)。
+        _loads = int(getattr(self, "loads", 0))
+        _hits = int(getattr(self, "hits", 0))
+        total = max(1, _hits + _loads)
+        return {
+            "slots": int(self.slots),
+            "blob_bytes": int(self.blob_bytes),
+            "states": {
+                "free": st.get(self.FREE, 0),
+                "reserved": st.get(self.RESERVED, 0),
+                "copying": st.get(self.COPYING, 0),
+                "staged": st.get(self.STAGED, 0),
+                "in_use": st.get(self.IN_USE, 0),
+            },
+            "occupied": len(self._by_key),
+            "fill_ratio": len(self._by_key) / float(n),
+            "layers_present": len(by_layer),
+            "busiest_layers": sorted(by_layer.items(), key=lambda t: -t[1])[:5],
+            "hits": _hits,
+            "loads": _loads,
+            "hit_rate": (_hits / float(total)),
+            "evictions": int(getattr(self, "evictions", 0)),
+            "pinned": self.pinned_count(),
+            "urgent": len(self._urgent),
+            "dirty": len(self._dirty),
+        }
+
     def slot_table(self, n_layers: int, n_experts: int):
         """[n_layers, n_experts] int32 device 表：专家的槽位编号，-1 = 不在显存。
 

@@ -1003,10 +1003,24 @@ class TinyModelBackend(BaseBackend):
             "device": getattr(model, "device", "cpu") if model is not None else "cpu",
             "gpu_layers_budget": getattr(model, "gpu_layers", None) if model is not None else None,
             "engine_stats": model.stats() if model is not None and hasattr(model, "stats") else None,
+            # 专家槽位的实时状态。线上排查「命中率为什么掉了」时，这里能直接看出
+            # 是池子被占死、还是路由真的变了 —— 只有 hits/loads 一个数字时
+            # 分不清这两件事。
+            "expert_slots": self._slot_snapshot(model),
             "tokenizer": type(self._tokenizer).__name__ if self._tokenizer is not None else None,
             "slot_caches": len(self._slot_kv),
             "expert_store": self._expert_store is not None,
         }
+
+    @staticmethod
+    def _slot_snapshot(model) -> dict | None:
+        """专家槽位池的状态快照（不可用时返回 None，不影响 /health）。"""
+        try:
+            slots = getattr(getattr(model, "expert_store", None), "slots", None)
+            snap = getattr(slots, "snapshot", None)
+            return snap() if callable(snap) else None
+        except Exception:
+            return None
 
     def list_models(self) -> list[dict[str, Any]]:
         if self._adapter is not None:
