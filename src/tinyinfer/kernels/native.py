@@ -114,6 +114,123 @@ def kernel(name: str, func: str):
     return handle
 
 
+# --- stream memory operations ------------------------------------------------
+# CU_STREAM_WAIT_VALUE_GEQ / CU_STREAM_WRITE_VALUE_DEFAULT
+_CU_STREAM_WAIT_VALUE_GEQ = 0x0
+_CU_STREAM_WRITE_VALUE_DEFAULT = 0x0
+
+
+def _memops():
+    _bind_primary_ctx()
+    lib = _lib()
+    if not getattr(lib, "_memops_ready", False):
+        lib.cuStreamWaitValue32.argtypes = [ctypes.c_void_p, ctypes.c_uint64,
+                                            ctypes.c_uint32, ctypes.c_uint]
+        lib.cuStreamWaitValue32.restype = ctypes.c_int
+        lib.cuStreamWriteValue32.argtypes = [ctypes.c_void_p, ctypes.c_uint64,
+                                             ctypes.c_uint32, ctypes.c_uint]
+        lib.cuStreamWriteValue32.restype = ctypes.c_int
+        lib._memops_ready = True
+    return lib
+
+
+def stream_wait_value32(dev_ptr: int, value: int, stream=None) -> None:
+    """Block a stream until the 32-bit word at dev_ptr is >= value.
+
+    这是「GPU 等数据」的正确形式：CPU 把等待排进流里就继续往下走，不需要
+    自己等搬运完成（那个等法每层 3.3ms、每 token 130ms）。
+    """
+    import torch
+
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    raw = ctypes.c_void_p(int(getattr(stream, "cuda_stream", stream)))
+    rc = _memops().cuStreamWaitValue32(raw, ctypes.c_uint64(int(dev_ptr)),
+                                       ctypes.c_uint32(int(value) & 0xFFFFFFFF),
+                                       _CU_STREAM_WAIT_VALUE_GEQ)
+    if rc != 0:
+        raise RuntimeError(f"cuStreamWaitValue32 failed: {rc}")
+
+
+def stream_write_value32(dev_ptr: int, value: int, stream=None) -> None:
+    import torch
+
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    raw = ctypes.c_void_p(int(getattr(stream, "cuda_stream", stream)))
+    rc = _memops().cuStreamWriteValue32(raw, ctypes.c_uint64(int(dev_ptr)),
+                                        ctypes.c_uint32(int(value) & 0xFFFFFFFF),
+                                        _CU_STREAM_WRITE_VALUE_DEFAULT)
+    if rc != 0:
+        raise RuntimeError(f"cuStreamWriteValue32 failed: {rc}")
+
+
+def _cudart():
+    """Locate the CUDA runtime that ships with torch (host-mapped memory)."""
+    from ..budget import _cudart as _bud
+    return _bud()
+
+
+def host_mapped(nbytes: int):
+    """一块主机和 GPU 都能直接读写的内存，返回 (host 指针, device 指针)。
+
+    槽位表、请求队列这类「两边都要看、数据量只有几十 KB」的结构放这里：
+    GPU 直接读，CPU 直接写，中间没有 H2D 也没有 D2H，也就没有同步点。
+
+    走 cudart 而不是 driver API：cuMemHostAlloc 需要显式绑定 primary context，
+    而 torch 自己也在反复 cuCtxSetCurrent，绑了也会被切走（实测返回 201）。
+    cudaHostAlloc/cudaHostGetDevicePointer 是 runtime API，跟随当前设备，不受影响。
+    """
+    lib = _cudart()
+    if lib is None:
+        raise RuntimeError("cudart not found (needed for host-mapped memory)")
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        torch.zeros(1, device="cuda")   # 建立 primary context
+    p = ctypes.c_void_p()
+    # cudaHostAllocMapped | cudaHostAllocPortable
+    rc = lib.cudaHostAlloc(ctypes.byref(p), ctypes.c_size_t(int(nbytes)), 0x02 | 0x01)
+    if rc != 0:
+        raise RuntimeError(f"cudaHostAlloc({nbytes}) failed: {rc}")
+    dp = ctypes.c_void_p()
+    rc = lib.cudaHostGetDevicePointer(ctypes.byref(dp), p, 0)
+    if rc != 0:
+        raise RuntimeError(f"cudaHostGetDevicePointer failed: {rc}")
+    return p, dp.value
+
+
+def _bind_primary_ctx():
+    """把 torch 用的 primary context 设成驱动 API 的当前 context。
+
+    torch.cuda.init() 会创建 primary context，但驱动 API 的 cuMemHostAlloc /
+    cuStreamWaitValue32 这类调用要求它被 cuCtxSetCurrent 显式设为当前，否则
+    一律返回 CUDA_ERROR_INVALID_CONTEXT (201)。cuLaunchKernel 之所以能工作，
+    是 torch 在每次 kernel 调用前自己设过。
+    """
+    lib = _lib()
+    if getattr(lib, "_ctx_bound", False):
+        return
+    lib.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    lib.cuCtxGetCurrent.restype = ctypes.c_int
+    if not hasattr(lib, "cuDevicePrimaryCtxRetain"):
+        lib.cuDevicePrimaryCtxRetain.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                                 ctypes.c_int]
+        lib.cuDevicePrimaryCtxRetain.restype = ctypes.c_int
+        lib.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+        lib.cuCtxSetCurrent.restype = ctypes.c_int
+    cur = ctypes.c_void_p()
+    lib.cuCtxGetCurrent(ctypes.byref(cur))
+    if not cur.value:
+        pctx = ctypes.c_void_p()
+        rc = lib.cuDevicePrimaryCtxRetain(ctypes.byref(pctx), 0)
+        if rc != 0:
+            raise RuntimeError(f"cuDevicePrimaryCtxRetain failed: {rc}")
+        lib.cuCtxSetCurrent(pctx)
+    lib._ctx_bound = True
+
+
 def available(name: str, func: str | None = None) -> bool:
     """True when the cubin is present and, if given, the kernel symbol resolves."""
     try:
@@ -178,6 +295,10 @@ class BoundLaunch:
             k = kinds[i]
             if k == "n":
                 raw[i] = 0 if a is None else a.data_ptr()
+            elif k == "p":
+                # 裸设备指针：host-mapped 的队列/标志块没有 torch 张量可拿，
+                # 但 kernel 需要一个地址。直接给地址，不伪造 tensor。
+                raw[i] = int(a)
             elif k == "T" or k == "O":
                 raw[i] = a.data_ptr()
                 # No record_stream here. Every caller in this engine keeps its tensors
