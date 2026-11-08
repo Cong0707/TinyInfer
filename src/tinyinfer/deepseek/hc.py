@@ -440,8 +440,21 @@ class HCBlockMixin:
                              b * s, k_dim, j_dim, float(self.hc_eps), 0])
                 return hc_split_sinkhorn(out.view(b, s, j_dim), hc_scale, hc_base,
                                          self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
-            except Exception:
-                pass
+            except Exception as _hc_exc:
+                # **不许静默降级。**
+                # 这里原本是 `except Exception: pass`，于是 native kernel 一失败就
+                # 悄悄落到下面那条 torch 链（square/mean/rsqrt + F.linear，七个算子），
+                # 而那条链的末尾 hc_split_sinkhorn 又要 sinkhorn.cubin —— 那个 cubin
+                # 在 L20 上从来没编译过，于是真正的错误是「cubinh 不存在」，
+                # 而不是「native kernel 挂了」。两层静默叠加，报出来的位置跟根因
+                # 差了两层，实测多花一整轮才定位。
+                import os as _os_hc
+                if _os_hc.environ.get("TI_HC_KERNEL_SOFT") == "1":
+                    pass
+                else:
+                    raise RuntimeError(
+                        f"hc_mixes native kernel failed ({_hc_exc!r}); set "
+                        f"TI_HC_KERNEL_SOFT=1 to fall back to the torch chain") from _hc_exc
         xf = x.flatten(2).float()
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.hc_eps)
         mixes = F.linear(xf, hc_fn) * rsqrt
