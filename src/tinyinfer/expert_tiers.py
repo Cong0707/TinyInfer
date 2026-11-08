@@ -228,32 +228,50 @@ class ExpertTierManager:
         stop = self._warm_stop
 
         def _one(worker: int) -> None:
-            for layer in range(self.n_layers):
+            # **按「专家位置」跨层轮转，而不是逐层填满。**
+            #
+            # 以前是 `for layer in range(40)` 顺序填：填到第 6 层时，第 30 层的
+            # decode 还是空的，于是每层都去读盘。实测 L20：预热 76 个专家/秒、
+            # 装完 13150 个要 173 秒，而头 60 秒里 decode 一直读盘 ——
+            # GPU 利用率 0-16%，CPU 189%，每个 step 500-3000ms。
+            #
+            # decode 的访问模式是「每层都要几个」，所以正确的顺序是
+            # (第 0 层专家0..7) -> (第1层专家0..7) -> ... -> (第39层专家0..7)
+            # -> (每层专家 8..15) ...
+            # 这样预热到 1/N 时，每层都有 1/N 的覆盖，命中率随进度线性上升，
+            # 而不是「前几层 100%、其余 0%」。
+            #
+            # 每层的专家按 8 个一组切，外层遍历组号、内层遍历层。
+            _GRP = 8
+            _groups = (self.n_experts + _GRP - 1) // _GRP
+            for g in range(_groups):
                 if stop.is_set():
                     return
-                gap = [e for e in range(self.n_experts) if not self.ram.contains(layer, e)]
-                if not gap:
-                    continue
-                n = max(1, threads)
-                step = max(1, len(gap) // n)
-                mine = gap[worker * step:] if worker == n - 1 else gap[worker * step:(worker + 1) * step]
-                for i in range(0, len(mine), 8):
+                for layer in range(self.n_layers):
                     if stop.is_set():
                         return
-                    # 推理在忙的时候让路：预热是「没事干才做的事」，和 decode 抢
-                    # 磁盘只会把关键路径拖慢。_busy 由 MoE 每层置位。
-                    # 注意不能用 _busy.wait()：那是等「被置位」，而这里要等的是
-                    # 「被清空」。事件已置位时 wait() 立刻返回，等于没让路。
-                    while self._busy.is_set():
+                    lo = g * _GRP
+                    hi = min(self.n_experts, lo + _GRP)
+                    mine = [e for e in range(lo, hi) if not self.ram.contains(layer, e)]
+                    if not mine:
+                        continue
+                    for i in range(0, len(mine), 8):
                         if stop.is_set():
                             return
-                        time.sleep(0.005)
-                    chunk = mine[i:i + 8]
-                    try:
-                        self.ram.prefetch(layer, chunk).result(timeout=300)
-                        self.stats["warm"] += len(chunk)
-                    except Exception:
-                        return
+                        # 推理在忙的时候让路：预热是「没事干才做的事」，和 decode 抢
+                        # 磁盘只会把关键路径拖慢。_busy 由 MoE 每层置位。
+                        # 注意不能用 _busy.wait()：那是等「被置位」，而这里要等的是
+                        # 「被清空」。事件已置位时 wait() 立刻返回，等于没让路。
+                        while self._busy.is_set():
+                            if stop.is_set():
+                                return
+                            time.sleep(0.005)
+                        chunk = mine[i:i + 8]
+                        try:
+                            self.ram.prefetch(layer, chunk).result(timeout=300)
+                            self.stats["warm"] += len(chunk)
+                        except Exception:
+                            return
 
         def _run() -> None:
             ts = [threading.Thread(target=_one, args=(w,), name=f"expert-warm{w}",
