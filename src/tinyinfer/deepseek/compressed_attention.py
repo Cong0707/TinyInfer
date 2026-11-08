@@ -617,14 +617,25 @@ class MLACompressedAttention:
                 elif start_pos == 0:
                     fr = self.freqs_cis[:_ng * self.ratio : self.ratio]
                 else:
-                    # 组号必须来自 device（捕获期 Python int 会被折成常量）。
+                    # **官方语义：decode 时压缩层的 RoPE 取 freqs_cis[start_pos + 1 - ratio]。**
+                    #
+                    # 参考实现 model.py::_compress_kv 里写得很直白：
+                    #   freqs = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+                    # 一个 latent 代表它那一组的第一个 token，所以它的位置是
+                    # start_pos + 1 - ratio，不是 (start_pos // ratio) * ratio。
+                    #
+                    # 我们原来用的是后者，两者在 start_pos % ratio == ratio - 1 时相等，
+                    # 其余情况差 1 —— 而 decode 的每一步里 ratio - 1 步都会差 1。
+                    # 位置错 1 意味着 RoPE 角度整体偏移，压缩层的注意力权重全歪。
+                    #
+                    # 实测：92 token 的 prompt 之后图解码退化成复读，而 eager 通顺。
                     if torch.cuda.is_current_stream_capturing():
                         from ..nn import _pos_buf
-                        _g0 = (_pos_buf(latent.device) // self.ratio).to(torch.long)
+                        _p0 = (_pos_buf(latent.device) + 1 - self.ratio).to(torch.long)
                     else:
-                        _g0 = start_pos // self.ratio
-                    _grp = _g0 + torch.arange(_ng, device=latent.device)
-                    fr = self.freqs_cis[_grp * self.ratio]
+                        _p0 = start_pos + 1 - self.ratio
+                    _grp = _p0 + torch.arange(_ng, device=latent.device) * self.ratio
+                    fr = self.freqs_cis[_grp]
                 # 旋转+fp4 往返直接做在 latent 上，不再 clone。数值原因：这次 forward
                 # 里 latent 在旋转之后只被当作「旋转+量化后的结果」使用（写共享 cache、
                 # 交给 indexer —— 索引器拿到的本来就是旋转后的张量），旋转前的值没有
@@ -722,9 +733,9 @@ class MLACompressedAttention:
                     print(f"[kv] L{getattr(self, 'layer_id', '?')} grow to {cap} groups "
                           f"({cap * self.head_dim / 2**20:.1f} MB)", flush=True)
             if _per_row_start is None:
-                # 捕获期 start_group 是 device 张量（见上），切片赋值拿张量当下标
-                # 会退化成 aten 的 index_put 路径，语义不稳定。统一用 index_copy_：
-                # 单行时下标就是 [g0, g0+1, ..., g0+n-1]，与切片等价。
+                # 官方写法：compress_kv_cache[:, start_pos // ratio : +latent.size(1)] = latent。
+                # 捕获期 start_group 是 device 张量，切片下标不能是张量，所以走 index_copy_；
+                # 单行时下标就是 [g0, g0+1, ..., g0+n-1]，与官方切片逐元素等价。
                 if torch.is_tensor(start_group):
                     _n2 = int(latent.size(1))
                     _idx2 = (start_group.reshape(1) + torch.arange(
