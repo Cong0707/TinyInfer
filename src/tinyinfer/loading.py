@@ -3675,7 +3675,21 @@ class ExpertStore:
             # 只要不在槽位里就要装（哪怕 RAM 里有）：RAM 命中只是「不用读盘」，
             # 不等于「已经在显存里」。原来的条件是「RAM 没有 且 槽位没有」，于是
             # RAM 全命中时一个槽位都不分配，表里全是 -1。
+            # **已经在槽位里** → 完全不用管。
+            # **不在槽位但 RAM 里有** → 只需 H2D 拷进槽位，不必读盘。
+            # 以前这里只减了 _slot_have，于是 RAM 命中的专家照样排进 blobs 去读盘。
+            # 实测 L20：prefill 16 token 只路由到 7 个不同专家，disk 却读了 96 次
+            # —— 13.7 倍重复读；一次 40 层 prefill 累积 14896 次读盘（约 280GB），
+            # 而缓存里只有 902 个专家。那 126 秒的 prefill 和之后每步 300-1900ms
+            # 的 decode 全是这个读盘打的。
+            #
+            # 正确语义：需要装的 = 不在槽位里的；其中 RAM 有的走 H2D，没有的才读盘。
             misses = [e for e in experts if e not in _slot_have]
+            _ram_have = {e for e, ok in zip(experts, _have) if ok} if _have else set()
+            _need_disk = [e for e in misses if e not in _ram_have]
+            if _need_disk != misses:
+                self.stats["ram_hit"] += len(misses) - len(_need_disk)
+            misses = _need_disk
             if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
                 print(f"[fetch] layer0 experts={experts} misses={misses}", flush=True)
             if misses:
