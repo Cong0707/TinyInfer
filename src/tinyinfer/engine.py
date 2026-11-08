@@ -1270,7 +1270,34 @@ class Engine:
         _budget = int(slots.slots)
         if _budget < _need_step * 2:
             return 0
-        _sel = _cand[: _budget - _need_step]
+        # 覆盖率决定 pin 多少，而不是「排前 N 个」。
+        # 实测（tests/test_hot_coverage.py，单层 384 次路由）：
+        #   top-24 覆盖 56.5%、top-48 覆盖 74.7%、top-96 覆盖 92.4%。
+        # 也就是说 pin 的收益是**次线性**的：pin 一半容量只换来一半覆盖率，
+        # 而 pin 掉的槽位永久失效。真正划算的是「只 pin 覆盖率高得多的头部」。
+        #
+        # 这里按「pin 完仍至少留一个完整步的余量」定上限，再用覆盖率曲线检查：
+        # 如果连 50% 路由都覆盖不到，pin 的收益低于它占掉的容量，直接不 pin。
+        _avail = _budget - _need_step
+        _tot = sum(c for c, _, _ in _cand)
+        if _tot <= 0:
+            return 0
+        # 只 pin「贡献显著的头部」，不是「填满预算」。
+        # 排序后的尾部每个只被路由寥寥几次：pin 它们既省不下一次搬运
+        # （它们本来也几乎不会被路由到），又永久占死槽位。实测里 1119 个
+        # 预算中会有 319 个落在「只被路由 1 次」的尾巴上。
+        # 规则：累计覆盖率到 95% 为止，或到预算上限。
+        _sel = []
+        _acc = 0
+        for _c, _l, _e in _cand[: _avail]:
+            _sel.append((_c, _l, _e))
+            _acc += _c
+            if _acc >= 0.95 * _tot:
+                break
+        _cover = _acc / float(_tot)
+        if _cover < 0.5:
+            # 覆盖不到一半：pin 占掉的槽位比它省下的搬运更贵
+            return 0
         _by_layer: dict[int, list[int]] = {}
         for _c, _l, _e in _sel:
             _by_layer.setdefault(_l, []).append(_e)
