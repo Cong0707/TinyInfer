@@ -329,7 +329,13 @@ class MLACompressedAttention:
         hit = getattr(rt, "_fr_hit", None)
         if hit is not None and hit[0] == key and hit[1] is grp0:
             return hit[2]
-        grp = grp0.unsqueeze(1) + torch.arange(ng, device=device).unsqueeze(0)
+        # grp0 有两种形状：[b] 或 [b, s]。latent 的压缩组起点只由**每行最后
+        # 一个位置**决定（前面的位置已经压缩进历史组），所以统一取最后一列。
+        # 以前直接 `grp0.unsqueeze(1)`：s=1 或 grp0 是 [b] 时正好对，
+        # s=1024 时变成 (b,1,1024) 去加 (1,512)，直接 RuntimeError，
+        # 被引擎的 except 吞掉之后整层输出 NaN —— 实测 1024 token 就挂。
+        _g = grp0 if grp0.dim() == 1 else grp0[:, -1]
+        grp = _g.unsqueeze(1) + torch.arange(ng, device=device).unsqueeze(0)
         fr = self.freqs_cis[(grp * self.ratio).reshape(-1)].reshape(b, ng, -1)
         rt._fr_hit = (key, grp0, fr)
         return fr
