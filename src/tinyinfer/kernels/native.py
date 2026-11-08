@@ -318,12 +318,23 @@ class BoundLaunch:
             # 内部走 _get_device_index + 构造 Stream 对象，py-spy 采样里 Stream.__new__
             # 和 current_stream 是仅次于 cuLaunchKernel 的热点；一个 token 1200+ 次
             # launch，这些纯开销就吃掉了可观的 CPU 时间（而 CPU 已经是瓶颈）。
-            # 默认直接用缓存，只有 TI_STREAM_CHECK=1 时才每次回查 torch —— 引擎内部
-            # 不切换 stream，graph capture 也在独立路径上，回查只有在外部调用者
-            # 自己切流时才需要。
+            #
+            # **但捕获期必须回查，不能吃缓存。** 上面原来写的是「graph capture 也在
+            # 独立路径上」，那是错的：torch.cuda.graph() 会把当前流换成它自己的捕获流，
+            # 而缓存里存的是捕获之前的默认流。于是捕获期每一次 native.launch 都发到
+            # 流外 —— 图里只剩下 torch 的算子，手写 kernel 一个都没进图，replay 出来的
+            # 是半张图，数值自然是错的（实测 L20：3 层起全 NaN）。
+            # 打开 TI_STREAM_CHECK=1 后同一批测试立刻 graph=True、数值吻合，确认根因。
+            #
+            # 所以：捕获期强制回查。开销只在捕获时付，replay 不受影响。
             tid = _threading.get_ident()
             ent = _STREAM_CACHE.get(tid)
-            if ent is None or _STREAM_CHECK:
+            _capturing = False
+            try:
+                _capturing = torch.cuda.is_current_stream_capturing()
+            except Exception:
+                _capturing = False
+            if ent is None or _STREAM_CHECK or _capturing:
                 cur = torch.cuda.current_stream()
                 raw = int(cur.cuda_stream)
                 if ent is None or ent[0] != raw:
