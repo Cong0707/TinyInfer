@@ -598,65 +598,32 @@ class MoE:
             # 不触发同步），CPU 侧的卖家线程去备货，本层的 kernel 在流里等
             # 就绪计数。主机侧在这里一次同步都没有 —— 这是每 token 130ms 的
             # 来源（40 层 x 3.3ms 的 D2H）。
+            # 备货：卖家线程已经把字节放进 pinned staging（上一次 post 之后
+            # 它就一直在做），这里在主线程把它 DMA 上卡并写表 —— 只碰本线程的
+            # stream，不会和谁死锁。
             _async = self._async_experts()
+            _mgr = self._tier_manager()
             if _async is not None and _async.enabled:
-                # 卖家线程刚可能改过槽位表：先把待写的槽位号刷进 device 表
-                # （在本线程的 stream 上，不跨线程发 kernel），再发布请求。
-                sl.table_flush()
-                _async.post(sids, int(indices.numel()), self.layer_id)
-                _async.wait(self.layer_id)
-                # 等完之后表已经包含本层的槽位号，但 sids 是等之前索引的；
-                # 表变了就得重索引一次（一次 index_select，几微秒）。
-                tab = sl._slot_tab
-                torch.index_select(tab[self.layer_id], 0,
-                                   indices.view(-1).clamp_(0, 383), out=sids)
-            else:
-                # 没有异步链路（例如 CPU-only 或捕获期）：退回同步补缺。
-                _nmiss = 0
-                if (not getattr(self, "_all_pinned", False)
-                        and not torch.cuda.is_current_stream_capturing()):
-                    _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
-                if _nmiss:
-                    _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
-                    if _miss:
-                        _mgr = self._tier_manager()
-                        _mgr.need(self.layer_id, _miss)
-                        _mgr.ready(self.layer_id, _miss)
-                        tab = sl._slot_tab
-                    # 写进持久 buffer：index_select 每次新建张量，driver-API 的 kernel 只拿裸
-                # 指针，函数返回后这批显存会被 allocator 立刻复用（多行 prefill 时
-                # 就是 slot_ids 读到 INT_MAX、权重地址偏 4e16 的来源）。原地写同一块
-                # buffer，生命周期就不再依赖 Python 引用。
-                _sn = int(indices.numel())
-                _sb = getattr(self, "_sids_buf", None)
-                if _sb is None or _sb.device != xf.device or _sb.numel() < _sn:
-                    _sb = torch.empty(max(4096, _sn), dtype=torch.int32, device=xf.device)
-                    self._sids_buf = _sb
-                sids = _sb[:_sn]
-                torch.index_select(tab[self.layer_id], 0,
-                                   indices.view(-1).clamp_(0, 383), out=sids)
-                if __import__("os").environ.get("TI_GPUDBG") == "1":
-                    print(f"[t6] L{self.layer_id} tabvals={[int(tab[self.layer_id, e]) for e in _miss]}"
-                          f" sids={sids.tolist()}", flush=True)
-                    if __import__("os").environ.get("TI_GPUDBG") == "1":
-                        print(f"[t5] L{self.layer_id} sids={sids.tolist()}", flush=True)
-                if __import__("os").environ.get("TI_GPUDBG") == "1":
-                    print(f"[miss] L{self.layer_id} miss={_miss} by_key={len(sl._by_key)} "
-                          f"has={[sl.has(self.layer_id, e) for e in _miss]}", flush=True)
-                if __import__("os").environ.get("TI_GPUDBG") == "1":
-                    print(f"[tab] sids={sids.tolist()} tabvals="
-                          f"{[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
-                if bool((sids < 0).any().item()):
-                    _free = sum(1 for _i in range(sl.slots) if sl._state[_i] == sl.FREE)
-                    _stg = sum(1 for _i in range(sl.slots) if sl._state[_i] == sl.STAGED)
-                    _r0 = sum(1 for _i in range(sl.slots) if sl._refs[_i] == 0)
-                    print(f"[diag] L{self.layer_id} miss={_miss} bykey={len(sl._by_key)} "
-                          f"free={_free} staged={_stg} refs0={_r0} pinned={sl.pinned_count()} "
-                          f"last_ids={len(getattr(self, '_last_ids', None) or [])} prev={len(getattr(self, '_prev_ids', None) or [])} "
-                          f"byslot={[sl._by_key.get((self.layer_id, e), -1) for e in _miss]} "
-                          f"tabvals={[int(tab[self.layer_id, e]) for e in _miss]}", flush=True)
-                    raise RuntimeError(
-                        f"MoE layer {self.layer_id}: {_miss} still not resident")
+                _mgr.commit(self.layer_id)
+            # 本层还缺的（staging 还没备到的，或根本没启异步的），当场补：
+            # 判断由 GPU 做（moe_miss_scan），CPU 只拿回缺的那几个 id。
+            _nmiss = 0
+            if (not getattr(self, "_all_pinned", False)
+                    and not torch.cuda.is_current_stream_capturing()):
+                _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
+            if _nmiss:
+                _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
+                if _miss:
+                    _mgr.need(self.layer_id, _miss)
+                    _mgr.commit(self.layer_id)
+                    _mgr.ready(self.layer_id, _miss)
+                    tab = sl._slot_tab
+                    torch.index_select(tab[self.layer_id], 0,
+                                       indices.view(-1).clamp_(0, 383), out=sids)
+                    if bool((sids < 0).any().item()):
+                        raise RuntimeError(
+                            f"MoE layer {self.layer_id}: {_miss} still not resident")
+            # 把本层路由告诉卖家，让它提前备下一层要用的（不阻塞）。
             # 这里不再主动「还槽位」。
             # 原来按「池子装不下整步（40 层 x topk）」判断，小卡每步把整层用过的
             # 专家全扔回去 —— 于是每一步每一层都要重读 4.5GB，8GB 卡永远在
