@@ -657,14 +657,30 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
                  max(1, buffers) * max_layer_b)
     cpu_tables = (embed_b if not embed_gpu else 0.0) + (head_b if not head_gpu else 0.0)
     page_cache_b = min(6.0 * GB, 0.20 * host)
-    # 0.8 of the remainder measured best: 4.8GB of cache held only one token's experts
-    # (273 entries) so the second token missed everything and fetch doubled; ~10GB
-    # reaches the 40% hit rate that keeps the SSD inside its 4.6GB/s envelope.
-    # 纯比例：宿主预算扣掉层 slab、CPU 侧的 embed/head、预留的页缓存之后，80% 给专家
-    # 缓存。这里曾经有一个 128GB 的绝对上限，是 47GB 内存的机器上"再大也没用"的观察值；
-    # 搬到 371GB 的机器上它就成了枷锁 —— 300GB 内存闲置，每个 token 的专家读全靠那点
-    # 缓存兜。比例本身已经保证小机器不会超支。
-    cache_b = int(max(256 * MB, (host - slab_b - cpu_tables - page_cache_b) * 0.8))
+    # 专家缓存的大小：扣掉层 slab、CPU 侧 embed/head、页缓存之后，剩下的给它。
+    #
+    # 以前乘 0.8，理由是「47GB 机器上 4.8GB 太小、10GB 足够」。搬到 371GB 的机器上，
+    # 那个 0.8 意味着 50GB 内存白留 —— 而模型**全部 15360 个专家只要 268.9GB**。
+    # 实测 L20：pool 只拿到 231.4GB = 13214 项，比需要的少 2146 项（14%）。
+    # 于是预热装不下全部，decode 每步有 13-25 个专家要去读盘，
+    # 每层一次 `_miss_scan` 全同步，GPU 利用率被压到 0-16%。
+    #
+    # 改法：**只要装得下就装全部**。判据用「全部专家字节 <= 剩余预算的 92%」，
+    # 那个 8% 留给预热过程中的临时 buffer 和页缓存抖动。装不下时才退回 0.8。
+    _room = max(0.0, host - slab_b - cpu_tables - page_cache_b)
+    _all_experts_b = float(n_layers) * float(getattr(hw, "n_experts", 0) or 0) * 0.0
+    try:
+        _eb = float(getattr(hw, "expert_b", 0) or 0)
+        _ne = float(getattr(hw, "n_experts", 0) or 0)
+        if _eb > 0 and _ne > 0:
+            _all_experts_b = float(n_layers) * _ne * _eb
+    except Exception:
+        _all_experts_b = 0.0
+    if _all_experts_b > 0 and _all_experts_b <= _room * 0.92:
+        # 装得下全部：给足，让 decode 稳态零读盘
+        cache_b = int(max(256 * MB, _all_experts_b * 1.02))
+    else:
+        cache_b = int(max(256 * MB, _room * 0.8))
 
     if len(cards) <= 1:
         layer_card = {i: 0 for i in range(n_layers)}
