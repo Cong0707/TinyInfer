@@ -2506,6 +2506,28 @@ class Engine:
                     # 正确条件：跑完 [_graph_lo, _graph_hi) 就停。
                     if i >= getattr(self, "_graph_hi", 1 << 30):
                         break
+                # **每层进场前把 _active_layer 设成它自己。**
+                #
+                # attention / compressor / indexer 的 state 槽都以 _active_layer 为键
+                # （_kv_buf、_graph_kv_buf、wo_a_bf 这些常驻 buffer 都挂在里面）。
+                # 那个字段原本只在 __init__ 里设一次，于是整套 state 只有「构造时那个
+                # 层号」一个槽：L0 建好 KV buffer，L1..L39 全都读同一块，历史互相覆盖。
+                #
+                # 实测：图里 L0 的 slot5 是 [0,0,0,0]（压根没写进去），整图解码输出是
+                # '<｜begin▁of▁sentence｜># 关于" | 202' 这种噪声，eager 同一 prompt 是
+                # 完整中文。eager 之所以「看起来正常」，是因为它每层都重新分配 buf，
+                # 而捕获期 buf 是常驻的 —— 同一个坑只有图会踩。
+                _al = getattr(b, "layer_id", None)
+                if _al is not None:
+                    for _mod in (getattr(b, "attn", None), getattr(b, "ffn", None)):
+                        if _mod is not None and hasattr(_mod, "_active_layer"):
+                            _mod._active_layer = int(_al)
+                        _cmp = getattr(_mod, "compressor", None)
+                        if _cmp is not None and hasattr(_cmp, "_active_layer"):
+                            _cmp._active_layer = int(_al)
+                        _ix = getattr(_mod, "indexer", None)
+                        if _ix is not None and hasattr(_ix, "_active_layer"):
+                            _ix._active_layer = int(_al)
                 h, pre_mix = b.forward(h, start_pos, pre_mix, positions=positions)
                 _dh = getattr(self, "_dump_h", None)
                 if _dh is not None:
