@@ -1586,7 +1586,13 @@ class Engine:
             # 捕获刚结束（_graph_capturing 为 True）时保持原 buffer 不动：
             # 图已经把捕获期那些 buffer 的地址记进 kernel 参数了，clone 出来的
             # 新内存 fig 内根本看不见。
-            _keep_buf = bool(getattr(self, "_graph_just_captured", False))
+            # 只有「图已经真的建出来了」才 KEEP；warmup 那一次不算。
+            # 原来判的是 _graph_just_captured，而它在 warmup 之前就置 True ——
+            # 于是整个捕获流程里 KV 一次都没恢复，捕获那一轮看到的历史比 warmup
+            # 多一个 token，路由漂到没进槽位的专家上，表里是 -1，kernel 拿
+            # -1 * blob_bytes 当偏移读到别的专家：实测图内 L1 的
+            # sids = [7, 6, 11, -1, -1, 13]，输出 absmax 2.36e37。
+            _keep_buf = bool(getattr(self, "_graph_captured_done", False))
             if _keep_buf:
                 # 捕获刚结束：图已经把捕获期 buffer 的地址记进 kernel 参数了，
                 # 这里**什么都不能改** —— 包括不能把 _kv_window 设成 None。
@@ -2883,9 +2889,13 @@ class Engine:
                         out = self._forward_impl(in_buf, start_pos, None)
                     _graphs.append(_g)
                 torch.cuda.synchronize()
+                # 图已经把捕获期那些 buffer 的地址记进 kernel 参数了；从这一刻起
+                # restore 不能再换 buffer（见 restore 里的 KEEP 分支）。
+                self._graph_captured_done = True
             finally:
                 self.restore(snap)
                 self._graph_just_captured = False
+                self._graph_captured_done = False
                 # 把捕获前那次完整 forward 建好的跨层共享状态放回去（见上面
                 # _keep_rt 的注释）。restore(snap) 会把 _rt 清成 None，那会让
                 # 随后 replay 出来的图在 compressor 里拿到 None。
