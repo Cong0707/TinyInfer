@@ -2995,6 +2995,8 @@ class Engine:
                 try:
                     from .deepseek.hc import _CAP_PRE_IDX as _cpi
                     _cpi.clear()
+                    from .deepseek.hc import _CAP_PRE_MIX_IDX as _cpm
+                    _cpm.clear()
                 except Exception:
                     pass
             finally:

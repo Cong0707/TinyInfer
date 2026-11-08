@@ -254,6 +254,8 @@ _FUSED_PRE_NORM = None
 # 捕获期的输出 buffer 环：图里 pool 分配的中间张量在跨 kernel 使用时内容不稳定
 _CAP_PRE_OUT: dict = {}
 _CAP_PRE_IDX: dict = {}
+_CAP_PRE_MIX: dict = {}
+_CAP_PRE_MIX_IDX: dict = {}
 # dynamic shared memory holds one fp32 row; beyond this the fused path is not worth the
 # opt-in attribute call, so the two-kernel chain stays in charge
 _PRE_NORM_MAX_D = 8192
@@ -294,8 +296,26 @@ def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
                 b, s, hc, d = x.shape
                 if x.dtype == torch.bfloat16 and x.is_cuda and d <= _PRE_NORM_MAX_D:
                     xc = x.reshape(b * s, hc, d).contiguous()
-                    pc = pre_mix.reshape(b * s, hc).float().contiguous()
                     w = weight.contiguous()
+                    # **pre_mix.float() 的产出也必须常驻。**
+                    # 它是这个 kernel 三个输入里唯一在捕获期新分配的（xc 是 view、
+                    # w 是原张量）。图里 kernel 读的是它的地址，而这个地址属于
+                    # graph pool —— replay 之前池里的内容归谁，取决于上一次分配
+                    # 留下的残局。
+                    if torch.cuda.is_current_stream_capturing():
+                        _pb = _CAP_PRE_MIX.get((b * s, hc))
+                        if _pb is None or _pb.device != x.device:
+                            _pb = [torch.empty((b * s, hc), dtype=torch.float32,
+                                               device=x.device) for _ in range(8)]
+                            _CAP_PRE_MIX[(b * s, hc)] = _pb
+                            _CAP_PRE_MIX_IDX[(b * s, hc)] = 0
+                        _j = _CAP_PRE_MIX_IDX[(b * s, hc)]
+                        _pc_ring = _pb[_j]
+                        _CAP_PRE_MIX_IDX[(b * s, hc)] = (_j + 1) % len(_pb)
+                        _pc_ring.copy_(pre_mix.reshape(b * s, hc))
+                        pc = _pc_ring
+                    else:
+                        pc = pre_mix.reshape(b * s, hc).float().contiguous()
                     # **捕获期 out 必须落在常驻 buffer 上。**
                     # 它在 graph pool 里分配，返回后被 attn 当输入用（wqkv 的 h）。
                     # 实测同一个张量在 hc_pre_rms_norm 返回时和图里用的时候内容不同：
