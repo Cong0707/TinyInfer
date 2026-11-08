@@ -642,6 +642,19 @@ class MLACompressedAttention:
                 # 发生，decode 阶段已经不再增长（need 只随 token +1，几何增长
                 # 给的余量足够）。
                 cap = max(need, int(cur.shape[1] * 2) if cur is not None else 1024)
+                # 【已知限制，不是已修复】扩容的显存峰值是两倍：新块和旧块同时存在。
+                # 1M 上下文时单层压缩 KV 是 512MB，扩容瞬间要 1GB。多条会话同时
+                # 扩容就会 OOM。
+                #
+                # 试过「先 clone 到 CPU 再释放旧块」，但那条路在本机（8GB）触发
+                # 不了 —— 1600 个 token 里 cap 只从 0 长到 1024 一次，之后就够用了
+                # （需要 >2048 token 才会再翻倍，而本机跑不了那么长）。
+                # 按纪律「不保留无法验证的改动」，这里退回简单写法，把风险记在
+                # docs/kv_1m_capacity.md 里。
+                #
+                # 真要修，正确的做法是一次性按 max_position_embeddings 预分配
+                # （1M 时每层 512MB，38 层共 7.25GB），代价是短上下文也占满 ——
+                # 那正是这条几何增长想避免的。权衡留给有真卡的场景。
                 grown = torch.zeros(b, cap, self.head_dim,
                                     dtype=latent.dtype, device=latent.device)
                 if cur is not None:
