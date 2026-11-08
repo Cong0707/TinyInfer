@@ -14,19 +14,16 @@ from pathlib import Path
 
 import torch
 
-_REF = Path(__file__).resolve().parents[2] / "reference" / "official"
-if str(_REF) not in sys.path:
-    sys.path.insert(0, str(_REF))
-
-try:
-    import kernel as _k  # noqa: E402  (reference/official/kernel.py)
-except Exception:  # pragma: no cover
-    _k = None
-
-# Block quantisation has a native implementation (kernels/cuda/act_quant.cu) that is
-# bit-identical to the reference's; it is used for every act_quant call below so the
-# decode path does not need tilelang's JIT. _k is still what provides fp8_gemm/fp4_gemm
-# for the M>1 fallback (prefill), so tilelang remains required for prefill only.
+# **这里不再有任何 tilelang 依赖。**
+#
+# 曾经有一段把官方参考实现的 kernel.py（tilelang JIT）挂进 sys.path 当 fp8/fp4 GEMM 的
+# 大 M 兜底。现在那条路已经由我们自己的 kernel 全部接管：
+#   M=1        -> fp8_gemv_bs / fp8_gemv_inline_q / gemv_fp4_w4a8   (native)
+#   M>=128     -> mma_gemm.fp8_gemm_mma                             (native)
+#   M 在中间   -> 逐行走上面的 GEMV（慢，但只有 prefill 尾块会落到这里）
+#   fp4 的任意 M -> 逐行 gemv_fp4_w4a8                              (native)
+# 官方参考实现只在 /models/deepseek/inference 里作为**只读对拍基准**存在，
+# 不拷进仓库、不作为运行时依赖。
 from .kernels.quant import act_quant as _act_quant  # noqa: E402
 
 # HF's V4.1 fp8 blocks use ue8m0 scales (see official model.py globals)
@@ -37,15 +34,10 @@ SCALE_DTYPE = torch.float8_e8m0fnu
 def available() -> bool:
     """True when the fp8 kernels can run.
 
-    NOT "tilelang imported". fp8_linear's decode path (M=1) is the native fp8_gemv_bs
-    kernel and needs no tilelang at all; gating on _k made every QuantLinear fall back to
-    dequantise-then-matmul, which is a DIFFERENT computation -- measured: a run with
-    tilelang blocked produced [2058, 3] where the fp8 path produces [989, 43].
-    tilelang is still needed for the M>1 (prefill) branch, and that is the branch that
-    falls back to _k.fp8_gemm.
+    「能用」的判据是 native kernel 能加载，不是某个第三方包导入得了。曾经按
+    "tilelang imported" 判断，于是没有 tilelang 的机器上每个 QuantLinear 都退回
+    「反量化再 matmul」—— 那是**另一种计算**，实测 [2058, 3] vs fp8 路径的 [989, 43]。
     """
-    if _k is not None:
-        return True
     try:
         from .kernels import native
 
@@ -322,8 +314,8 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             if x.dim() != 2:
                 x = xf
     # Prefill (M > 8 or a shape the GEMV does not cover): the native tensor-core GEMM.
-    # This used to be the tilelang _k.fp8_gemm; the mma kernel is the replacement and
-    # takes M >= 128, which is what a prefill chunk is.
+    # Prefill 的大 M 走 tensor-core GEMM：mma kernel 要求 M >= 128，正好是一个
+    # prefill chunk 的量级。这是官方 tilelang kernel 的替代，不是它的封装。
     if x.is_cuda and x.dim() == 2 and x.size(0) >= 128 and block == 32:
         try:
             from .kernels import mma_gemm
@@ -331,13 +323,9 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             return mma_gemm.fp8_gemm_mma(x, w_fp8, w_scale)
         except Exception:
             pass
-    if _k is not None:
-        with _bf16_default():
-            x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
-            return _k.fp8_gemm(x_fp8, x_s, w_fp8, w_scale, SCALE_DTYPE, block_size=block)
-    # No tilelang, or the caller's shape fell through the branches above: the only kernel
-    # left is the native M=1 one, so run it row by row. Same numbers as the block-M GEMM
-    # (it is the same maths, one row at a time), just slower.
+    # 上面的分支都没接住（典型是 M 在 9..127 之间）：只剩 native 的 M=1 kernel，
+    # 按行跑。数值与 block-M GEMM 相同（同一套算术，一次一行），只是慢。
+    # prefill 的尾块会落到这里，所以这是正确性必须的一条路。
     xf = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
     if xf.size(0) == 1:
         # 走到这里说明 M=1 没有落到任何快速路径。**必须有一条正确的兜底**：
@@ -369,7 +357,7 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
                 f"dim={x.dim()} M={x.size(0)} block={block} "
                 f"w={tuple(w_fp8.shape)} K%16={(w_fp8.shape[1] % 16)} "
                 f"N%16={(w_fp8.shape[0] % 16)} native={_fp8_native()} "
-                f"k={_k is not None} xdt={x.dtype} wdt={w_fp8.dtype})") from _exc
+                f"xdt={x.dtype} wdt={w_fp8.dtype})") from _exc
     rows = [fp8_linear(xf[i:i + 1], w_fp8, w_scale, block) for i in range(xf.size(0))]
     out = torch.cat(rows, dim=0)
     return out.view(*x.shape[:-1], out.shape[-1])
@@ -421,20 +409,8 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
             aq, asc = fp4_act_quant(x[i:i + 1], act_block)
             rows.append(gemv_fp4_w4a8(aq, asc, w_fp4, w_scale))
         return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
-    with _bf16_default():
-        x_fp8, x_s = _act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
-        if _k is None:
-            raise RuntimeError(
-                "fp4_linear: no path for this shape (not CUDA and the vendor reference "
-                f"kernel is gone): M={x.size(0)} K={w_fp4.shape[1] * 2} N={w_fp4.shape[0]}")
-        out = _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)
-    # same story as gemv_fp4._keep: the tilelang GEMM launches itself, so the allocator
-    # has no record of the expert weights it is still reading
-    if x_fp8.is_cuda:
-        try:
-            _cur = torch.cuda.current_stream()
-            for _t in (x_fp8, x_s, w_fp4, w_scale, out):
-                _t.record_stream(_cur)
-        except Exception:
-            pass
+    raise RuntimeError(
+        "fp4_linear: no CUDA path for this shape (GPU-only kernel): "
+        f"M={x.size(0)} K={w_fp4.shape[1] * 2} N={w_fp4.shape[0]} "
+        f"is_cuda={x.is_cuda} dim={x.dim()}")
     return out
