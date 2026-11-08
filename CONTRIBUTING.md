@@ -2,7 +2,7 @@
 
 ## 环境
 
-见 [docs/ENV.md](docs/ENV.md)，Windows 用 [scripts/bootstrap.ps1](scripts/bootstrap.ps1)，
+见 [docs/环境.md](docs/环境.md)，Windows 用 [scripts/bootstrap.ps1](scripts/bootstrap.ps1)，
 Linux 用 [scripts/bootstrap.sh](scripts/bootstrap.sh)。
 
 自写 kernel 需要 CUDA toolkit 的 `nvcc`：
@@ -59,7 +59,7 @@ Vendoring it took one file (src/tinyinfer/gemv_fp4_marlin.py, ~150 lines): repac
 weights once at load with gptq_marlin_repack, permute the e8m0 scales into the block order
 the dequantiser reads, then call marlin_gemm. Correctness is checked against a hand decode
 of E2M1 (max relative error 4.7e-3, i.e. bf16 activation precision). Full numbers in
-docs/vllm-baseline.md.
+docs/README.md.
 
 So: vendor the upstream kernel, adapt its interface, keep its name in a comment with the
 commit or version it came from, and only then consider a replacement. A from-scratch kernel

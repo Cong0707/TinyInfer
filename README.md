@@ -12,11 +12,11 @@
 
 | 想知道什么 | 看哪份 |
 | --- | --- |
-| 时间花在哪、为什么优化不动了 | `docs/decode_bounds.md`（实测分解 + 三条硬件上限） |
-| 和 vLLM 比谁强、强在哪 | `docs/vs-vllm.md`（20GB 以上零 PCIe；kernel 慢 4.15x） |
-| 怎么测量才不会骗自己 | `docs/MEASUREMENT.md`（5 类陷阱 + 8 条被否决的尝试） |
-| 引擎怎么做决策 | `docs/architecture.md`（没有卡型号查表，全部按实测字节求解） |
-| 历史性能记录 | `docs/benchmarks.md`、`docs/decode_speed.md`（**已过时，仅存档**） |
+| 时间花在哪、为什么优化不动了 | `docs/README.md`（实测分解 + 三条硬件上限） |
+| 和 vLLM 比谁强、强在哪 | `docs/README.md`（20GB 以上零 PCIe；kernel 慢 4.15x） |
+| 怎么测量才不会骗自己 | `docs/README.md`（5 类陷阱 + 8 条被否决的尝试） |
+| 引擎怎么做决策 | `docs/架构.md`（没有卡型号查表，全部按实测字节求解） |
+| 历史性能记录 | `docs/README.md`、`docs/README.md`（**已过时，仅存档**） |
 
 跑一遍验证：
 

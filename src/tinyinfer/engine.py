@@ -239,7 +239,7 @@ class Engine:
                 raise RuntimeError(
                     f"not enough VRAM for this checkpoint: {self.hw_plan.reason}. "
                     "The engine needs a card that can hold at least the streaming ring "
-                    "plus the tilelang workspace; see docs/PERFORMANCE.md.")
+                    "plus the tilelang workspace; see docs/README.md.")
         if expert_store is None and self.tier.level >= OptLevel.BALANCED:
             # production tiers own their ExpertStore (RAM cache + VRAM slots)
             try:
@@ -495,7 +495,7 @@ class Engine:
         else:
             self.expert_store = expert_store
         # The VRAM slot pool is faster but not bit-reproducible yet (a slot can be
-        # re-targeted while the GEMV that reads it is still queued; docs/analysis.md
+        # re-targeted while the GEMV that reads it is still queued; docs/README.md
         # section 10). TI_NO_SLOTS=1 trades about 40% of decode for deterministic logits.
         # **冷启动 = 进程一起来就让磁盘开工，并且请求不被它挡住。**
         #
@@ -554,7 +554,7 @@ class Engine:
         self.prefill_chunk = 2048  # overridden by the hardware plan on cuda
         # TI_PREFILL_CHUNK=1 forces the exactly reference-matching prefill path (each
         # token its own block); the planner's chunk is ~0.5% harder but 1.6x faster
-        # (docs/analysis.md 13).
+        # (docs/README.md 13).
         _pc = __import__("os").environ.get("TI_PREFILL_CHUNK")
         if _pc:
             try:
@@ -1842,7 +1842,7 @@ class Engine:
                     # torch.frombuffer reports for the same slice do not agree on Windows
                     # (measured: base 8.67e9 vs data_ptr 5.3e12), so the span arithmetic
                     # cannot be trusted until the loader lays weights out for it directly.
-                    # See docs/deepseek-v41-flash.md; TI_ZC=1 turns the experiment on.
+                    # See docs/模型结构.md; TI_ZC=1 turns the experiment on.
                     if (no_overlap and span <= total_b + 65536 * len(actual)
                             and __import__("os").environ.get("TI_ZC") == "1"):
                         lay[i] = (actual, span)

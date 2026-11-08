@@ -42,7 +42,7 @@ def test_this_box_shape():
     assert 1 <= p.gpu_layers <= 6          # measured 4 here
     assert p.stream_layers == N - p.gpu_layers
     # The planner used to zero a small pool because a stale "ready" slot could hand back
-    # the wrong bytes (docs/analysis.md 16). The pool now writes its own slot table and
+    # the wrong bytes (docs/README.md 16). The pool now writes its own slot table and
     # only ever returns bytes it just placed (tests/test_slot_pool.py), so a small pool
     # is simply a small pool: it must still exist, and it must not eat the residency.
     assert p.expert_slots >= 2

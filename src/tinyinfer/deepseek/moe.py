@@ -532,7 +532,7 @@ class MoE:
         # 这一批里反复覆盖，命中率归零。11 行 x 6 = 66 个请求 vs 8GB 卡的 14 个
         # 槽位 —— 必须分；L20 的 1359 个槽位 —— 66 个绰绰有余，根本不需要分。
         #
-        # 而且实测（docs/nan_batch_verdict.md）：**分批路径有多行 NaN bug**，
+        # 而且实测（docs/README.md）：**分批路径有多行 NaN bug**，
         # 位置随批次大小移动、加任何 hook 就消失（数据竞争，打印法追不到）。
         # 不分批时 N=8/11/12/16/20 全部正确。
         #
@@ -545,7 +545,7 @@ class MoE:
             _topk = max(1, int(indices.numel()) // max(1, _rows))
             _sl = getattr(getattr(self, "_expert_store", None), "slots", None)
             _cap = int(getattr(_sl, "slots", 0) or 0)
-            # 实测（docs/moe_batching_default.md）：8GB 卡**不分批**时能跑
+            # 实测（docs/README.md）：8GB 卡**不分批**时能跑
             # N=20..192 的 prefill，全部不 OOM。
             #
             # 试过「槽位不够就按 cap//topk 分批」，**没有改善**（误差从 0.0085

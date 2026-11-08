@@ -29,7 +29,7 @@ def _engine():
     return eng, tok
 
 
-@pytest.mark.xfail(reason="a second prefill in the same session drifts by >1 logit; the residual session state is not fully cleared yet (see docs/changelog.md)", strict=False)
+@pytest.mark.xfail(reason="a second prefill in the same session drifts by >1 logit; the residual session state is not fully cleared yet ", strict=False)
 @requires_cuda
 def test_repeat_prefill_same_argmax():
     """A second prefill in the same session must match the first (session reset)."""

@@ -18,7 +18,7 @@ It is deliberately backend-agnostic:
   (HF safetensors, fp8/fp4 experts).  It loads lazily and runs the reference
   PyTorch forward; per-slot KV ownership is left for the engine integration.
 
-Design notes (see docs/api.md):
+Design notes (see docs/接口.md):
 
 * One HTTP request takes exactly one *slot*.  A slot owns the KV cache and any
   expert cache the backend keeps for a conversation; the server only tracks

@@ -1,46 +1,46 @@
 # 文档
 
-## 入门
+这个目录只放三类东西：
 
-- [QUICKSTART](QUICKSTART.md) — 从零到跑起来
-- [ENV](ENV.md) — 环境变量与运行时开关
-- [HARDWARE](HARDWARE.md) — 硬件要求与实测机型
-- [faq](faq.md) — 常见问题
+- **架构定义** —— 引擎由哪些部件构成、部件之间的契约
+- **设计** —— 某个机制为什么这样设计、边界条件在哪
+- **流程** —— 构建、部署、启动、排障的操作顺序
+
+不放调查记录、草稿、一次性分析、复盘。那些属于过程，不属于文档。
+
+## 架构
+
+| 文件 | 内容 |
+| --- | --- |
+| [架构.md](架构.md) | 引擎分层与一次推理的数据流 |
+| [模型结构.md](模型结构.md) | DeepSeek-V4.1-Flash 的层、专家、注意力规格 |
 
 ## 设计
 
-- [architecture](architecture.md) — 模块结构、流式模型、会话
-- [PHILOSOPHY](PHILOSOPHY.md) — 取舍的理由
-- [loading](loading.md) — 权重加载、分片、跨盘布局
-- [level2_mechanisms](level2_mechanisms.md) — 流式、专家缓存、门控预取
-- [mtp_design](mtp_design.md) — 多 token 预测
-- [long_context](long_context.md) — 长上下文与压缩注意力
+| 文件 | 内容 |
+| --- | --- |
+| [设计-专家加载.md](设计-专家加载.md) | 显存槽位 / 内存缓存 / 磁盘分片三级存储与槽位管理 |
+| [设计-槽位策略.md](设计-槽位策略.md) | 槽位分配、回收与 pin 的判定规则 |
+| [设计-二级机制.md](设计-二级机制.md) | 除主路径外的优化机制清单 |
+| [设计-MTP.md](设计-MTP.md) | 多 token 预测 |
 
-## Kernel
+## 内核
 
-- [kernels](kernels.md) — 每个 kernel 的实现说明
-- [kernels_provenance](kernels_provenance.md) — 官方移植 / 重实现的来源对照
+| 文件 | 内容 |
+| --- | --- |
+| [内核清单.md](内核清单.md) | 每个 CUDA kernel 的入参契约、几何约束与数值口径 |
 
-## 性能
+## 接口与硬件
 
-- [PERFORMANCE](PERFORMANCE.md) — 实测数字
-- [benchmarks](benchmarks.md) — 基准方法与经验规则
-- [decode_speed](decode_speed.md) — 每项优化带来的变化
-- [lower_bounds](lower_bounds.md) — 硬件物理下限的推算
+| 文件 | 内容 |
+| --- | --- |
+| [接口.md](接口.md) | 对外 HTTP / OpenAI 兼容接口 |
+| [硬件.md](硬件.md) | 目标硬件的规格与由此推出的约束 |
 
-## 正确性
+## 流程
 
-- [parity](parity.md) — 与参考实现的分量级对比
-- [GLOSSARY](GLOSSARY.md) — 术语（slab / ring / slot / tier）
-
-## 使用
-
-- [api](api.md) — HTTP API
-- [OPERATIONS](OPERATIONS.md) — 运维
-- [EXTENDING](EXTENDING.md) — 接入新模型 / 新 kernel
-- [changelog](changelog.md) — 变更记录
-- [ROADMAP](ROADMAP.md) — 计划
-
-## history/
-
-过程记录与早期分析，保留备查，不是给使用者看的。
+| 文件 | 内容 |
+| --- | --- |
+| [环境.md](环境.md) | 依赖、编译、构建产物约定 |
+| [快速开始.md](快速开始.md) | 从零到跑通一条推理 |
+| [部署.md](部署.md) | 部署与冷启动顺序 |

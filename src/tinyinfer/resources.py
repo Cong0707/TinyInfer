@@ -526,7 +526,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         resident = min(n_layers, layers_that_fit(False, False, buffers, ws0))
 
     # VRAM headroom knob: on cards where the plan uses ~85% of physical VRAM the driver
-    # can page, which makes identical runs differ (docs/analysis.md 19). Lower residency
+    # can page, which makes identical runs differ (docs/README.md 19). Lower residency
     # trades speed for a better chance of reproducibility.
     _cap = __import__("os").environ.get("TI_MAX_RESIDENT")
     if _cap:

@@ -28,7 +28,7 @@ def _engine(nlayers=4):
     """每个用例一个引擎 —— 跨用例共享会让第二个用例拿到被污染的共享状态。
 
     实测：同一个引擎上先跑一个用例、再跑另一个，第二个会出 NaN。
-    这与 docs/measurement_discipline.md 里「一进程一引擎」是同一条纪律。
+    这与 docs/README.md 里「一进程一引擎」是同一条纪律。
     """
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")

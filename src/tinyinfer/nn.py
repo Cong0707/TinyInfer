@@ -454,7 +454,7 @@ def precompute_freqs_cis(
         # DeepInfer (the model author's serving stack) applies yarn_get_mscale:
         # 0.1*ln(factor)+1 = 1.277 at factor 16, and the author's stack is the authority
         # this engine aligns to. The plain HF reference table omits it, which is why
-        # docs/parity.md records the DeepInfer comparison as the reference one.
+        # docs/README.md records the DeepInfer comparison as the reference one.
         _ms = float(os.environ.get("TI_YARN_MSCALE", "1.0"))
         if factor > 1 and _ms:
             mscale = 0.1 * _ms * math.log(factor) + 1.0

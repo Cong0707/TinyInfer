@@ -1,7 +1,7 @@
 """Print the planner's decision across a matrix of hypothetical machines.
 
 Nothing here touches a GPU: it is the portability check for "it must also work on other
-boxes". The last two columns apply the IO arithmetic (docs/lower_bounds.md) so the
+boxes". The last two columns apply the IO arithmetic (docs/README.md) so the
 predicted decode floor can be compared with a real run on that hardware.
 
 Run with PYTHONPATH=src.

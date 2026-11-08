@@ -18,7 +18,7 @@ they are read:
     RAM (17.7 GB non-expert) -> VRAM attention weights (fp8, pinned layers)
 
 The reference numbers used by the planner come from the HF checkpoint itself
-(see docs/loading.md):
+(see docs/设计-专家加载.md):
 
 * routed expert blob = 18,800,640 B (w1/w2/w3 fp4 + their ue8m0 scales)
 * one decode token reads 6 experts x 40 layers = 240 blobs = 4.512 GB

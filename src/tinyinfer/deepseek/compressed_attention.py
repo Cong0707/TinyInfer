@@ -716,7 +716,7 @@ class MLACompressedAttention:
                 # 不了 —— 1600 个 token 里 cap 只从 0 长到 1024 一次，之后就够用了
                 # （需要 >2048 token 才会再翻倍，而本机跑不了那么长）。
                 # 按纪律「不保留无法验证的改动」，这里退回简单写法，把风险记在
-                # docs/kv_1m_capacity.md 里。
+                # docs/README.md 里。
                 #
                 # 真要修，正确的做法是一次性按 max_position_embeddings 预分配
                 # （1M 时每层 512MB，38 层共 7.25GB），代价是短上下文也占满 ——
