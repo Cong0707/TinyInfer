@@ -416,7 +416,11 @@ class MLAWindowAttention:
             if torch.cuda.is_current_stream_capturing():
                 from ..nn import _pos_buf
                 _slot = (_pos_buf(x.device) % self.window).to(torch.long)
-                buf.index_copy_(1, _slot.reshape(1), kv[:, 0])
+                # buf 是 [b, window, d]，kv[:, 0] 是 [b, d]：按第 1 维拷贝要降一维，
+                # 否则 index_copy_ 报 dimensionality must match (2 vs 3)。
+                buf2 = buf.reshape(buf.shape[0], self.window, -1)
+                for _r in range(buf.shape[0]):
+                    buf2[_r].index_copy_(0, _slot.reshape(1), kv[_r, 0:1])
             else:
                 buf[:, start_pos % self.window] = kv[:, 0]
         else:
