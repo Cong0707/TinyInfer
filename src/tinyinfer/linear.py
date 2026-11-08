@@ -121,7 +121,20 @@ class QuantLinear:
             # owns.
             weight, scale = self.weight, self.scale
             if weight.device != x.device:
-                return self._one(x, weight.to(x.device), scale.to(x.device))
+                # **捕获期禁止在这里做 H2D。**
+                # weight.to(x.device) 会新开一块显存，它被写进图里 kernel 的参数；
+                # 捕获结束这块临时内存被 allocator 回收，replay 读到的就是别人的
+                # 字节（实测输出 absmax 2.36e37，正是 bf16 把任意 16 位当数值
+                # 解释的量级）。eager 每步都重新搬一次所以永远正常，只有
+                # 「不同层 / 冷权重 + CUDA graph」这个组合才暴露。
+                if torch.cuda.is_current_stream_capturing():
+                    # 就地搬一次并留下引用：之后 weight.device 已经是 x.device，
+                    # 图里拿到的是长期存活的地址。
+                    self.weight = weight = weight.to(x.device)
+                    self.scale = scale = scale.to(x.device)
+                    self.parts = [(weight.device, weight, scale)]
+                else:
+                    return self._one(x, weight.to(x.device), scale.to(x.device))
             return self._one(x, weight, scale)
         xdev = x.device
         outs = []
