@@ -2889,6 +2889,41 @@ class Engine:
         except Exception:
             pass
 
+        # **压缩 KV 池也必须预建到足够大。**
+        #
+        # 捕获期 compress_kv 的宽度会进图的 kernel 参数（切片/掩码都按它算）。
+        # 池子在 decode 期间一旦扩容，_full 就换了一块新显存，图里记的还是旧地址 ——
+        # replay 读到的是已被回收的内容。这里按 max_position_embeddings // ratio
+        # 一次性建满，decode 期间不再增长。
+        try:
+            _mx = int(getattr(self.cfg, "max_position_embeddings", 0) or 0)
+            _ratios = list(getattr(self.cfg, "compress_ratios", ()) or ())
+            _hdim = int(self.cfg.head_dim)
+            for _lid, _blk in getattr(self, "_blocks", {}).items():
+                _att = getattr(_blk, "attn", None)
+                if _att is None or not _ratios or _lid >= len(_ratios):
+                    continue
+                _rt = int(_ratios[_lid])
+                if _rt <= 0 or _mx <= 0:
+                    continue
+                # 上限 4096 组：1M 上下文按 ratio 2 算是 500k 组、每层 512MB，
+                # 40 层直接吃满整卡。4096 组足够覆盖 8k token 以内的 decode，
+                # 更长的上下文回落到「池子扩容 → 重新捕获」（见 _graph_run 里的形状检查）。
+                _need = max(1024, min(4096, _mx // _rt))
+                _old = getattr(_att, "_active_layer", None)
+                try:
+                    _att._active_layer = int(_lid)
+                    _cur = _att._compress_kv
+                    if _cur is None or _cur.shape[1] < _need:
+                        _att._compress_kv = torch.zeros(1, _need, _hdim,
+                                                        dtype=torch.bfloat16,
+                                                        device=self.device)
+                finally:
+                    if _old is not None:
+                        _att._active_layer = _old
+        except Exception:
+            pass
+
         b, s = int(ids.shape[0]), int(ids.shape[1])
         d = int(self.cfg.dim)
         hc_mult = int(self.cfg.hc_mult)

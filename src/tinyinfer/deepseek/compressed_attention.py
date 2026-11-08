@@ -763,19 +763,39 @@ class MLACompressedAttention:
             # 于是浅的行会读到深的行才写出来的组 —— 那些组对它来说是「未来」，
             # 语义上不该可见。这里是拼批正确性的最后一块。
             _full = self.rt.compress_kv
+            # **宽度必须是常量，可见范围只能是掩码。**
+            #
+            # compress_len = end_pos // ratio 每步都变大，而 CUDA graph 里
+            # `_full[:, :compress_len]` 的切片宽度在捕获那一刻就定死了：replay 时
+            # 永远只取捕获时那么宽，后面新写进池子的压缩组一个都看不到。
+            #
+            # 实测：92 token 的 prompt 之后，图解码成
+            #   '这段话的核心意思是是张量：深度学习中的所有张量：张量：张：张张：张张'
+            # 而同一个 prompt 走 eager 是通顺正确的
+            #   '张量是深度学习的基础数据结构，涵盖图像、文本、权重矩阵等各类张量…'
+            #
+            # 这里把宽度固定成池子的全部宽度（形状在图里恒定），能用哪一段完全由
+            # 掩码决定 —— 掩码的界来自 _POS_BUF，图里跟着位置走。
+            _width = int(_full.size(1))
             if b > 1 and _grp0 is not None:
                 _own = _grp0.reshape(b, -1)[:, -1] + int(latent.size(1)) \
                     if latent is not None else None
                 if _own is not None:
-                    # 用一个 [b, full_len, d] 的掩码把每行的可见范围之外清零
-                    _gidx = torch.arange(_full.size(1), device=_full.device)
+                    _gidx = torch.arange(_width, device=_full.device)
                     _vis = (_gidx.unsqueeze(0) < _own.unsqueeze(1))
-                    compress_kv = _full[:, :compress_len] * _vis[:, :compress_len] \
-                        .unsqueeze(-1).to(_full.dtype)
+                    compress_kv = _full * _vis.unsqueeze(-1).to(_full.dtype)
+                else:
+                    compress_kv = _full
+            else:
+                if torch.cuda.is_current_stream_capturing():
+                    # 单行：可见组数 = position // ratio，界从 device 读。
+                    from ..nn import _pos_buf
+                    _cl = (_pos_buf(x.device) // ratio_now).to(torch.long)
+                    _gidx = torch.arange(_width, device=_full.device)
+                    _vis = (_gidx < _cl).to(_full.dtype)
+                    compress_kv = _full * _vis.unsqueeze(0).unsqueeze(-1)
                 else:
                     compress_kv = _full[:, :compress_len]
-            else:
-                compress_kv = _full[:, :compress_len]
             if self.indexer is not None:
                 if _pt is not None:
                     _t2 = __import__("time").perf_counter()
