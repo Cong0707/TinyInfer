@@ -1576,7 +1576,23 @@ class Engine:
                 continue
             b = self.block(i)
             a = b.attn
-            _kv = None if entry.get("kv") is None else entry["kv"].clone()
+            # **捕获期必须原地写回，不能 clone。**
+            # restore() 在 _graph_try_capture 的 finally 里跑，而这时图已经把
+            # 捕获期那些 buffer 的地址记进 kernel 参数了。clone() 会换一块新内存，
+            # 于是图内 kernel 操作的地址和 Python 侧持有的地址从此分离：replay 时
+            # 写的是旧地址（已被 allocator 回收），读回来就是垃圾 —— 实测 L1 的
+            # 输出 absmax 是 2.36e37，正是 bf16 把别人的字节当数值解释的量级。
+            # L0 侥幸正确是因为它的窗口路径不走这块 buffer。
+            # 捕获刚结束（_graph_capturing 为 True）时保持原 buffer 不动：
+            # 图已经把捕获期那些 buffer 的地址记进 kernel 参数了，clone 出来的
+            # 新内存 fig 内根本看不见。
+            _keep_buf = bool(getattr(self, "_graph_just_captured", False))
+            if entry.get("kv") is None:
+                _kv = None
+            elif _keep_buf:
+                _kv = None   # 保持原 buffer，restore 不动它
+            else:
+                _kv = entry["kv"].clone()
             # 环形槽位 cache 之后 _kv_window 和 _kv_buf 是同一块 buffer（forward 里
             # 直接 self._kv_window = buf），两个 property 各自映射到自己的 state key
             # （attention 是 "buf"，compressed 是 "winbuf"），所以两处都要写 ——
@@ -2761,6 +2777,8 @@ class Engine:
                 pass
             _pinned_on = []
             snap = self.snapshot()
+            # 捕获流程内部的 restore(snap) 必须保留图内 buffer（见 restore 里的注释）
+            self._graph_just_captured = True
             _keep_rt = None   # finally 里要用，必须在 try 之外初始化
             try:
                 in_buf = ids.clone()
@@ -2841,6 +2859,7 @@ class Engine:
                 torch.cuda.synchronize()
             finally:
                 self.restore(snap)
+                self._graph_just_captured = False
                 # 把捕获前那次完整 forward 建好的跨层共享状态放回去（见上面
                 # _keep_rt 的注释）。restore(snap) 会把 _rt 清成 None，那会让
                 # 随后 replay 出来的图在 compressor 里拿到 None。
