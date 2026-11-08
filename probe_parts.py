@@ -11,36 +11,33 @@ b = e._blocks[0]
 HC, D = e.cfg.hc_mult, e.cfg.dim
 torch.manual_seed(0)
 x = torch.randn(2, 1, HC, D, dtype=torch.bfloat16, device="cuda") * 0.02
-pos = torch.tensor([1, 2], dtype=torch.long, device="cuda")
+from tinyinfer.nn import rms_norm
 
-def reset_all():
-    for sub in (b.attn, getattr(b.attn, "compressor", None), getattr(b.attn, "indexer", None)):
-        if sub is not None and hasattr(sub, "reset"):
-            sub.reset()
+def fresh():
+    b.attn.reset()
+    b.attn._kv_buf = None
 
-def run_attn(n):
-    reset_all()
+def prep(n):
     pm = torch.zeros(n, 1, HC, dtype=torch.float32, device="cuda")
     pm[:, :, 0] = 1.0
-    h = b.hc_pre(x[:n], pm)
-    from tinyinfer.nn import rms_norm
-    h = rms_norm(h, b.attn_norm, e.cfg.rms_norm_eps)
-    o = b.attn.forward(h, 0, positions=pos[:n])
-    return o.float()
+    return rms_norm(b.hc_pre(x[:n], pm), b.attn_norm, e.cfg.rms_norm_eps)
 
-a1 = run_attn(1)
-a2 = run_attn(2)
-print("attn shapes", tuple(a1.shape), tuple(a2.shape), flush=True)
-print("attn row0 maxdiff = %.6f" % float((a2[0] - a1[0]).abs().max()), flush=True)
+# 单行，position 1
+fresh(); h1 = prep(1)
+o1 = b.attn.forward(h1, 0, positions=torch.tensor([1], device="cuda")).float()
 
-def run_ffn(n):
-    pm = torch.zeros(n, 1, HC, dtype=torch.float32, device="cuda")
-    pm[:, :, 0] = 1.0
-    h = b.hc_pre(x[:n], pm)
-    from tinyinfer.nn import rms_norm
-    h = rms_norm(h, b.ffn_norm, e.cfg.rms_norm_eps)
-    return b.ffn.forward(h).float()
+# 两行，位置 [1, 2]：第 0 行应等于 o1
+fresh(); h2 = prep(2)
+o2 = b.attn.forward(h2, 0, positions=torch.tensor([1, 2], device="cuda")).float()
+print("row0 vs single  = %.6f" % float((o2[0:1] - o1).abs().max()), flush=True)
 
-f1 = run_ffn(1)
-f2 = run_ffn(2)
-print("ffn row0 maxdiff = %.6f" % float((f2[0] - f1[0]).abs().max()), flush=True)
+# 两行，位置 [1, 1]
+fresh(); h3 = prep(2)
+o3 = b.attn.forward(h3, 0, positions=torch.tensor([1, 1], device="cuda")).float()
+print("row0 pos[1,1]   = %.6f" % float((o3[0:1] - o1).abs().max()), flush=True)
+
+# 两行，位置都是 1，但第 1 行数据与第 0 行相同 -> 两行输出必须一致
+fresh()
+h4 = h3.clone(); h4[1] = h4[0]
+o4 = b.attn.forward(h4, 0, positions=torch.tensor([1, 1], device="cuda")).float()
+print("identical rows  = %.6f" % float((o4[0] - o4[1]).abs().max()), flush=True)

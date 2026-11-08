@@ -284,7 +284,20 @@ class MLAWindowAttention:
         # one shared table per (dim, seqlen, yarn args): resolving it through the cache
         # (rather than .to() per instance) keeps a single device copy instead of 40
         self.freqs_cis = get_table(self._rope_key, self._rope_factory, x.device)
-        freqs = self.freqs_cis[start_pos:start_pos + s]
+        # RoPE 频率必须**逐行**取：batch>1 时各行位置不同（一行在做 prefill、
+        # 另一个已经解码了几步），用同一个 start_pos 切片会让所有行套用同一组
+        # 旋转角度，位置对不上的行就是错的。
+        # 单行时退化成原来的切片，数值不变。
+        if positions is not None and b > 1:
+            _pr = positions.reshape(b, -1)
+            if _pr.size(1) >= s:
+                # [b, s] -> gather 成 [b, s, d/2]
+                freqs = self.freqs_cis.index_select(0, _pr[:, :s].reshape(-1))
+                freqs = freqs.view(b, s, -1)
+            else:
+                freqs = self.freqs_cis[start_pos:start_pos + s]
+        else:
+            freqs = self.freqs_cis[start_pos:start_pos + s]
 
         def _lin(w, x_):
             return w.forward(x_) if hasattr(w, "forward") else F.linear(x_, w)

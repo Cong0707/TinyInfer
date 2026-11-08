@@ -292,6 +292,13 @@ def _apply_rope_cuda(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool):
     npos = int(freqs_cis.shape[0])
     if npos <= 0:
         return None
+    # freqs 必须是「每行一组连续位置」的表：CUDA kernel 用 _rotary_cache 把它
+    # 当作 [npos, rot/2] 的连续表来索引。逐行传给它的 freqs（不同行位置不同）
+    # 形状合法但语义不对 —— kernel 会把第 2 行当第 1 行的下一个位置。
+    # 这里只接受「一维位置表」（dim == 2）或「与 x 的 token 数一致的」（dim == 3
+    # 且第 0 维是 token 数、但那是 gather 出来的逐 token 表，需要逐 token 常量 stride）。
+    if freqs_cis.dim() > 2:
+        return None
     heads = int(x.shape[-2])
     hstride = int(x.stride(-2))
     ntokens = 1
@@ -319,12 +326,29 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) 
         return _r
     y = x
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-    if inverse:
-        freqs_cis = freqs_cis.conj()
-    if xc.ndim == 3:
-        f = freqs_cis.view(1, xc.size(1), xc.size(-1))
+    # freqs_cis 有两种形态：
+    #   [npos, d/2]        —— 一段连续位置的表，整批共用同一段（单行 / 同相位）
+    #   [b, s, d/2]        —— 每行每列各自的频率（batch>1 且各行位置不同）
+    # 第二种是 gather 出来的，不能 view 成「从位置 0 开始的连续表」，
+    # 否则第 2 行会被当成第 1 行的下一个位置。
+    _row_major = (freqs_cis.dim() == 3)
+    if _row_major:
+        f = freqs_cis
+        if inverse:
+            f = f.conj()
+        if f.shape[0] == 1 and xc.shape[0] > 1:
+            f = f.expand(xc.shape[0], -1, -1)
+        if xc.ndim == 3:
+            f = f.reshape(xc.shape[0], xc.shape[1], xc.shape[-1])
+        else:
+            f = f.unsqueeze(2)
     else:
-        f = freqs_cis.view(1, xc.size(1), 1, xc.size(-1))
+        if inverse:
+            freqs_cis = freqs_cis.conj()
+        if xc.ndim == 3:
+            f = freqs_cis.view(1, xc.size(1), xc.size(-1))
+        else:
+            f = freqs_cis.view(1, xc.size(1), 1, xc.size(-1))
     out = torch.view_as_real(xc * f).flatten(-2)
     y.copy_(out)
     return y

@@ -9,6 +9,10 @@ output with shape [1, T, 512] doesn't match [2, T, 512]，实测 10 次请求
 
 import pytest
 
+# 这一组要加载真 checkpoint 并独占引擎锁（一台机器只能有一个引擎），
+# 所以按 slow 归类：默认门禁跳过，用 pytest -m slow 单跑。
+pytestmark = pytest.mark.slow
+
 torch = pytest.importorskip("torch")
 
 import sys
