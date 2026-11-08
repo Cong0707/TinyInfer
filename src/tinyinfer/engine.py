@@ -2839,8 +2839,12 @@ class Engine:
                             setattr(_sa_r, _k, _v)
                     except Exception:
                         pass
+            # **pool 必须一直被引用。** 捕获期分配的张量（含 out 本身）都住在
+            # graph pool 里；pool_handle 只是句柄，真正的存储由 CUDAGraph 持有。
+            # 实测：不保留 pool 时 n>=2 的输出恒为 0.0（kernel 都执行了，但写进了
+            # 已被回收的地址），n=1 却能对 —— 因为单层图不会触发 pool 的重新分配。
             self._graph = {"graphs": _graphs, "in": in_buf, "out": out,
-                           "start_pos": start_pos}
+                           "start_pos": start_pos, "pool": _pool}
             self._graph_start_pos = start_pos
             print(f"[tinyinfer] decode CUDA graph captured at pos={start_pos} "
                   f"({len(_graphs)} chunks)", flush=True)
