@@ -132,6 +132,10 @@ class Plan:
     # layer -> CUDA index, and per-card expert slot counts. Single-GPU boxes get
     # {layer: 0} and {0: slots} and the engine behaves exactly as before.
     layer_card: dict[int, int] = dataclasses.field(default_factory=dict)
+    # 每张卡分到多少专家槽位。**目前没有消费者**：decode 的槽位分配由
+    # VramSlotCache.set_devices 按设备实际余量自己做，不读这个字段。
+    # 它是给「想按计划预先分卡」的调用方留的接口（例如启动时要打印/校验），
+    # 不要以为它是生效的分配 —— 和 _expert_dev 一样容易看错。
     card_slots: dict[int, int] = dataclasses.field(default_factory=dict)
     embed_on_cpu: bool = False   # 1.32GB of VRAM for a 10KB row lookup: waste when tight
     speculation: bool = False    # the plan actually keeps room for MTP draft stages
