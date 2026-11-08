@@ -484,10 +484,26 @@ def launch(fn: int, grid, block, args, stream=None, shared: int = 0) -> None:
     # 0-30 bit-stable, 32/34/38/39 flipping) because a later allocation reused the memory
     # of a weight pointer the launch had already queued.
     _cur = torch.cuda.current_stream() if torch.cuda.is_available() else None
+    # **捕获期不能调 record_stream。**
+    # 它会在 caching allocator 里给这块显存记一笔「这个 stream 还在用」，而捕获期
+    # 的 stream 是一块临时的捕获流：图建完之后那条流就没了，这笔记账却留在
+    # allocator 里。更糟的是它在捕获期会触发分配器的内部状态变动，而 CUDA graph
+    # 要求捕获窗口内的分配行为是确定的。
+    #
+    # 这条路径上唯一的常客是 hc_pre_rms_norm（每层两次），而它正是唯一表现异常
+    # 的 kernel：hc_mixes 的 pre/post/comb（走 BoundLaunch）在图里与 eager 逐位
+    # 相同，紧接着同一个 x/pre_mix 输入喂进 hc_pre_rms_norm，出来的 xf 却完全不同
+    # （eager 0.168945 vs graph 0.206055）。
+    _capturing = False
+    if _cur is not None:
+        try:
+            _capturing = torch.cuda.is_current_stream_capturing()
+        except Exception:
+            _capturing = False
     for i, a in enumerate(args):
         if torch.is_tensor(a):
             holders.append(ctypes.c_void_p(a.data_ptr()))
-            if _cur is not None:
+            if _cur is not None and not _capturing:
                 try:
                     a.record_stream(_cur)
                 except Exception:
