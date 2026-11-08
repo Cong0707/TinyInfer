@@ -2749,6 +2749,7 @@ class Engine:
             except Exception:
                 pass
             snap = self.snapshot()
+            _keep_rt = None   # finally 里要用，必须在 try 之外初始化
             try:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
@@ -2767,7 +2768,6 @@ class Engine:
                 #
                 # 上面这次完整 forward 已经把 _rt 建好了，别让后面的 restore(snap)
                 # 把它清回 None（snap 是跑之前拍的，里面 _rt 就是 None）。
-                _keep_rt = None
                 try:
                     from .deepseek.compressor import shared_attn as _sa_k
                     _keep_rt = {
