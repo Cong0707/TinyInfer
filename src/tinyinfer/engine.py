@@ -3156,6 +3156,13 @@ class Engine:
                             _lid = getattr(_sub, "layer_id", None)
                             if _sub is not None and _lid is not None:
                                 _sub._active_layer = int(_lid)
+                        # 捕获期建的 _graph_kv_buf / _graph_freqs 是图专用的常驻
+                        # 张量，eager 不能继续用它们：图会往 _graph_kv_buf 里写
+                        # KV，eager 接着读同一块就是别人的历史。把它们从 state
+                        # 槽里摘掉，eager 下一层会按自己的形状重新分配。
+                        for _stt in getattr(_mm, "_states", {}).values():
+                            _stt.pop("buf", None)
+                            _stt.pop("kv", None)
                 # 把捕获前那次完整 forward 建好的跨层共享状态放回去（见上面
                 # _keep_rt 的注释）。restore(snap) 会把 _rt 清成 None，那会让
                 # 随后 replay 出来的图在 compressor 里拿到 None。
