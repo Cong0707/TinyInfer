@@ -256,6 +256,8 @@ _CAP_PRE_OUT: dict = {}
 _CAP_PRE_IDX: dict = {}
 _CAP_PRE_MIX: dict = {}
 _CAP_PRE_MIX_IDX: dict = {}
+_CAP_POST_OUT: dict = {}
+_CAP_POST_IDX: dict = {}
 # dynamic shared memory holds one fp32 row; beyond this the fused path is not worth the
 # opt-in attribute call, so the two-kernel chain stays in charge
 _PRE_NORM_MAX_D = 8192
@@ -567,7 +569,22 @@ class HCBlockMixin:
                 pc = post.reshape(b * s, hc).float().contiguous()
                 cc = comb.reshape(b * s, hc, hc).float().contiguous()
                 bfs = x.dtype == torch.bfloat16
-                out = torch.empty((b * s, hc, d), dtype=x.dtype, device=x.device)
+                # **捕获期 out 必须常驻。**
+                # 它是这一层的输出 x，会被下一层当输入用（L1 的 hc_pre_rms_norm 拿它
+                # 当 x）。图里它在 graph pool 里分配，跨层使用时地址归谁取决于池里的
+                # 残局 —— 实测 L1 的 wqkv 输入在图里偏 0.053。
+                if torch.cuda.is_current_stream_capturing():
+                    _ring = _CAP_POST_OUT.get((b * s, hc, d, x.dtype))
+                    if _ring is None or _ring[0].device != x.device:
+                        _ring = [torch.empty((b * s, hc, d), dtype=x.dtype,
+                                             device=x.device) for _ in range(8)]
+                        _CAP_POST_OUT[(b * s, hc, d, x.dtype)] = _ring
+                        _CAP_POST_IDX[(b * s, hc, d, x.dtype)] = 0
+                    _i = _CAP_POST_IDX[(b * s, hc, d, x.dtype)]
+                    out = _ring[_i]
+                    _CAP_POST_IDX[(b * s, hc, d, x.dtype)] = (_i + 1) % len(_ring)
+                else:
+                    out = torch.empty((b * s, hc, d), dtype=x.dtype, device=x.device)
                 n = b * s * hc * d
                 # Bound launcher: hc_post runs once per layer (80 per decode step on this
                 # model's two hyper-connection sites). Signature is

@@ -2993,10 +2993,9 @@ class Engine:
                 # 重新捕获）必须从 0 开始，否则新图里每个 kernel 绑到的 buffer
                 # 和上一次捕获的位置错开，两张图共用池时会互相踩。
                 try:
-                    from .deepseek.hc import _CAP_PRE_IDX as _cpi
-                    _cpi.clear()
-                    from .deepseek.hc import _CAP_PRE_MIX_IDX as _cpm
-                    _cpm.clear()
+                    from .deepseek import hc as _hcm
+                    for _nm in ("_CAP_PRE_IDX", "_CAP_PRE_MIX_IDX", "_CAP_POST_IDX"):
+                        getattr(_hcm, _nm).clear()
                 except Exception:
                     pass
             finally:
