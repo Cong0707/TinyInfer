@@ -411,6 +411,12 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # reserve a gigabyte for them (Qwen reserved 1GB and streamed 5 of its 24 layers for
     # a mechanism it does not have)
     _engram_b = float(model.get("engram_bytes", 0.0) or 0.0)
+    # 实测对账：8GB 卡上 plan 说 11 层 + 11 槽位占 4.15GB，实际初始化后占 6.21GB。
+    # 差出来的主要是 MTP draft stages（mtp_bytes=1.33GB）。
+    # 这里**不**无条件计入：第 421 行的 `if speculation:` 会在装不下时把它关掉，
+    # 引擎于是根本不分配。两处必须用同一个判断，否则一边算进 used、一边不分配，
+    # 槽位数白算少（实测无条件计入后 slots 从 11 掉到 1，而 MTP 明明是关的）。
+    _mtp_b = float(model.get("mtp_bytes", 0.0) or 0.0)
     runtime_b = (_engram_b * 0.5 + 0.15 * GB + PREFILL_TEMP)
     if speculation and V < 16 * GB:
         # Drafting pays only when the acceptance rate is high; here it is 0.08 (docs/
@@ -442,11 +448,16 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # head_bytes a second time reserved 1.35GB that is never allocated.
     _tied_head = bool(model.get("tied_head", False))
 
-    def layers_that_fit(embed_gpu, head_gpu, buffers, ws):
+    def layers_that_fit(embed_gpu, head_gpu, buffers, ws, slot_bytes=0.0):
         # a tied checkpoint has no separate head allocation (see _tied_head below)
         head_term = head_b if (head_gpu and not _tied_head) else 0.0
+        # 专家槽位占的显存必须算进来。以前没算：规划器给出「11 层常驻 + 14 个槽位」，
+        # 12 层吃 6333MB，14 个槽位再要 263MB，24GB 卡上剩下 333MB，第一次 prefill
+        # 连 arena 都分配不出来（实测 !handles_ INTERNAL ASSERT），整个模型不可用。
+        # 槽位数由 spare 推出，而 spare 又依赖这里 —— 用一次定点迭代解：先按 0 算，
+        # 再按得到的槽位重算一次。收敛很快（槽位是 spare 的线性函数）。
         fixed = ((embed_b if embed_gpu else 0.0) + head_term
-                 + buffers * max_layer_b + ws + runtime_b)
+                 + buffers * max_layer_b + ws + runtime_b + float(slot_bytes))
         return int(max(0.0, V - fixed) // max(1.0, layer_b * LAYER_SLACK))
 
     ws0 = WS_BASE + 8 * WS_PER_TOKEN
@@ -582,6 +593,23 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             if _slots2 >= need_slots:
                 embed_gpu, head_gpu, resident, slots = _eg, _hg, _r2, _slots2
                 break
+    # ---- 定点迭代：槽位自己也要占显存 -------------------------------------
+    # 上面的 resident 和 slots 是分别算的，两者加起来会超。实测 40 层模型
+    # （层权重 8GB 卡上 164MB/层）：plan 给 resident=11、slots=14，初始化后
+    # 只剩 333MB，第一次 prefill 的 arena 直接分配失败
+    # （!handles_.at(i) INTERNAL ASSERT），整个模型不可用。
+    # 这里迭代：把 slots*expert_b 记入 used，重算 resident 和 slots。
+    if has_experts and has_gpu and slots > 0:
+        for _ in range(6):
+            _sb = slots * expert_b
+            _r = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0,
+                                              slot_bytes=_sb))
+            _spare = max(0.0, V - _used_with(_r, embed_gpu, head_gpu) - _sb)
+            _s = int(_spare * SLOT_FRACTION // max(1.0, expert_b))
+            if _r == resident and _s == slots:
+                break
+            resident, slots = _r, max(0, _s)
+
     # The wave size is whatever the spare VRAM can hold at WS_PER_TOKEN each; the lower
     # bound keeps a chunk from degenerating into single rows. The old upper bound of 64
     # came from a measurement of the tilelang kernel set ("a wave of 8 needs ~1.6GB and

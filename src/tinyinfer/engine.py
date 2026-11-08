@@ -205,6 +205,10 @@ class Engine:
                     # routing width decides whether the expert pool can cover the experts
                     # a token may route to (planner's coverage/slot decision)
                     _prof["topk"] = int(getattr(self.cfg, "n_activated_experts", 0) or 0) or 0
+                    # MTP 的 draft stages 真的会被构造吗？规划器不能靠猜：它要么占
+                    # 显存要么不占，而「会不会加载」由 tier.mtp 决定。实测 8GB 卡上
+                    # 规划器算 11 层占 4.15GB、实际占 6.21GB，差的就是这 1.33GB。
+                    _prof["mtp_resident"] = bool(getattr(self.tier, "mtp", False))
                     # a tied checkpoint's head IS its embedding: reserving head_bytes
                     # again costs the plan 1.35GB of residency it never allocates
                     _prof["tied_head"] = (getattr(self.adapter, "head_key", "x") is None
