@@ -371,6 +371,13 @@ extern "C" __global__ void moe_fused_act(
 
     // e 是「行 x topk」的全局专家槽位：aq/asc/oq/os 都按这个下标展平
     const int e = blockIdx.y;
+    // **槽位 -1 是「不在显存」的合法状态，不是地址。**
+    // 表是表、槽位是槽位：moe_miss_scan 就按 slot_ids[i] < 0 判断缺失，而这里
+    // 原来直接拿 slot_ids[e] 去算偏移 —— -1 * blob_bytes 是负地址，读到的是 arena
+    // 前面几百 MB 处的任意字节，算出来的激活量级 1e37。
+    // CUDA graph 里补不了表（补表要 D2H，图内做不了），所以 miss 必然出现，kernel
+    // 必须自己处理：这个专家贡献 0，而不是把别人的权重当自己的。
+    if (slot_ids[e] < 0) return;
     const int row0 = blockIdx.x * MOE_ACT_ROWS;
     const int nwarp = blockDim.x >> 5;              // 本 block 的 warp 数（8 或 16）
     const int rpw = MOE_ACT_ROWS / nwarp;           // 每个 warp 负责的行数
@@ -460,6 +467,8 @@ extern "C" __global__ void moe_fused_down(
     const int topk = n_exp / n_rows;
     const int e0 = row_d * topk;
     for (int e = e0; e < e0 + topk; ++e) {
+        // 同上：槽位 -1 表示这个专家不在显存，跳过它的贡献。
+        if (slot_ids[e] < 0) continue;
         const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
         const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
         const unsigned char* s2 = arena + eb + s2_off + (long long)n * (k_mid >> 5);
