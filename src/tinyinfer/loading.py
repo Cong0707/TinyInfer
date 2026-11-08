@@ -2560,25 +2560,34 @@ class VramSlotCache:
         if not self._stage_bufs:
             self.table_flush(layer)
             return 0
+        # 批量提交：先把要发的都挑出来（一次锁），发完再一次锁把状态推上去。
+        # 原来每个专家单独取一次锁 + 一次 notify_all，14 个专家就是 28 次锁竞争，
+        # 而锁的持有者还可能正被别的线程抢 —— 实测 commit 每步 144ms，
+        # 而同样 14 次 DMA 纯发只要 37ms。
+        with self._lock:
+            todo = [(idx, buf) for idx, buf in self._stage_bufs.items()
+                    if self._key[idx] is not None
+                    and (layer is None or self._key[idx][0] == layer)]
         done = []
-        for idx, buf in list(self._stage_bufs.items()):
-            key = self._key[idx]
-            if key is None or key[0] != layer if layer is not None else key is None:
-                continue
+        failed = []
+        for idx, buf in todo:
             try:
                 ev = self._copy_blocking(idx, buf)
             except Exception:
-                with self._lock:
-                    self._evict_locked(idx)
-                self._stage_bufs.pop(idx, None)
+                failed.append(idx)
                 continue
             self._event[idx] = ev
-            with self._lock:
+            done.append(idx)
+        with self._lock:
+            for idx in done:
                 if self._state[idx] in (self.RESERVED, self.IN_USE):
                     self._state[idx] = self.STAGED
+                self._stage_bufs.pop(idx, None)
+            for idx in failed:
+                self._evict_locked(idx)
+                self._stage_bufs.pop(idx, None)
+            if done or failed:
                 self._cond.notify_all()
-            self._stage_bufs.pop(idx, None)
-            done.append(idx)
         self.table_flush(layer)
         return len(done)
 
