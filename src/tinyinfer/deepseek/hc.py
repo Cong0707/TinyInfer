@@ -85,7 +85,7 @@ def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
                     torch.empty((b, s, hc), dtype=mixes.dtype, device=mixes.device),
                     torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device),
                     torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device),
-                ) for _ in range(8)]
+                ) for _ in range(64)]
                 _CAP_MIX_OUT[(b, s, hc, mixes.dtype)] = _ring
                 _CAP_MIX_IDX[(b, s, hc, mixes.dtype)] = 0
             _i = _CAP_MIX_IDX[(b, s, hc, mixes.dtype)]
@@ -330,7 +330,7 @@ def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
                         _pb = _CAP_PRE_MIX.get((b * s, hc))
                         if _pb is None or _pb.device != x.device:
                             _pb = [torch.empty((b * s, hc), dtype=torch.float32,
-                                               device=x.device) for _ in range(8)]
+                                               device=x.device) for _ in range(64)]
                             _CAP_PRE_MIX[(b * s, hc)] = _pb
                             _CAP_PRE_MIX_IDX[(b * s, hc)] = 0
                         _j = _CAP_PRE_MIX_IDX[(b * s, hc)]
@@ -354,7 +354,7 @@ def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
                         _ring = _CAP_PRE_OUT.get((b * s, d, x.dtype))
                         if _ring is None or _ring[0].device != x.device:
                             _ring = [torch.empty((b * s, d), dtype=x.dtype,
-                                                 device=x.device) for _ in range(8)]
+                                                 device=x.device) for _ in range(64)]
                             _CAP_PRE_OUT[(b * s, d, x.dtype)] = _ring
                             _CAP_PRE_IDX[(b * s, d, x.dtype)] = 0
                         _i = _CAP_PRE_IDX[(b * s, d, x.dtype)]
@@ -589,7 +589,7 @@ class HCBlockMixin:
                     _ring = _CAP_POST_OUT.get((b * s, hc, d, x.dtype))
                     if _ring is None or _ring[0].device != x.device:
                         _ring = [torch.empty((b * s, hc, d), dtype=x.dtype,
-                                             device=x.device) for _ in range(8)]
+                                             device=x.device) for _ in range(64)]
                         _CAP_POST_OUT[(b * s, hc, d, x.dtype)] = _ring
                         _CAP_POST_IDX[(b * s, hc, d, x.dtype)] = 0
                     _i = _CAP_POST_IDX[(b * s, hc, d, x.dtype)]
