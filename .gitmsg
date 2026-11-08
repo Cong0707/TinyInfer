@@ -1,1 +1,0 @@
-engine: let the startup probes through while the slot table is still missing -- pin_hot_experts needs one forward to learn the hot experts, the slot table comes from pin, and the graph needs the table, so the two warmup forwards have to run before the graph path exists. Once the table is set every decode goes through the graph with no fallback

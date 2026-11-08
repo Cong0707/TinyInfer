@@ -1,5 +1,10 @@
-.git-rewrite/
-src/tinyinfer/kernels/build/
 # python bytecode
 __pycache__/
 *.pyc
+
+# 一次性探针脚本不属于仓库：写到 E:\Develop\Deepseek\deepseek 或远端 /tmp，
+# 只有沉淀下来的东西才进 tests/ 或 docs/。
+probe_*.py
+fix_indent.py
+# 提交信息临时文件（git commit -F .gitmsg 用）
+.gitmsg

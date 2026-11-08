@@ -1,0 +1,26 @@
+tree bb0488991fba7dc457730b766413856a7aecdcc6
+parent d00480a0f19350ed1e4899abac5ae6cb027dc79a
+author tinyinfer <tinyinfer@localhost> 1793806907 +0800
+committer tinyinfer <tinyinfer@localhost> 1793806907 +0800
+
+gemm: 记录 fp8 M=1 快速路径失效的根因，并确认修好它需要先修 kernel 的对齐
+
+归因 decode 的计算耗时时发现最大的一笔是 fp8_gemm_kernel：37.7 ms/token，248 次调用
+（每次 152 μs）。那是 shared expert 的 fp8 线性层，按 [2304,5120] 算只有 96 GB/s，
+而同类形状的 fp4 GEMV（Marlin）能到 316 GB/s —— 中间差了 3 倍。
+
+为什么走的是慢路径：fp8_linear 本来有 M=1 专用分支，但它写的是
+    from .gemv_fp8 import gemv_fp8
+这个名字在该模块里从来不存在（导出的是 fused_fp8_gemv / fused_fp8_gemv_pq），于是
+每次调用都抛 ImportError、被 except 吞掉、继续落到 block_M=32 的 tilelang GEMM。
+整个 248 次/token 的快速路径就是这么失效的，没有任何提示。
+
+把名字改对之后引擎在几层之后死于 CUDA misaligned address（错误异步报在 hc_post）。
+gemv_fp8.py 自己的 docstring 就写着 bf16 变体在 N=1280/K=5120 会崩，shared expert 是
+N=2304/K=5120，同样崩。给 x 强制 16 字节对齐的拷贝也没解决。所以这次只做到「定位并
+记录」：开关 TI_FP8_GEMV=1 可以复现，默认关，避免把已知会崩的路径设成默认。
+
+同批排查的另外两项结论：
+- head_gemv 3.65 ms 一次，词表 1.23 GiB / 3.65 ms = 337 GB/s，已经贴着上限，没有空间
+- sinkhorn_hc 4.01 ms（80 次 × 50 μs），是超连接的幂迭代，理论上可以用 Newton 步减少
+  迭代次数，但要先确认收敛界

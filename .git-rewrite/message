@@ -1,0 +1,26 @@
+kernels: fp4 gate/up GEMV + SwiGLU + FP8 量化合成一个 CUDA kernel
+
+重写的是 prefill 路径上这三个算子：
+  fused_fp4_swiglu_pq (tilelang)  ->  act_quant(h)  ->  fused_fp4_down_pq
+合成 kernels/cuda/fp4_swiglu_quant.cu：一个 block 拥有 32 个连续输出（正好一个量化组），
+组内 8 线程协作算一个 GEMV，gate/up 两路 + clamp-SwiGLU + block-32 FP8 量化全部在寄存器
+里完成，省掉整个 [1, inter] 行的 bf16 往返和一次 launch。
+
+数值：和 tilelang 链逐位相同（hq maxdiff 0.0 且 bit=True，e8m0 scale 字节完全一致），
+40 层逐层钩子 all identical。能对上是因为两边都按 block-32 顺序累加，且 fp8×fp4 乘积和
+fp32 累加本身是精确的。
+
+过程中修掉两个自己的 bug：
+- __nv_cvt_fp8_to_halfraw(...).x 是 ushort 位模式，直接当 float 乘会得到垃圾
+- e8m0 scale 必须复刻 fast_log2_ceil 的位运算（float 的 ceil(log2) 在边界上会差一个 binade），
+  并且 amax 要先 floor 到 1e-4
+
+**作用域说明**：这条链只在 prefill（x.size(0) > 8）上跑。decode（M<=8）的 fp4_linear 走的
+是 Marlin（gemv_fp4_fast），根本不经过 fused_fp4_expert_ffn，所以 decode 的 kernel 数没变。
+这也纠正了我之前的一个判断：那 478 次 act_quant 不是专家 GEMV 的，是 shared expert 和
+attention 的 fp8 路径。
+
+prefill 的收益在这台机器上无法量化：160 token 的 prefill 要 95 秒，被 275GB 专家的磁盘
+读取完全淹没。理论上省 240 次 launch + 240 次 bf16 写读，要到大显存设备才看得出来。
+
+TI_FUSED_MOE=0 回退到 tilelang 链。
