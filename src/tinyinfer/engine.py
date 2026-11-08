@@ -2918,9 +2918,20 @@ class Engine:
                 # 路由从 [79,132,292,278,91,372] 漂成 [132,79,309,349,348,372]，
                 # 后两个从未进过槽位，表里是 -1。
                 #
-                # 所以 warmup 之后先把状态原样收回 snap，让捕获从同一起点重跑。
-                # 注意这一步**不能**碰 _rt：warmup 建好的跨层状态稍后要放回去。
+                # 所以 warmup 之后把 KV 状态清回「一次都没跑过」——那正是 eager
+                # 在 reset() 之后的起点。直接用 restore(snap) 不够：snap 是 warmup
+                # 之前拍的，里面 kv 本来就是 None，但 restore 对 None 只是不赋值，
+                # 捕获期新建的 buffer 会留在 _states 里（_keep_buf 分支之外的分支
+                # 才 clone）。这里显式清干净，任何残留都不带进捕获。
+                # 注意**不能**碰 _rt：warmup 建好的跨层状态稍后要放回去。
                 self.restore(snap)
+                for _bq in self._blocks.values():
+                    _aq = getattr(_bq, "attn", None)
+                    if _aq is not None and hasattr(_aq, "reset"):
+                        try:
+                            _aq.reset()
+                        except Exception:
+                            pass
                 # **捕获前这次完整 forward 产出的 _rt 必须留住。**
                 #
                 # 分块捕获时每块只跑 [_graph_lo, _graph_hi) 那几层，前面层的
