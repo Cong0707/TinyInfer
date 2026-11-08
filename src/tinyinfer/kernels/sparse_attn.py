@@ -19,6 +19,12 @@ def sparse_attn_cuda(q, kv, sink, idxs, scale):
     sink [H]          fp32
     idxs [B, M, K]    int32 (-1 = empty slot)
     """
+
+    # 参数 dtype 必须与 kernel 签名严格一致（driver API 不做转换）：
+    #   q/kv/out  __nv_bfloat16    sink  float32    idxs  int32
+    q = q.contiguous(); kv = kv.contiguous()
+    sink = sink.float().contiguous()
+    idxs = idxs.to(torch.int32).contiguous()
     b, m, h, d = q.shape
     n, k = kv.size(1), idxs.size(-1)
     out = torch.empty_like(q)
@@ -27,7 +33,10 @@ def sparse_attn_cuda(q, kv, sink, idxs, scale):
     # cuLaunchKernel 直接报 700（illegal address）。
     block = 128
     nwarps = block // 32
-    shared = (2 * nwarps + nwarps * 16) * 4
+    # s_out 的索引是 warp * D + d（见 kernel 第 124 行），所以是 nwarps * D 个
+    # float，不是 nwarps * kMaxLocal。按 16 算会让最后一个 warp 写到共享内存外，
+    # 表现为 kernel 内部 illegal memory access，随后整个 context 变 700。
+    shared = (2 * nwarps + nwarps * int(d)) * 4
     native.launch(
         native.kernel("sparse_attn_sink", "sparse_attn_sink"),
         (b * m * h,), (block,),
