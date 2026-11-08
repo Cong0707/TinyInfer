@@ -7,7 +7,7 @@ M = "/models/deepseek"
 tok = AutoTokenizer.from_pretrained(M, trust_remote_code=True)
 pad = tok.encode("你好", add_special_tokens=False)[0]
 ids = torch.tensor([[pad]], device="cuda")
-e = Engine(M, tier=OptLevel.AGGRESSIVE, device="cuda", layers=[0,2], tokenizer=tok)
+e = Engine(M, tier=OptLevel.AGGRESSIVE, device="cuda", layers=[0,1], tokenizer=tok)
 OBS = {}
 import tinyinfer.deepseek.moe as MO
 orig = MO.MoE._forward_gpu_only

@@ -2765,6 +2765,51 @@ class Engine:
             _gr.replay()
         return out.clone()
 
+    def _graph_force_load_routes(self, slots) -> None:
+        """把「已经路由过、但此刻不在槽位」的专家全部装进来。
+
+        CUDA graph 里的 MoE 只认 tab[layer][expert] 查到的槽位号直通 kernel，捕获期
+        又跳过 _miss_scan / need / commit（都要 D2H，图内做不了）。所以只要表里有
+        一个 -1，kernel 就会拿 -1 * blob_bytes 当偏移读到别的专家的字节 —— 实测
+        图内 L1 的 sids = [7,6,11,-1,-1,13]、输出 absmax 2.36e37，而 eager 正常。
+
+        这里按 MoE 自己累计的 _route_counts（哪些专家被路由过）逐个补齐，比按
+        「覆盖率挑热门」更贴近这一轮真正会用到的集合。
+        """
+        if slots is None:
+            return
+        total = 0
+        for lid, blk in getattr(self, "_blocks", {}).items():
+            rc = getattr(getattr(blk, "ffn", None), "_route_counts", None)
+            if not rc:
+                continue
+            need = [int(e) for e in rc.keys() if not slots.has(lid, int(e))]
+            if not need:
+                continue
+            try:
+                self.expert_store.fetch(lid, need)
+            except Exception:
+                pass
+            for e in need:
+                if slots.has(lid, e):
+                    continue
+                try:
+                    slots.acquire(lid, e)
+                    total += 1
+                except Exception:
+                    # 槽位真的满了：这里不能静默 —— 图里那些专家一定是 -1。
+                    break
+        if total:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                slots.table_sync()
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
     def _graph_try_capture(self, ids: torch.Tensor, start_pos: int) -> None:
         if getattr(self, "_graph", None) is not None or getattr(self, "_graph_failed", False):
             return
@@ -2835,6 +2880,18 @@ class Engine:
                         torch.cuda.synchronize()
                     except Exception:
                         pass
+                    # **捕获这一轮要路由到的专家，必须此刻全部在槽位里。**
+                    #
+                    # 图里的 MoE 只认 tab[layer][expert] 查到的槽位号直通 kernel，而
+                    # 捕获期会跳过 _miss_scan / need / commit（都要 D2H，图内做不了）。
+                    # 所以只要有一个专家此刻不在槽位，表里就是 -1，kernel 拿
+                    # -1 * blob_bytes 当偏移，读到的是别的专家的字节 —— 实测图内 L1
+                    # 的 sids = [7,6,11,-1,-1,13]，输出 absmax 2.36e37，而 eager 走
+                    # 同一套权重结果正常。
+                    #
+                    # pin_hot_experts 是按覆盖率挑的热门专家，不保证覆盖这一轮的
+                    # 真实路由，所以这里按「刚跑完这次 forward 记录到的路由」补装。
+                    self._graph_force_load_routes(_sl_cap)
                 # **捕获前这次完整 forward 产出的 _rt 必须留住。**
                 #
                 # 分块捕获时每块只跑 [_graph_lo, _graph_hi) 那几层，前面层的
