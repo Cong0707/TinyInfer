@@ -84,6 +84,44 @@ def plan_slots(*, vram_free_bytes: int = 0, head_dim: int = 512,
     return max(int(min_slots), n)
 
 
+
+
+def batch_slots_bound(*, slots: int, n_layers: int, topk: int,
+                      marginal_experts: float = 4.1,
+                      reserve_ratio: float = 1.0) -> int:
+    """槽位池能支撑多少条并发会话（编队约束的第二个来源）。
+
+    并发共享一次 forward，所以一层要搬的是**所有会话路由的并集**。实测
+    （tests/test_route_union.py，真实 gate）：8 条会话的并集是 35 个，不是
+    最坏的 48 —— 每条新会话只多带约 4.1 个新专家，存在共同热点。
+
+    所以「n 条会话一层要多少槽位」可以这样估：
+
+        per_layer = topk + marginal * (n - 1)
+        needed    = per_layer * n_layers
+
+    返回满足 needed <= slots 的最大 n（至少 1）。
+
+    这是和 `plan_slots`（按 KV 显存算）**独立**的第二条约束；真正的批宽是
+    两者取小。两条约束都从真实数字出发，不写死常量。
+    """
+    slots = int(slots)
+    n_layers = max(1, int(n_layers))
+    topk = max(1, int(topk))
+    if slots <= 0:
+        return 1
+    budget = int(slots * float(reserve_ratio))
+    n = 1
+    while True:
+        per_layer = topk + float(marginal_experts) * (n - 1)
+        needed = per_layer * n_layers
+        if needed > budget:
+            return max(1, n - 1)
+        n += 1
+        if n > 4096:
+            return n
+
+
 class KvSwapPool:
     """按「整条会话」换出 KV 的主机侧仓库。
 

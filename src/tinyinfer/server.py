@@ -1574,6 +1574,19 @@ class TinyModelBackend(BaseBackend):
                             vram_free_bytes=_free,
                             context_tokens=int(getattr(self._cfg, "max_position_embeddings",
                                                         1_048_576) or 1_048_576)))
+                    # 第二条约束：专家槽位。并发共享一次 forward，一层要搬的是
+                    # 所有会话路由的**并集**（实测 8 条会话并集 35 个/层）。
+                    # 两条约束取小 —— 哪个先撞线就听哪个。
+                    _sl = getattr(getattr(self, "_expert_store", None), "slots", None)
+                    _ns = int(getattr(_sl, "slots", 0) or 0)
+                    if _ns > 0:
+                        from .kv_tiers import batch_slots_bound
+
+                        _by_slots = batch_slots_bound(
+                            slots=_ns,
+                            n_layers=int(getattr(self._cfg, "n_layers", 40)),
+                            topk=int(getattr(self._cfg, "n_activated_experts", 6)))
+                        want = max(1, min(want, _by_slots))
                 except Exception:
                     want = 1
             loop = ServingEngine(self._model, max_batch=max(1, want)).start()

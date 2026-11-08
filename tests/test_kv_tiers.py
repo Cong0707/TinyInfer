@@ -76,3 +76,39 @@ def test_1m_context_kv_is_several_gb():
     # 内存放得下几十条：不活跃的沉到内存，活跃的留在卡上
     assert (371 * 2**30) // total > 30
 
+
+def test_slot_bound_matches_the_measured_union():
+    """槽位约束算出来的批宽必须和实测并集一致。
+
+    实测（tests/test_route_union.py）：8 条会话并集 35 个/层，40 层要 1400 个槽。
+    L20 有 1359 -> 8 条放不下，7 条（约 30.7/层 x40 = 1228）放得下。
+    """
+    from tinyinfer.kv_tiers import batch_slots_bound
+
+    n = batch_slots_bound(slots=1359, n_layers=40, topk=6)
+    assert n == 7, n
+
+
+def test_small_pool_gives_one():
+    """8GB 卡的 14 个槽位只够一条会话 —— 和 plan_slots 的结论一致。"""
+    from tinyinfer.kv_tiers import batch_slots_bound
+
+    assert batch_slots_bound(slots=14, n_layers=40, topk=6) == 1
+    assert batch_slots_bound(slots=240, n_layers=40, topk=6) == 1
+
+
+def test_zero_slots_is_safe():
+    from tinyinfer.kv_tiers import batch_slots_bound
+
+    assert batch_slots_bound(slots=0, n_layers=40, topk=6) == 1
+    assert batch_slots_bound(slots=-5, n_layers=40, topk=6) == 1
+
+
+def test_more_slots_never_reduce_the_bound():
+    from tinyinfer.kv_tiers import batch_slots_bound
+
+    prev = 0
+    for slots in (100, 500, 1000, 2000, 5000, 20000):
+        n = batch_slots_bound(slots=slots, n_layers=40, topk=6)
+        assert n >= prev, (slots, n, prev)
+        prev = n
