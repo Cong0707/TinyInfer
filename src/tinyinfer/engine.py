@@ -2755,22 +2755,6 @@ class Engine:
         except Exception:
             pass
         g["in"].copy_(ids)
-        # **replay 前把槽位表刷成当前状态。**
-        #
-        # 图里 index_select(tab[layer], indices) 读的是 tab 的地址，replay 时才读内容。
-        # 而 tab 的内容取决于「上一次谁被装进了哪个槽位」—— 捕获那一轮和 replay 这一轮
-        # 的路由未必相同（KV 状态不同 → 上一层输出不同 → gate 输出不同）。
-        # 实测：捕获期 L1 的 sids 是 [6,11]，replay 时变成 [6,13]；表没跟着变，kernel
-        # 就用别的专家的权重算出 2e37。
-        #
-        # 所以在 replay 之前按当前 Python 侧的 key->slot 映射重刷一遍。这是 H2D，
-        # 但只搬 40x384 int32 = 61KB，且只在图外做。
-        try:
-            _sl_r = getattr(getattr(self, "expert_store", None), "slots", None)
-            if _sl_r is not None and getattr(_sl_r, "_slot_tab", None) is not None:
-                _sl_r.table_sync()
-        except Exception:
-            pass
         for _gr in g["graphs"]:
             _gr.replay()
         return out.clone()
