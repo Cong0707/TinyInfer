@@ -403,7 +403,22 @@ class MLAWindowAttention:
             for _r in range(b):
                 buf[_r].index_copy_(0, _slots[_r], kv[_r])
         elif s == 1:
-            buf[:, start_pos % self.window] = kv[:, 0]
+            # **捕获期不能把 start_pos % window 当成 Python 常量算进来。**
+            #
+            # 图里固化的是一块固定的下标 buffer，replay 多少次都写同一格；而 decode
+            # 每步的绝对位置都不同，于是历史 token 的 KV 被反复覆盖 —— 实测解码出来
+            # 是 '<｜begin▁of▁sentence｜># of ofrulesbooked ...' 这种纯噪声，
+            # 而同一 prompt 走 eager 是完整通顺的中文。
+            #
+            # 捕获期改用 device 侧的 _POS_BUF：图内它只是一个读取地址，_graph_run 在
+            # 每次 replay 之前写入当前 start_pos，所以槽位跟着位置走。非捕获期保持
+            # 原来的 Python 整数取模，省一次内核启动。
+            if torch.cuda.is_current_stream_capturing():
+                from ..nn import _pos_buf
+                _slot = (_pos_buf(x.device) % self.window).to(torch.long)
+                buf.index_copy_(1, _slot.reshape(1), kv[:, 0])
+            else:
+                buf[:, start_pos % self.window] = kv[:, 0]
         else:
             # 一个 chunk 比窗口还长时，只有最后 window 个位置能留在 cache 里；带上
             # 前面的会让 index_copy_ 收到重复下标（未定义行为）。
@@ -418,7 +433,9 @@ class MLAWindowAttention:
         kv_att = buf
         n_old = min(start_pos, self.window)
         full = s == 1 and n_old == self.window
-        if full and self._decode_idxs is not None:
+        # 捕获期不取缓存：_decode_idxs 里存的是图外某个 start_pos 算出来的常量张量，
+        # 一旦被写进图的 kernel 参数，replay 就永远用那一个位置组的槽位。
+        if full and self._decode_idxs is not None and not torch.cuda.is_current_stream_capturing():
             idxs = self._decode_idxs
         else:
             if positions is not None and positions.numel() == b and b > 1:
