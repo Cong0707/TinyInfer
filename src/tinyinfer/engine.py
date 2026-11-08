@@ -433,7 +433,19 @@ class Engine:
                     # 给尚未加载的层权重。TI_CACHE_CAP_GB 仍然可以硬指定。
                     _cap_env = __import__("os").environ.get("TI_CACHE_CAP_GB")
                     if _cap_env is None:
-                        _cap_bytes = max(192 << 20, int(_pool_avail * 0.75))
+                        # 0.75 的余量是给「还没加载的 streamed 层权重」留的。
+                        # 当**所有层都常驻**（L20 的 40/40）时根本不存在这件事，
+                        # 那 25% 就是白留：实测 L20 上池子只拿到 231GB，
+                        # 而模型全部 15360 个专家要 268.9GB —— 差 14%，预热永远装不完，
+                        # decode 每步还得读 13-25 次盘。
+                        # 所以：没有 streamed 层时只留 6% 给分配器抖动。
+                        _n_stream = 0
+                        try:
+                            _n_stream = int(len(self._stream_layers()))
+                        except Exception:
+                            _n_stream = 0
+                        _frac = 0.94 if _n_stream == 0 else 0.75
+                        _cap_bytes = max(192 << 20, int(_pool_avail * _frac))
                     else:
                         _cap_bytes = max(192 << 20, int(float(_cap_env) * (1 << 30)))
                     _pool_avail = min(_pool_avail, _cap_bytes)
