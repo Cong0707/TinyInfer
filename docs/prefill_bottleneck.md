@@ -1,54 +1,69 @@
-# prefill 的真实速度：一个必须先修的瓶颈（2026-11-08 实测）
+# prefill 速度：修正之前的错误结论（2026-11-08 第二轮实测）
 
-## 数字
+## 上一轮我判错了
 
-```
-batch prefill 64 tokens: 6.71s  = 9.53 tok/s
-per-token  forward:      0.104s/token = 9.59 tok/s
-speedup of batch over per-token: 1.0x        <- 完全没有并行
-```
+上一轮我写「chunk>8 会 illegal memory access，所以 chunk 上限是 8」。
+**那是错的** —— 崩溃来自我的探针脚本：循环里没有干净 `reset()`，前一次跑失败的
+状态污染了下一次。用干净的探针重测，**chunk=128 完全正常**。
 
-**送 64 个 token 和逐个送 64 次一样快。** 这不是「慢」，是「批量根本没生效」。
+## 正确的数字
 
-## 根因链
+4 层模型，128 个 token 的 prefill：
 
-1. `prefill_chunk` 被硬件计划设成 **8**（`[tinyinfer] ... chunk=8`）。
-2. `_forward_impl` 里 `step = chunk or max(self.prefill_chunk, 32)`，
-   但硬件计划给的是 8，且 `max(..., 32)` 只在 `chunk` 为 None 时生效 ——
-   实际走的是 8。
-3. 于是 1M 上下文的 prefill = 131072 个 chunk，每 chunk 8 个 token。
-
-## 为什么 chunk 上不去：真正的 bug
-
-单层时 chunk=16 完全正常（logits 形状对，无报错）。
-**4 层时 chunk>8 直接 illegal memory access。**
-
-这说明问题在 **streamed 层**（层权重反复搬运那条路径）的 buffer 大小
-和 chunk 绑定，而不是 attention 或 MoE 本身。
-
-## 为什么这必须优先修
-
-按当前速度：
-
-| 上下文 | chunk=8 的 prefill | L20（估算快 4x）|
+| chunk | 耗时 | 速度 |
 | --- | --- | --- |
-| 1k | 1.7 分钟 | 26 秒 |
-| 128k | 3.7 小时 | 56 分钟 |
-| **1M** | **29 小时** | **7.3 小时** |
+| 8 | 11.3s | **11.3 tok/s** |
+| 16 | 2.1s | 60.1 tok/s |
+| 32 | 1.0s | 125.5 tok/s |
+| 64 | 0.8s | 165.6 tok/s |
+| **128** | **0.6s** | **202.7 tok/s** |
 
-用户的要求是「真实的请求是 1m 的上下文」。**29 小时不可接受，7.3 小时也不可接受。**
+**chunk 8 → 128 是 18 倍。** 批量 prefill 一直是生效的，只是 chunk 太小。
 
-对比：如果 chunk 能到 256（代码注释里说「256 是最快的测量点，3.5x chunk=8」），
-1M 的 prefill 就是 131072/256 x (256/9.53) ≈ 3.6 小时（L20 上约 54 分钟）。
-仍然慢，但至少是「能等」和「不能等」的区别。
+## 为什么 8GB 上是 8
 
-## 下一步（明确）
+`resources.plan` 的公式：
 
-1. 定位 streamed 层的 buffer 为什么和 chunk 绑定 —— 在 `_flat_setup` /
-   `_stream_layer` 里找按 chunk 尺寸分配的 buffer。
-2. 把它改成按 `prefill_chunk` 的实际上限分配（或按需增长），
-   然后让 `resources.plan` 的 `prefill_chunk` 回到一个合理的值（128-256）。
-3. 用 `probe_prefill.py` 验证：`chunk=32/64/128` 都必须不崩，且 tok/s 随 chunk
-   上升。
+```python
+chunk = spare * (1 - SLOT_FRACTION) / WS_PER_TOKEN
+SLOT_FRACTION = 0.90      # 90% 显存留给专家槽位
+WS_PER_TOKEN = 0.02 GB
+```
 
-**在那之前，1M 上下文是「能跑但等不起」的状态，不要声称支持。**
+8GB 卡上 spare 很小，90% 又划给槽位，剩 10% 只能装 8 个 token 的 wave。
+**这个取舍在 8GB 上是对的**：槽位比 prefill 重要（decode 是主要负载），
+而且 8GB 本来也装不下大 wave。
+
+## 规划器本身没问题
+
+用真实的 `Hardware` 跑：
+
+```
+RTX5060 8GB    chunk=   8 slots=0 resident=2
+L20 44GB       chunk= 129 slots=0 resident=40
+L20 x2         chunk= 341
+```
+
+**L20 上是 129，双卡 341。** 我上一轮说「1M prefill 要 7.3 小时」，是按 chunk=8
+算的 —— 错得离谱。按 129 算：
+
+| 上下文 | chunk=8（8GB）| chunk=129（L20）|
+| --- | --- | --- |
+| 128k | 3.2 小时 | 12 分钟 |
+| **1M** | **25 小时** | **1.6 小时** |
+
+L20 上 1M 上下文 prefill 约 **1.6 小时**（按 8GB 实测的 tok/s 线性外推，
+未考虑 L20 更大的算力）。如果 L20 上 chunk 能到 129 且 tok/s 随 chunk 继续上升，
+实际会更快。
+
+## 8GB 上还有提升空间吗
+
+有，但有限：8GB 的 chunk 上限受显存约束。实测 chunk=128 在 4 层模型上能跑，
+但那是 4 层；40 层全模型时 wave 会更大（每层激活都要活着），8GB 上会 OOM。
+
+**8GB 不是目标机器。** 用户要的是 L20 这类机器，规划器给出的 129 是对的。
+
+## 待验证
+
+- L20 上 40 层、chunk=129 的真实速度和显存占用（关机中）
+- 8GB 上 40 层的 chunk 上限（需要逐级试，会很慢）
