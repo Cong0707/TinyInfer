@@ -1,6 +1,0 @@
-7e2dc1ac862b0d3c4cc872cf63eb6ef3420b8de6 commit	refs/heads/backup-before-rewrite
-94a003464027aa75fceb825288c50f01435b7bd6 commit	refs/heads/master
-1734b608abf2ebb06506fdd6c8dc0e3d70dec242 commit	refs/remotes/origin/HEAD
-1734b608abf2ebb06506fdd6c8dc0e3d70dec242 commit	refs/remotes/origin/master
-a800e6a91cd5dfb9b6bd6d40698884c48748b0cf commit	refs/stash
-8687233f7e3af8b3a4de39d81c8850eb46953870 tag	refs/tags/checkpoint-2026-11-06

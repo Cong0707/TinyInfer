@@ -8,3 +8,7 @@ probe_*.py
 fix_indent.py
 # 提交信息临时文件（git commit -F .gitmsg 用）
 .gitmsg
+
+# runtime KV session cache: session data does not belong in the repo
+.kvcache/*
+!.kvcache/.gitkeep
