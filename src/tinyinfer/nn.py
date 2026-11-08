@@ -98,9 +98,19 @@ _POS_BUF = None   # window_idxs_ring 的全局位置 buffer（捕获期不能新
 _POS_BUF = None
 
 def _pos_buf(device=None):
+    """图内读位置用的那块 buffer。
+
+    **device 必须归一化。** torch.device('cuda') 和 torch.device('cuda:0') 不相等，
+    而调用方有的传 'cuda'（老代码）、有的传 x.device（cuda:0）。原来这里直接比
+    `_POS_BUF.device != torch.device(dev)`，两种写法交替出现时每次都会新建一块新
+    buffer —— 图里引用的是捕获那一刻那块，_graph_run 每次 replay 前 fill_ 的却是
+    另一块，于是图内的位置永远是捕获时的值。
+    """
     global _POS_BUF
-    dev = device or 'cuda'
-    if _POS_BUF is None or _POS_BUF.device != torch.device(dev):
+    dev = torch.device(device or 'cuda')
+    if dev.type == 'cuda' and dev.index is None:
+        dev = torch.device('cuda', torch.cuda.current_device())
+    if _POS_BUF is None or _POS_BUF.device != dev:
         _POS_BUF = torch.zeros((), dtype=torch.long, device=dev)
     return _POS_BUF
 
