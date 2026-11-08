@@ -2299,7 +2299,18 @@ class VramSlotCache:
         if self.pin_staging and dev.type == "cuda":
             self._staging = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
             self._staging_b = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
-            self._copy_stream = torch.cuda.Stream(device=dev)
+            # 每张卡一条 copy stream。多卡时槽位分片在不同卡上，DMA 必须发到
+            # **目标卡自己的 stream** 上：往 cuda:0 的 stream 里排一个目标是
+            # cuda:1 的 copy，驱动要么报错要么按错卡解析地址。
+            self._copy_streams = {}
+            for _d in (getattr(self, "devices", None) or [str(dev)]):
+                try:
+                    self._copy_streams[_d] = torch.cuda.Stream(device=_d)
+                except Exception:
+                    pass
+            self._copy_stream = self._copy_streams.get(str(dev))
+            if self._copy_stream is None and self._copy_streams:
+                self._copy_stream = next(iter(self._copy_streams.values()))
             self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
 
     def reinit(self, reserve_bytes: int = 2 << 30) -> int:
@@ -2439,27 +2450,30 @@ class VramSlotCache:
         # staging path also produced " 2023-1-1 20:" for a capital question with the same
         # slots: one shared staging buffer is reused while an earlier async DMA out of it
         # may still be in flight.
-        if isinstance(data, memoryview) and self._copy_stream is not None:
+        # 多卡：这块槽位的 DMA 必须发到它所在卡的 stream 上，
+        # 否则驱动按错卡的地址空间解析目标指针。
+        cs = self.slot_stream(idx) if hasattr(self, "slot_stream") else self._copy_stream
+        if isinstance(data, memoryview) and cs is not None:
             ev = event if event is not None else torch.cuda.Event()
-            with torch.cuda.stream(self._copy_stream):
-                if _async_h2d(buf, data, int(buf.numel())):
-                    ev.record(self._copy_stream)
+            with torch.cuda.stream(cs):
+                if _async_h2d(buf, data, int(buf.numel()), stream=cs):
+                    ev.record(cs)
                     return ev
         # Pinned sources go straight to the device as an async DMA (26GB/s, six in
         # parallel). Routing them through the single shared staging buffer serialised
         # them through one 18.8MB host memcpy (measured 18ms/layer). Pageable sources
         # cannot be async, so they copy synchronously.
         if cpu.is_pinned():
-            if self._copy_stream is None:
+            if cs is None:
                 buf.copy_(cpu, non_blocking=True)
                 return None
             # Copy on the dedicated copy stream. A pinned H2D queued on the compute
             # stream makes every later host sync (the per-layer routing bincount) wait
             # for the whole 18.8MB transfer: measured 12.7ms/layer of pure stall.
             ev = event if event is not None else torch.cuda.Event()
-            with torch.cuda.stream(self._copy_stream):
+            with torch.cuda.stream(cs):
                 buf.copy_(cpu, non_blocking=True)
-                ev.record(self._copy_stream)
+                ev.record(cs)
             return ev
         # 非 pinned 源（我们的大池子是 mmap，pageable）：原来的路径先
         # staging.copy_(cpu) 同步拷到 pinned staging，再异步 H2D —— 那次同步拷贝
@@ -2467,15 +2481,15 @@ class VramSlotCache:
         # 期间 GPU 完全空转（实测推理时 GPU 0-27% 反复跳）。
         # pageable 源直接 non_blocking=True 交给驱动：驱动会自己分块暂存，
         # 慢一点但**不阻塞调用者**，主线程可以继续发下一层的 kernel。
-        if staging is None or self._copy_stream is None:
+        if staging is None or cs is None:
             buf.copy_(cpu, non_blocking=True)
             return None
         ev = event if event is not None else torch.cuda.Event()
-        with torch.cuda.stream(self._copy_stream):
+        with torch.cuda.stream(cs):
             # 同一份 pageable 源，驱动内部会做暂存；把这块也放到 copy stream 上，
             # 就不会占住计算流的排序点。
             buf.copy_(cpu, non_blocking=True)
-            ev.record(self._copy_stream)
+            ev.record(cs)
         return ev
 
     def wait_ready(self, idxs) -> None:
@@ -2489,11 +2503,21 @@ class VramSlotCache:
         cs = getattr(self, "_copy_stream", None)
         if t is None or cs is None:
             return
-        stream = t.cuda.current_stream()
         for i in idxs:
             ev = self._event[i]
             if ev is not None and not ev.query():
-                stream.wait_event(ev)
+                # 等这块槽位**自己所在卡**的 compute stream：多卡时它可能在
+                # 另一张卡上，往这张卡的流里插等待没有意义。
+                devs = list(getattr(self, "devices", None) or [])
+                didx = self.slot_device(i)
+                if devs and 0 <= didx < len(devs):
+                    try:
+                        with t.cuda.device(devs[didx]):
+                            t.cuda.current_stream().wait_event(ev)
+                        continue
+                    except Exception:
+                        pass
+                t.cuda.current_stream().wait_event(ev)
 
     def stage(self, layer: int, experts, loader, *, urgent: bool = True) -> int:
         """只做主机侧：挑槽位、记归属、把字节拷到 pinned staging。**不碰 CUDA**。
@@ -3051,6 +3075,24 @@ class VramSlotCache:
             return 0
         return int(devs[slot])
 
+    def slot_stream(self, slot: int):
+        """这块槽位所在卡上的 copy stream（单卡时就是那一条）。
+
+        原来只有一条 stream，建在 self.device 上。多卡时槽位分片到不同卡，
+        把目标在 cuda:1 的 DMA 排进 cuda:0 的 stream 是错的 —— 驱动会按
+        发送时当前设备的地址空间解析，结果是拷贝失败或拷到错误的显存。
+        """
+        devs = list(getattr(self, "devices", None) or [])
+        streams = getattr(self, "_copy_streams", None) or {}
+        if not devs or not streams:
+            return getattr(self, "_copy_stream", None)
+        idx = self.slot_device(slot)
+        if 0 <= idx < len(devs):
+            s = streams.get(devs[idx])
+            if s is not None:
+                return s
+        return getattr(self, "_copy_stream", None)
+
     def stats(self) -> dict[str, float]:
         with self._lock:
             return {"slots": self.slots, "blob_bytes": self.blob_bytes,
@@ -3135,7 +3177,7 @@ def _gpu_addressable(data) -> bool:
     return obj is not None and hasattr(obj, "addressof")
 
 
-def _async_h2d(dst, src, nbytes: int) -> bool:
+def _async_h2d(dst, src, nbytes: int, stream=None) -> bool:
     """cudaMemcpyAsync from a host-pool slice straight into a device tensor.
 
     torch.frombuffer() over cudaHostAlloc memory reports is_pinned() == False (measured),
@@ -3163,10 +3205,12 @@ def _async_h2d(dst, src, nbytes: int) -> bool:
             addr = int(src.data_ptr())
         else:
             addr = ctypes.addressof(ctypes.c_char.from_buffer(src))
+        if stream is None:
+            stream = torch.cuda.current_stream()
         rc = lib.cudaMemcpyAsync(
             ctypes.c_void_p(int(dst.data_ptr())), ctypes.c_void_p(int(addr)),
             ctypes.c_size_t(int(nbytes)), 1,
-            ctypes.c_void_p(int(torch.cuda.current_stream().cuda_stream)),
+            ctypes.c_void_p(int(getattr(stream, "cuda_stream", stream))),
         )
         return rc == 0
     except Exception:
