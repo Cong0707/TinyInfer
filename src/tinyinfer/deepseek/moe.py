@@ -620,7 +620,9 @@ class MoE:
 
             # quantize_act（TileLang 的 fp4_native）已删除，改用 CUDA 的 act_quant：
             # 同一个 ue8m0 分块量化，走 act_quant.cubin。
-            aq, asc = _act_q(xf, 32, "ue8m0", torch.float8_e8m0fnu, True)
+            # inplace 必须是 False —— inplace=True 返回的是「量化后再还原的 bf16」，
+            # 只有一个值；这里要的是 (fp8 张量, scale) 这一对。
+            aq, asc = _act_q(xf, 32, "ue8m0", torch.float8_e8m0fnu, False)
             # 路由计数（pin 用）。原来在 serve() 里更新，那条路删掉后这里补上：
             # 只在还没 pin 的时候统计，pin 之后路由恒定，不必再花这次 D2H。
             if (not getattr(self, "_all_pinned", False)
