@@ -1,1 +1,1 @@
-engine: cold start means the disk starts working the moment the process does, and requests never queue behind it -- background fill runs from startup (TI_WARM=0 to disable) while a request reads exactly the experts it needs on its own, with the fill yielding to it via _busy
+engine: capture the decode graph as soon as pin_hot_experts makes the slot table ready -- removing the eager fallback exposed that the capture preconditions were only met after the first prefill, so a request arriving before warmup hit a hard error instead of a ready graph

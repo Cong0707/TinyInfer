@@ -1421,6 +1421,20 @@ class Engine:
                             _ffn._all_pinned = True
             except Exception:
                 self._slot_tab_ready = False
+        # **槽位表就绪后立刻捕获 decode graph。**
+        #
+        # 捕获的前置条件里有一条是「_slot_tab 已建」，而它只在 pin 之后才存在。
+        # 删掉 eager 回落之后，第一次 decode 若还没捕获就直接报错 —— 那不是
+        # 「图坏了」，是「启动顺序里少了一步」。服务端的 warmup() 会走 pin，
+        # 所以在那之后把图建好，请求进来就是 replay，不用等第一次捕获的 11 秒。
+        if self._slot_tab_ready and getattr(self.tier, "cuda_graph", False):
+            try:
+                import torch as _t
+                _ids = _t.zeros((1, 1), dtype=_t.long, device=self.device)
+                self._graph_try_capture(_ids, 1)
+            except Exception:
+                # 捕获失败就在这里炸，让启动阶段暴露问题，而不是等第一个请求
+                raise
         return pinned
 
     def reset(self) -> None:
