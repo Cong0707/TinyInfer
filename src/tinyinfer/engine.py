@@ -1592,34 +1592,36 @@ class Engine:
             # 多一个 token，路由漂到没进槽位的专家上，表里是 -1，kernel 拿
             # -1 * blob_bytes 当偏移读到别的专家：实测图内 L1 的
             # sids = [7, 6, 11, -1, -1, 13]，输出 absmax 2.36e37。
-            _keep_buf = bool(getattr(self, "_graph_captured_done", False))
-            if _keep_buf:
-                # 捕获刚结束：图里的 kernel 已经记下了捕获期那块 buffer 的地址，
-                # 而且那块显存属于 graph pool —— **必须留一份引用**，否则图里就是
-                # 已释放地址（实测输出 2.36e37）。
-                #
-                # 但不能像上一版那样让 _states 继续指向它：graph pool 的显存在图
-                # 之外读写是未定义行为，捕获之后 eager 再用同一块地址就会踩到
-                # 别人的内容 —— 实测捕获后 eager 直接出 nan（embedding 和 ids 都
-                # 校验过没变，坏的是 KV 状态）。
-                #
-                # 所以分家：图留池里的地址，Python 侧换成一块普通显存。
-                _gbufs = getattr(self, "_graph_bufs", None)
-                if _gbufs is None:
-                    _gbufs = {}
-                    self._graph_bufs = _gbufs
-                _cur = a._kv_window
-                if _cur is not None:
-                    _gbufs[i] = _cur          # 钉住，图退役前不许回收
-                # Python 侧回到捕获前的状态，**不是**复制捕获期那块脏 buffer。
-                # 捕获期的 buffer 里已经写进了 warmup 那一步的 KV，eager 从它开始
-                # 就会多读一个 token（实测 POST-EAGER 出 nan）。snap 是 warmup
-                # 之前拍的，那里的 kv 就是「没有」（reset 之后没跑过）。
-                _kv = None if entry.get("kv") is None else entry["kv"].clone()
-            elif entry.get("kv") is None:
+            # **图和 eager 必须共用同一块 KV buffer。**
+            #
+            # 以前这里给图单独留一份（_graph_bufs）再把 Python 侧换成 clone 出来的新
+            # 显存，理由是「graph pool 的显存在图外读写是未定义行为」。那个理由本身
+            # 没错，但分家的代价是致命的：图 replay 读写的是 A 块，prefill 走
+            # _forward_impl 写的是 B 块，两套 cache 从此永不互通 —— 第一步 decode
+            # 时图看到的 KV 里只有捕获那一步的内容，整个 prompt 的历史一个字节都
+            # 没有。实测图解码退化成
+            #   '<｜begin▁of▁sentence｜># 关于“ 关于“ 关于“新'
+            # 而同一个 prompt 走 eager 是完整中文。
+            #
+            # 正确的解法是把「pool 里的显存不能在图外读写」这条约束在源头消掉：
+            # 所有捕获期用到的 buffer 都在进入捕获窗口之前就分配好（见
+            # _pregrow_graph_buffers），窗口内只复用、不分配，于是它们落在普通显存
+            # 上，图外读写完全合法。这样图和 eager 天然是同一块地址。
+            #
+            # 捕获期确实写进去了一些中间 token 的 KV（warmup 那一步），必须清掉：
+            # 用原地 copy_ 把捕获前那份快照写回去，地址不变。
+            if entry.get("kv") is None:
                 _kv = None
             else:
-                _kv = entry["kv"].clone()
+                _snapkv = entry["kv"]
+                _cur = a._kv_window
+                if (_cur is not None and _cur.shape == _snapkv.shape
+                        and _cur.dtype == _snapkv.dtype and _cur.device == _snapkv.device):
+                    # 同一块、原地回填：地址保持不变，图里记的就是它。
+                    _cur.copy_(_snapkv)
+                    _kv = _cur
+                else:
+                    _kv = _snapkv.clone()
             # 环形槽位 cache 之后 _kv_window 和 _kv_buf 是同一块 buffer（forward 里
             # 直接 self._kv_window = buf），两个 property 各自映射到自己的 state key
             # （attention 是 "buf"，compressed 是 "winbuf"），所以两处都要写 ——
