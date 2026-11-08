@@ -2710,11 +2710,23 @@ class Engine:
         try:
             from .deepseek.compressed_attention import refresh_cos_sin
             _blocks = list(getattr(self, "_blocks", {}).values())
-            if _blocks:
-                _att = getattr(_blocks[0], "attn", None)
+            # **每一层都要刷，不是只刷第 0 层。**
+            # freqs_cis 由 get_table 按 _rope_key 缓存，不同层可能拿到不同的表；
+            # 而图里引用的是各层自己那张表的 device 地址。只刷 _blocks[0] 时，
+            # 其余层在 replay 里用的是捕获那一刻的 cos/sin —— 位置对不上，
+            # 注意力权重全错。实测症状：L0 单独捕获数值逐位正确，加进 L1 之后
+            # 整张图的输出恒为 0.0（精确的 0，不是垃圾值）。
+            _seen = set()
+            for _b in _blocks:
+                _att = getattr(_b, "attn", None)
                 _tbl = getattr(_att, "freqs_cis", None)
-                if _tbl is not None:
-                    refresh_cos_sin(_tbl, start_pos, int(ids.shape[1]))
+                if _tbl is None:
+                    continue
+                _k = int(_tbl.data_ptr())
+                if _k in _seen:
+                    continue
+                _seen.add(_k)
+                refresh_cos_sin(_tbl, start_pos, int(ids.shape[1]))
                 # 窗口索引用的位置 buffer：图外写值，图内读同一块地址。
                 from . import nn as _nnmod
                 if getattr(_nnmod, "_POS_BUF", None) is not None:
