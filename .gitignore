@@ -12,3 +12,6 @@ fix_indent.py
 # runtime KV session cache: session data does not belong in the repo
 .kvcache/*
 !.kvcache/.gitkeep
+
+# 编译产物：由 scripts/build_native.sh 生成，每台机器自己编
+src/tinyinfer/kernels/build/
