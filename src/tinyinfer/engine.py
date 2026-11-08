@@ -2851,17 +2851,24 @@ class Engine:
                     hit = self._graph_run(ids, start_pos)
                     if hit is not None:
                         return hit
+                    # **启动期：槽位表还没建，图不可能存在。**
+                    #
+                    # 捕获的前置条件之一是 device 侧的 [n_layers, n_experts] 槽位表，
+                    # 而它由 pin_hot_experts() 建立；pin 又需要先跑过一次 forward 才
+                    # 知道热点。于是「跑 forward 建表」和「建表才能捕获图」互为前提。
+                    #
+                    # 破法：**只有表还没建的那几次 forward 走直接路径**。这批调用是
+                    # 启动期的探测（server.warmup 的两次 forward + pin），它们本来就不
+                    # 是用户请求。表建好之后一律走 graph，没有任何回落。
+                    if getattr(self, "_slot_tab_ready", False) is not True:
+                        return self._forward_impl(ids, start_pos, chunk, positions=positions)
                     self._graph_try_capture(ids, start_pos)
                     hit = self._graph_run(ids, start_pos)
                     if hit is not None:
                         return hit
-                    # **没有 eager 回落。**
-                    # decode 单步必须走 graph：捕获失败时 _graph_try_capture 已经
-                    # 抛异常了，走到这里只能是「形状不满足捕获条件」，那也是错，
-                    # 不是「先用 slow path 出字」。留着回落等于留一条没人验证的实现，
-                    # 和 MoE 那边「eager/serve 已整段删除」的规矩自相矛盾。
+                    # 表已就绪却还没有图 = 真错误，不回落。
                     raise RuntimeError(
-                        f"decode step has no CUDA graph and cannot capture one "
+                        f"slot table ready but decode graph missing "
                         f"(ids={tuple(ids.shape)} start_pos={start_pos} "
                         f"gpu_layers={self.gpu_layers}/{self.max_layers})")
                 return self._forward_impl(ids, start_pos, chunk, positions=positions)
