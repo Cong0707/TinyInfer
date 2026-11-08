@@ -1587,10 +1587,14 @@ class Engine:
             # 图已经把捕获期那些 buffer 的地址记进 kernel 参数了，clone 出来的
             # 新内存 fig 内根本看不见。
             _keep_buf = bool(getattr(self, "_graph_just_captured", False))
-            if entry.get("kv") is None:
+            if _keep_buf:
+                # 捕获刚结束：图已经把捕获期 buffer 的地址记进 kernel 参数了，
+                # 这里**什么都不能改** —— 包括不能把 _kv_window 设成 None。
+                # （上一版写成 _kv = None 再统一赋值，等于把 buffer 摘掉，
+                #   图里那些地址立刻成了已释放内存。）
+                _kv = "KEEP"
+            elif entry.get("kv") is None:
                 _kv = None
-            elif _keep_buf:
-                _kv = None   # 保持原 buffer，restore 不动它
             else:
                 _kv = entry["kv"].clone()
             # 环形槽位 cache 之后 _kv_window 和 _kv_buf 是同一块 buffer（forward 里
@@ -1598,8 +1602,9 @@ class Engine:
             # （attention 是 "buf"，compressed 是 "winbuf"），所以两处都要写 ——
             # 只写 _kv_window 的话 forward 会从 _kv_buf 现开一块空 buffer，
             # 恢复出来的历史一个字节都用不上。
-            a._kv_window = _kv
-            a._kv_buf = _kv
+            if _kv != "KEEP":
+                a._kv_window = _kv
+                a._kv_buf = _kv
             if hasattr(a, "_kv_len"):
                 a._kv_len = int(entry.get("klen", 0))
             if hasattr(a, "_compress_kv"):
