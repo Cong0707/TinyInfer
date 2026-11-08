@@ -2517,8 +2517,18 @@ class Engine:
                 # '<｜begin▁of▁sentence｜># 关于" | 202' 这种噪声，eager 同一 prompt 是
                 # 完整中文。eager 之所以「看起来正常」，是因为它每层都重新分配 buf，
                 # 而捕获期 buf 是常驻的 —— 同一个坑只有图会踩。
+                # **只在捕获期设置。**
+                #
+                # 非捕获期这条赋值会改掉 streaming 层原本的共享槽语义：多个层
+                # 共用一个 attn 对象时，_active_layer 是「谁在跑」，而不是
+                # 「构造函数里的层号」。eager 一旦在这里被强制改写成 layer_id，
+                # 共享槽就退化成每层独占，_forward_impl 第二次调用直接出 NaN
+                # （实测 eager absmax=nan，而同一个 eager 路径不设这行时是完整中文）。
+                #
+                # 捕获期则必须设：图里每层的常驻 buffer（_graph_kv_buf /
+                # _graph_freqs）都挂在 _st() 里，槽位弄混就是 40 层共用一块 KV。
                 _al = getattr(b, "layer_id", None)
-                if _al is not None:
+                if _al is not None and torch.cuda.is_current_stream_capturing():
                     for _mod in (getattr(b, "attn", None), getattr(b, "ffn", None)):
                         if _mod is not None and hasattr(_mod, "_active_layer"):
                             _mod._active_layer = int(_al)
