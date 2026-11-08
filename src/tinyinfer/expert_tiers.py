@@ -129,6 +129,39 @@ class ExpertTierManager:
             return 0
         return int(self.slots.commit(layer))
 
+
+    # -- 给 MoE 的薄接口：它不该知道池子的内部结构 -----------------------
+    @property
+    def blob_bytes(self) -> int:
+        return int(getattr(self.slots, "blob_bytes", 0))
+
+    def table(self):
+        """device 侧的 [n_layers, n_experts] 槽位表（-1 = 不在显存）。"""
+        if self.slots is None:
+            return None
+        return self.slots.slot_table(self.n_layers, self.n_experts)
+
+    def layer_begin(self) -> None:
+        """一层开始：它要用的专家从这一刻起不许被别的层顶掉。"""
+        if self.slots is not None:
+            self.slots.clear_urgent()
+
+    def capabilities(self) -> dict:
+        """这一套布局能做什么，供上层（EP / 规划器）自适应。
+
+        不写死任何数字：槽位数、内存容量、是否多卡，全问实际对象。
+        """
+        devices = list(getattr(self.slots, "devices", None) or []) if self.slots else []
+        return {
+            "slots": int(getattr(self.slots, "slots", 0) or 0),
+            "blob_bytes": self.blob_bytes,
+            "vram_gb": int(getattr(self.slots, "slots", 0) or 0) * self.blob_bytes / 2**30,
+            "devices": devices,
+            "n_devices": max(1, len(devices)),
+            "ram_entries": int(getattr(self.ram, "capacity_entries", 0) or 0)
+                            if self.ram is not None else 0,
+        }
+
     def ready(self, layer: int, experts: Iterable[int]) -> None:
         """让 compute stream 等这批专家的 DMA。已落地的槽位不插等待。"""
         if self.slots is None:

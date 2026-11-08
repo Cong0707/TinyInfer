@@ -599,19 +599,12 @@ class MoE:
             sids = _sb[:_sn]
             torch.index_select(tab[self.layer_id], 0,
                                indices.view(-1).clamp_(0, 383), out=sids)
-            # 卖家模式：GPU 自己把「缺谁」写进 host-mapped 环（kernel 级操作，
-            # 不触发同步），CPU 侧的卖家线程去备货，本层的 kernel 在流里等
-            # 就绪计数。主机侧在这里一次同步都没有 —— 这是每 token 130ms 的
-            # 来源（40 层 x 3.3ms 的 D2H）。
-            # 备货：卖家线程已经把字节放进 pinned staging（上一次 post 之后
-            # 它就一直在做），这里在主线程把它 DMA 上卡并写表 —— 只碰本线程的
-            # stream，不会和谁死锁。
-            # 本层的专家开始当「当前单」处理：它们的槽位不许被别的层顶掉，
-            # 直到本层算完（否则同一层 6 个专家会互相覆盖，实测 hits=0）。
-            if not torch.cuda.is_current_stream_capturing():
-                sl.clear_urgent()
-            _async = self._async_experts()
             _mgr = self._tier_manager()
+            # 本层开始：它要用的专家从这一刻起不许被别的层顶掉，直到本层算完。
+            # 否则同一层的 6 个专家会互相覆盖（实测 hits=0，每步重搬 768 次）。
+            if not torch.cuda.is_current_stream_capturing():
+                _mgr.layer_begin()
+            _async = self._async_experts()
             # GPU 侧一次性完成「检查缺谁 + 发布请求 + 等 CPU 备好」。
             # 主机在这里不做任何同步：不 item()、不 tolist()、不拿中间产物。
             # 这是用户要的「买家下单，卖家发货，买家自己等货」—— 以前每层
@@ -630,7 +623,7 @@ class MoE:
                     _mgr.need(self.layer_id, _miss)
                     _mgr.commit(self.layer_id)
                     _mgr.ready(self.layer_id, _miss)
-            tab = sl._slot_tab
+            tab = sl._slot_tab   # 池子自有的 device 表，下面立刻索引用
             torch.index_select(tab[self.layer_id], 0,
                                indices.view(-1).clamp_(0, 383), out=sids)
             # 把本层路由告诉卖家，让它提前备下一层要用的（不阻塞）。
@@ -642,7 +635,7 @@ class MoE:
             _nrows = int(xf.size(0))
             n_exp = int(indices.numel())   # 多行时 = rows * topk
             nmid = int(self.cfg.moe_inter_dim)
-            blob = int(sl.blob_bytes)
+            blob = int(sl.blob_bytes)   # 槽位池自己的 blob 尺寸，不是猜的
             off = self._ts_offsets(self.layer_id)
             scr = self._scratch(n_exp * (nmid + (nmid >> 5)), arena[0].device)
             # moe_fused_down 的 y 形参是 __nv_bfloat16*：这里必须是 bf16。分配成
