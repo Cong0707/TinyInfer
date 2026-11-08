@@ -90,12 +90,25 @@ class QuantLinear:
 
     # ---- compute ----
     def _one(self, x: torch.Tensor, weight, scale) -> torch.Tensor:
+        # **捕获期禁止任何懒搬运。**
+        # 这个类有好几条路径会搬权重：_bf16 分支、fp8 gemm 分支、以及 fp32 反量化
+        # 分支。它们都只把搬好的结果传给 kernel，不写回 self —— 捕获期新开的显存
+        # 地址被记进图里，捕获结束即被回收，replay 读到别人的字节。
+        # 所以在捕获期先把三个字段整体搬到位，之后所有分支都拿到长期存活的地址。
+        if (torch.cuda.is_current_stream_capturing()
+                and weight is not None and weight.device != x.device):
+            self.weight = weight = weight.to(x.device)
+            self.scale = scale = scale.to(x.device)
+            if len(self.parts) == 1:
+                self.parts = [(weight.device, weight, scale)]
         if self._bf16 is not None:
             # The bf16 copy is built on the host in __init__ and nothing moves it with the
             # layer, so migrate lazily, once -- the old code did this and the rewrite
             # dropped it, which surfaced as "mat2 is on cpu" inside the shared expert.
             w = self._bf16
             if w.device != x.device:
+                # 两个分支都要写回 self._bf16；捕获期更必须写回，否则图里存的是
+                # 一块马上就会被回收的临时显存。
                 w = w.to(x.device)
                 self._bf16 = w
             return F.linear(x, w.to(x.dtype) if w.dtype != x.dtype else w)
