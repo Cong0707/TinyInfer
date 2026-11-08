@@ -457,6 +457,18 @@ class MLAWindowAttention:
             if wo_a is None:
                 from ..quant import dequant_fp8_block
                 wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
+                # **捕获期这块缓存必须落在常驻显存上。**
+                # dequant_fp8_block 的输出在捕获期由 graph pool 分配；它同时被
+                # _st()["wo_a_bf"] 缓存、又被写进 einsum 的 kernel 参数。捕获结束后
+                # pool 会把这块地址复用给别的张量，缓存里的内容就被覆盖了 ——
+                # 而 L0 侥幸正确只是因为它先分配、没人跟它抢。
+                #
+                # 实测：L1 的 attn 输入（hc_pre_rms_norm 的输出）在图里与 eager 逐位
+                # 相同，attn 输出却差 0.54（eager [0.412109,...] vs graph [0.18457,...]）。
+                if torch.cuda.is_current_stream_capturing():
+                    _cap = torch.empty_like(wo_a)
+                    _cap.copy_(wo_a)
+                    wo_a = _cap
                 self._st()["wo_a_bf"] = wo_a
         else:
             wo_a = self.wo_a
