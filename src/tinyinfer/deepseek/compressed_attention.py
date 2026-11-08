@@ -151,6 +151,30 @@ class MLACompressedAttention:
         self.wkv = split("wkv", self.wkv)
         self.wo_b = split("wo_b", self.wo_b)
 
+    def _derived(self):
+        """全机共享的派生张量缓存（反量化结果这类可重算的大块显存）。
+
+        容量按「卡上真实剩多少」定：不和层数挂钩，也不写死。小卡转得快，
+        大卡一次装下就再也不重算 —— 同一个类，规模由硬件决定。
+        """
+        c = getattr(self, "_derived_cache", None)
+        if c is not None:
+            return c
+        from ..derived_cache import DerivedCache
+        import os
+
+        cap = int(float(os.environ.get("TI_DERIVED_MB", "0")) * (1 << 20))
+        if cap <= 0:
+            # 默认：每张卡可用显存的 15%，留够激活和 KV 的地方
+            try:
+                import torch
+                free, _ = torch.cuda.mem_get_info()
+                cap = int(free * 0.15)
+            except Exception:
+                cap = 256 << 20
+        c = self._derived_cache = DerivedCache(cap)
+        return c
+
     def _st(self) -> dict:
         st = self._states.get(self._active_layer)
         if st is None:
@@ -685,11 +709,14 @@ class MLACompressedAttention:
         o = o.view(b, s, self.o_groups, -1)
         if hasattr(self.wo_a, "weight"):  # fp8 resident: dequant just this grouped GEMM
             # 同 MLAWindowAttention：权重在一次 decode 里不变，反量化结果按层缓存。
-            wo_a = self._st().get("wo_a_bf")
+            wo_a = self._derived().get(self._active_layer, "wo_a_bf")
             if wo_a is None:
                 from ..quant import dequant_fp8_block
                 wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
-                self._st()["wo_a_bf"] = wo_a
+                # 容量驱动的缓存：小卡上这份 64MB 的 bf16 会被后面的层顶掉，
+                # 下一圈再算一遍；大卡一次装下 40 层就再也不重算。
+                # 之前是每层一个 dict 永久持有 —— 40 层 2.5GB，8GB 卡直接 OOM。
+                self._derived().put(self._active_layer, "wo_a_bf", wo_a)
         else:
             wo_a = self.wo_a
         wo_a = wo_a.view(self.o_groups, self.o_lora_rank, -1)
