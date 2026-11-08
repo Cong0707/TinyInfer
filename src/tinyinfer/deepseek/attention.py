@@ -354,6 +354,28 @@ class MLAWindowAttention:
         # sparse_attn_cuda 里又是一次 .contiguous() 全量拷贝。三份拷贝换来的只是
         # 「历史在 buffer 里连续」这一点，而窗口索引本来就该按槽位算。
         buf = self._kv_buf
+        # **捕获期：KV buffer 必须按层独占，地址一次定死。**
+        #
+        # 图里的 _kv_buf 由 graph pool 分配。pool 会把「已经没人引用」的块复用给下一次
+        # 分配，而 L0 的 buf 在 L0 算完后就没人引用了 —— L1 分配时很可能拿到同一块
+        # 地址。于是 L1 读到的历史是 L0 刚写进去的 KV（两层 _kv_len 都是 1、idxs 也
+        # 相同），attn 输出就错了。
+        #
+        # 实测：L1 的 attn 输出 eager [0.412109, -0.229492, ...] vs graph
+        # [0.18457, -0.3125, ...]；L0 全链逐元素相同（L0-DIFF 0），因为 L0 是第一个
+        # 分配的，没人跟它抢。
+        #
+        # 捕获期用一块挂在 self 上的常驻 buffer（图退役前不释放），pool 就不会把它
+        # 分配给别的层。
+        if torch.cuda.is_current_stream_capturing():
+            _gb = getattr(self, "_graph_kv_buf", None)
+            if (_gb is None or _gb.shape[0] != b or _gb.shape[1] != self.window
+                    or _gb.dtype != kv.dtype or _gb.device != kv.device):
+                _gb = torch.zeros(b, self.window, self.head_dim, dtype=kv.dtype,
+                                  device=kv.device)
+                self._graph_kv_buf = _gb
+            self._kv_buf = _gb
+            buf = _gb
         if (buf is None or buf.shape[0] != b or buf.shape[1] != self.window
                 or buf.dtype != kv.dtype or buf.device != kv.device):
             # 必须清零，不能用 new_empty：没写到的槽位会被窗口索引扫到，
