@@ -2410,7 +2410,34 @@ def create_app(
     app.state.backend = backend
     app.state.settings = settings
     app.state.limiter = ConcurrencyLimiter(settings.max_concurrency)
-    app.state.slots = SlotManager(settings.max_slots, settings.max_context_tokens)
+    # 槽位数由**这块卡真实剩多少显存**决定，不是写死的 4。
+    # 8GB 卡算出来是 1，44GB 是 5 左右，141GB 是几十 —— 同一份代码，
+    # 规模由硬件决定。显式传了 max_slots 就以调用方为准（诊断/压测用）。
+    # max_slots <= 0 表示「自己算」；显式传正整数就以调用方为准。
+    _slots = int(settings.max_slots)
+    if _slots <= 0 and __import__("os").environ.get("TI_AUTO_SLOTS", "1") != "0":
+        try:
+            from .kv_tiers import plan_slots
+
+            _free = 0
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    _free = int(torch.cuda.mem_get_info()[0])
+            except Exception:
+                _free = 0
+            _ctx = int(settings.max_context_tokens)
+            _planned = plan_slots(vram_free_bytes=_free, context_tokens=_ctx)
+            if _free > 0 and _planned > 0:
+                _slots = _planned
+                logger.info("slots: %d (from %.1f GiB free, %d ctx tokens)",
+                            _slots, _free / 2**30, _ctx)
+        except Exception:
+            pass
+    if _slots < 1:
+        _slots = 1
+    app.state.slots = SlotManager(_slots, settings.max_context_tokens)
     app.state.started_at = time.time()
 
     if cors_origins:

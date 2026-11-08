@@ -56,6 +56,34 @@ class KvTierPlan:
                 "kv_budget_gb": self.kv_budget() / 2**30}
 
 
+
+
+def plan_slots(*, vram_free_bytes: int = 0, head_dim: int = 512,
+                n_layers: int = 40, context_tokens: int = 1_048_576,
+                ratio_mix=(0, 5), ratio_a=(2, 18), ratio_b=(1, 20),
+                reserve_bytes: int = 2 * 2**30, min_slots: int = 1) -> int:
+    """根据**这块卡真实剩多少显存**决定并发槽位数，而不是写死 4。
+
+    一条会话的 KV 有多大是可以算的（压缩 latent，fp4 存储）：
+    每层每个压缩组占 head_dim/2 字节，1M 上下文下 --
+    实测本 checkpoint 是 6.91GB，所以 44GB 卡扣掉权重/激活后大约是 4-6 条。
+
+    同一份代码在 8GB 卡上算出来就是 1 条，在 141GB 卡上是几十条 ——
+    **规模由硬件决定，不是人工配参数**。
+    """
+    if context_tokens <= 0:
+        return max(1, int(min_slots))
+    per_layer_bytes = 0
+    for ratio, count in (ratio_mix, ratio_a, ratio_b):
+        if ratio > 0:
+            per_layer_bytes += int(count) * (context_tokens // int(ratio)) * (head_dim // 2)
+    if per_layer_bytes <= 0:
+        return max(1, int(min_slots))
+    budget = max(0, int(vram_free_bytes) - int(reserve_bytes))
+    n = int(budget // max(1, per_layer_bytes))
+    return max(int(min_slots), n)
+
+
 class KvSwapPool:
     """按「整条会话」换出 KV 的主机侧仓库。
 

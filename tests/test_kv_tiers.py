@@ -22,6 +22,38 @@ def test_zero_budget_is_safe():
     assert KvTierPlan(vram_free_bytes=100, reserve_bytes=200).kv_budget() == 0
 
 
+
+
+def test_plan_slots_scales_with_the_card():
+    """同一个函数在 8GB / 44GB / 141GB 上算出的并发数必须不同。"""
+    from tinyinfer.kv_tiers import plan_slots
+
+    n8 = plan_slots(vram_free_bytes=7 * 2**30)
+    n44 = plan_slots(vram_free_bytes=42 * 2**30)
+    n141 = plan_slots(vram_free_bytes=138 * 2**30)
+    assert n8 == 1, n8
+    assert 4 <= n44 <= 7, n44
+    assert n141 > n44, (n44, n141)
+
+
+def test_plan_slots_never_returns_zero():
+    from tinyinfer.kv_tiers import plan_slots
+
+    assert plan_slots(vram_free_bytes=0) >= 1
+    assert plan_slots(vram_free_bytes=1 * 2**30) >= 1
+
+
+def test_plan_slots_shrinks_with_context():
+    """上下文越长，同时驻留的会话越少 —— 这是长上下文和并发的真实 trade-off。"""
+    from tinyinfer.kv_tiers import plan_slots
+
+    free = 42 * 2**30
+    n_1m = plan_slots(vram_free_bytes=free, context_tokens=1_048_576)
+    n_128k = plan_slots(vram_free_bytes=free, context_tokens=131_072)
+    assert n_128k > n_1m, (n_128k, n_1m)
+
+
+
 def test_1m_context_kv_is_several_gb():
     """按这个 checkpoint 的真实 compress_ratios 算 1M 上下文的压缩 KV。
 
