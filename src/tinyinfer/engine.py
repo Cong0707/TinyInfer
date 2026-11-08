@@ -2826,6 +2826,16 @@ class Engine:
                   torch.empty((b, s, hc_mult, hc_mult), dtype=dtype, device=dev),
                   torch.empty((b, s, hc_mult, hc_mult), dtype=dtype, device=dev))
                  for _ in range(64)])
+        # 游标也要一起备好：环是"预建"的，但索引表若不存在，捕获期第一次取用
+        # 会在 _CAP_*_IDX[key] 上抛 KeyError。
+        for _k, _v in _hc._CAP_PRE_OUT.items():
+            _hc._CAP_PRE_IDX.setdefault(_k, 0)
+        for _k, _v in _hc._CAP_PRE_MIX.items():
+            _hc._CAP_PRE_MIX_IDX.setdefault(_k, 0)
+        for _k, _v in _hc._CAP_POST_OUT.items():
+            _hc._CAP_POST_IDX.setdefault(_k, 0)
+        for _k, _v in _hc._CAP_MIX_OUT.items():
+            _hc._CAP_MIX_IDX.setdefault(_k, 0)
         torch.cuda.synchronize()
 
     def _graph_force_load_routes(self, slots) -> None:
