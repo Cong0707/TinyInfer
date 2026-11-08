@@ -789,13 +789,22 @@ class MLACompressedAttention:
             else:
                 if torch.cuda.is_current_stream_capturing():
                     # 单行：可见组数 = position // ratio，界从 device 读。
+                    #
+                    # 切片宽度在图里是常量，所以不能靠「切短」来限制可见范围，
+                    # 只能整宽取出来、靠 _vis 把不可见组清零。
                     from ..nn import _pos_buf
                     _cl = (_pos_buf(x.device) // ratio_now).to(torch.long)
                     _gidx = torch.arange(_width, device=_full.device)
                     _vis = (_gidx < _cl).to(_full.dtype)
                     compress_kv = _full * _vis.unsqueeze(0).unsqueeze(-1)
+                    # **不可见的组号必须从 idxs 里抹成 -1。** 清零只是让数值为 0，
+                    # 但 -1 是 kernel 的空槽标记、会被直接跳过；留着组号就会把
+                    # 「未来」的零向量当成真实 KV 参与 attention（softmax 里它们
+                    # 拿到非零权重，等于往输出里掺了一批虚构的上下文）。
+                    _clamp = _cl
                 else:
                     compress_kv = _full[:, :compress_len]
+                    _clamp = None
             if self.indexer is not None:
                 if _pt is not None:
                     _t2 = __import__("time").perf_counter()
@@ -805,6 +814,13 @@ class MLACompressedAttention:
                 self.rt.topk_idxs = compress_idxs
             else:
                 compress_idxs = self.rt.topk_idxs
+            # 捕获期：把不可见组的组号抹成 -1（见上面 _clamp 的注释）。
+            if _clamp is not None and compress_idxs is not None:
+                # compress_idxs 是 [b, s, topk]，_clamp 是标量张量。
+                compress_idxs = torch.where(
+                    compress_idxs < _clamp.reshape(()),
+                    compress_idxs,
+                    torch.full_like(compress_idxs, -1))
 
         if __import__("os").environ.get("TI_DEBUG_ATTN") and \
                 getattr(self, "layer_id", -1) == 20:
