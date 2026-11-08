@@ -77,6 +77,22 @@ def test_1m_context_kv_is_several_gb():
     assert (371 * 2**30) // total > 30
 
 
+def test_union_estimate_hits_the_measured_points():
+    """估算曲线必须精确穿过三个实测点。"""
+    from tinyinfer.kv_tiers import union_estimate
+
+    assert union_estimate(1) == 6.0
+    assert abs(union_estimate(8) - 35.0) < 0.01
+    assert abs(union_estimate(16) - 61.0) < 0.01
+    # 单调递增，且不会超过专家总数
+    prev = 0.0
+    for n in range(1, 200):
+        v = union_estimate(n)
+        assert v >= prev, (n, v, prev)
+        assert v <= 384, (n, v)
+        prev = v
+
+
 def test_slot_bound_matches_the_measured_union():
     """槽位约束算出来的批宽必须和实测并集一致。
 
@@ -87,6 +103,9 @@ def test_slot_bound_matches_the_measured_union():
 
     n = batch_slots_bound(slots=1359, n_layers=40, topk=6)
     assert n == 7, n
+    # 141GB 卡（约 5000 槽位）：能到几十条
+    big = batch_slots_bound(slots=5000, n_layers=40, topk=6)
+    assert big > 20, big
 
 
 def test_small_pool_gives_one():

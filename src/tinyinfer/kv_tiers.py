@@ -86,8 +86,66 @@ def plan_slots(*, vram_free_bytes: int = 0, head_dim: int = 512,
 
 
 
+
+
+def union_estimate(n: int, topk: int = 6, n_experts: int = 384) -> float:
+    """估算 n 条会话在同一层的专家并集大小。
+
+    实测点（真实 gate，这个 checkpoint 的第 0 层）：
+        n=1  ->  6
+        n=8  -> 35
+        n=16 -> 61
+
+    增长是次线性的（有热点专家），但边际增长率**递减**，不是常数：
+        d(1..8)  = (35-6)/7  = 4.14
+        d(8..16) = (61-35)/8 = 3.25
+
+    用一个饱和曲线拟合这三点：
+
+        union(n) = n_experts * (1 - exp(-a * n))
+
+    其中 a 由「n=1 时等于 topk」定：1 - exp(-a) = topk/n_experts。
+    这个形式在 n 大时自然饱和到 n_experts（不可能超过专家总数），
+    在 n 小时接近 topk。
+
+    校验：a = -ln(1 - 6/384) = 0.01575
+        n=8:  384 * (1 - e^-0.126) = 45.5   （实测 35，偏高）
+        n=16: 384 * (1 - e^-0.252) = 85.7   （实测 61，偏高）
+
+    纯饱和曲线高估了。改用「幂律」形式更贴：
+
+        union(n) = topk * n ** beta
+
+    由 n=8 定 beta: 35 = 6 * 8^beta -> beta = ln(35/6)/ln(8) = 0.684
+    校验 n=16: 6 * 16^0.684 = 39.9 （实测 61，偏低）
+
+    两个都不够贴。折中：用分段线性插值，直接把实测点连起来 —— 这是最诚实的
+    做法，不假装有一个精确的解析形式。超出实测范围时按最后一段的斜率外推，
+    并限制在 n_experts 以内。
+    """
+    n = max(1, int(n))
+    topk = max(1, int(topk))
+    n_experts = max(topk, int(n_experts))
+    # 实测锚点：(n, union)
+    pts = [(1, float(topk)), (8, 35.0), (16, 61.0)]
+    pts = [(x, min(float(y), float(n_experts))) for x, y in pts]
+    if n <= pts[0][0]:
+        return pts[0][1]
+    for i in range(1, len(pts)):
+        x0, y0 = pts[i - 1]
+        x1, y1 = pts[i]
+        if n <= x1:
+            t = (n - x0) / float(x1 - x0)
+            return y0 + t * (y1 - y0)
+    # 超出实测范围：按最后一段斜率线性外推，封顶 n_experts
+    x0, y0 = pts[-2]
+    x1, y1 = pts[-1]
+    slope = (y1 - y0) / float(x1 - x0)
+    return min(float(n_experts), y1 + slope * (n - x1))
+
+
 def batch_slots_bound(*, slots: int, n_layers: int, topk: int,
-                      marginal_experts: float = 4.1,
+                      n_experts: int = 384,
                       reserve_ratio: float = 1.0) -> int:
     """槽位池能支撑多少条并发会话（编队约束的第二个来源）。
 
@@ -113,7 +171,7 @@ def batch_slots_bound(*, slots: int, n_layers: int, topk: int,
     budget = int(slots * float(reserve_ratio))
     n = 1
     while True:
-        per_layer = topk + float(marginal_experts) * (n - 1)
+        per_layer = union_estimate(n, topk, n_experts)
         needed = per_layer * n_layers
         if needed > budget:
             return max(1, n - 1)
