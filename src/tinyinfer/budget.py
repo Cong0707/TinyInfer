@@ -107,6 +107,19 @@ def _cudart():
         # 那正是「GPU 主动下单、CPU 立刻推送」这条设计的载体。
         _cands = (glob.glob(os.path.join(lib_dir, "cudart*.dll"))
                   + glob.glob(os.path.join(lib_dir, "libcudart*.so*")))
+        # torch 2.15 的 Linux wheel **不带** libcudart（它静态链接了 CUDA 运行时），
+        # 真正的 so 在 nvidia/cu13/lib 或系统 CUDA 目录。只 glob torch/lib 会
+        # 在 L20 上永远返回 False。这里再按顺序试这些位置。
+        try:
+            import sysconfig as _sc
+
+            _sp = _sc.get_paths().get("purelib") or ""
+        except Exception:
+            _sp = ""
+        for _pat in ("nvidia/cu13/lib/libcudart.so*", "nvidia/cuda_runtime/lib/libcudart.so*"):
+            if _sp:
+                _cands += glob.glob(os.path.join(_sp, _pat))
+        _cands += ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
         for path in _cands:
             try:
                 lib = ctypes.CDLL(path)
