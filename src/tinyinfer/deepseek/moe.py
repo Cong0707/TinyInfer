@@ -623,24 +623,6 @@ class MoE:
             # inplace 必须是 False —— inplace=True 返回的是「量化后再还原的 bf16」，
             # 只有一个值；这里要的是 (fp8 张量, scale) 这一对。
             aq, asc = _act_q(xf, 32, "ue8m0", torch.float8_e8m0fnu, False)
-            # **捕获期必须把 aq/asc 拷进常驻 buffer。**
-            # 它们由 act_quant 新建，只在本次调用期间有效。图里接下来那个
-            # _aqx.copy_(aq) 记录的是 aq 的地址；捕获结束 aq 被回收，replay 时
-            # copy_ 就从已释放内存里读 —— 而它是紧接着喂给 moe_fused_act 的激活。
-            # 实测：routed 路径单独跑图输出 2e37，shared 路径（不经过这里）正常。
-            if torch.cuda.is_current_stream_capturing():
-                _ab = getattr(self, "_aq_cap", None)
-                if _ab is None or _ab.numel() != aq.numel() or _ab.device != aq.device:
-                    _ab = torch.empty_like(aq)
-                    self._aq_cap = _ab
-                _ab.copy_(aq)
-                aq = _ab
-                _sc_cap = getattr(self, "_asc_cap", None)
-                if _sc_cap is None or _sc_cap.numel() != asc.numel() or _sc_cap.device != asc.device:
-                    _sc_cap = torch.empty_like(asc)
-                    self._asc_cap = _sc_cap
-                _sc_cap.copy_(asc)
-                asc = _sc_cap
             # 路由计数（pin 用）。原来在 serve() 里更新，那条路删掉后这里补上：
             # 只在还没 pin 的时候统计，pin 之后路由恒定，不必再花这次 D2H。
             if (not getattr(self, "_all_pinned", False)
