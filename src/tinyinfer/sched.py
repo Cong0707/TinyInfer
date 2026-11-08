@@ -218,7 +218,16 @@ class ServingEngine:
         # 「槽位不够时换出旧会话」这条策略根本没生效过。
         from .sequence import KVPool
 
-        self.pool = KVPool(self.max_batch)
+        # 换出池的字节上限：按真实可用内存的一半算，不写死。
+        # 一条 1M 会话的压缩 KV 是 6.9GB，光按条数限（默认 64）会要 440GB。
+        _park_bytes = 0
+        try:
+            import psutil as _ps
+
+            _park_bytes = int(_ps.virtual_memory().available * 0.5)
+        except Exception:
+            _park_bytes = 0
+        self.pool = KVPool(self.max_batch, max_parked_bytes=_park_bytes)
         # 被换出、等槽位的会话。不放进 _inbox：放进去的话本次 _admit 的 while
         # 会立刻又把它取出来、又换出去，无限循环（实测直接超时）。
         self._parked_wait: list = []

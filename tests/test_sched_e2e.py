@@ -91,3 +91,37 @@ def test_one_slot_does_not_starve_the_second_session():
     assert len(tb) == 3, tb
     assert ta == [2, 3, 4], ta
     assert tb == [21, 22, 23], tb
+
+def test_parked_session_resumes_at_the_right_position():
+    """被 park 又回来的会话，下次取的必须是「最后一个已产 token」的位置。
+
+    以前的 bug：重新接纳时仍被标成 fresh，于是每轮重放 prompt、
+    永远吐同一个 token（单槽位实测 [2,2,2]）。这条直接盯住那条不变量。
+    """
+    eng = ServingEngine(_FakeEngine(), max_batch=1, idle_sleep=0.001)
+    a = Sequence(prompt=[1, 2], max_new_tokens=4)
+    eng.start()
+    try:
+        eng.submit(a)
+        ta = _drain(a)
+    finally:
+        eng.stop()
+    # prompt 最后一个是 2，所以序列是 3,4,5,6
+    assert ta == [3, 4, 5, 6], ta
+
+
+def test_batch_width_never_exceeds_the_pool():
+    """running 的长度不能超过槽位数 —— 否则 forward 的 batch 维就会超。"""
+    eng = ServingEngine(_FakeEngine(), max_batch=2, idle_sleep=0.001)
+    seqs = [Sequence(prompt=[i], max_new_tokens=2) for i in range(1, 6)]
+    eng.start()
+    try:
+        for s in seqs:
+            eng.submit(s)
+        outs = [_drain(s, limit=5) for s in seqs]
+        assert len(eng._running) <= 2, len(eng._running)
+    finally:
+        eng.stop()
+    for i, (s, o) in enumerate(zip(seqs, outs)):
+        assert len(o) == 2, (i, o)
+        assert o == [i + 2, i + 3], (i, o)

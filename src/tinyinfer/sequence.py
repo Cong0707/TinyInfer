@@ -89,7 +89,8 @@ class KVPool:
     one's history or the new conversation starts with someone else's tokens in context.
     """
 
-    def __init__(self, capacity: int, max_parked: int = 64):
+    def __init__(self, capacity: int, max_parked: int = 64,
+                 max_parked_bytes: int = 0):
         self.capacity = max(1, int(capacity))
         self._free = list(range(self.capacity))
         self._owner: dict[int, int] = {}       # slot -> sequence id
@@ -97,6 +98,9 @@ class KVPool:
         # 上限按会话条数算（内存放得下几十条 1M 会话），超了丢最老的。
         self._parked: dict[int, dict] = {}
         self.max_parked = max(0, int(max_parked))
+        # 字节上限（0 = 不限）。按条数限制保护不了内存：一条 1M 会话 6.9GB。
+        self.max_parked_bytes = max(0, int(max_parked_bytes))
+        self._parked_bytes: dict[int, int] = {}
         self.parked = 0
         self.restored = 0
         self.dropped = 0
@@ -140,19 +144,31 @@ class KVPool:
         except Exception:
             n = 0
         if seq.state:
-            # 按会话条数限流：内存放得下几十条 1M 会话，但不能无限涨。
-            # 超了就丢最老的那条 —— 它下次回来要重新 prefill，但至少不会 OOM。
-            if self.max_parked and len(self._parked) >= self.max_parked:
-                try:
-                    oldest = next(iter(self._parked))
-                    self._parked.pop(oldest, None)
-                    self.dropped += 1
-                except StopIteration:
-                    pass
             self._parked[seq.id] = dict(seq.state)
+            self._parked_bytes[seq.id] = int(n)
             self.parked += 1
+            # 双重上限：条数 + 字节数。只按条数限不合理 —— 一条 1M 会话的
+            # 压缩 KV 是 6.9GB，64 条就是 440GB，比整台机器的内存还大。
+            # 超了从最老的开始丢：它下次回来要重新 prefill，但至少不会把
+            # 机器撑爆。
+            self._drop_until_fits()
         self.release(seq)
         return n
+
+    def _drop_until_fits(self) -> None:
+        while self._parked:
+            over_count = (self.max_parked and len(self._parked) > self.max_parked)
+            over_bytes = (self.max_parked_bytes and self.parked_bytes > self.max_parked_bytes)
+            if not (over_count or over_bytes):
+                return
+            oldest = next(iter(self._parked))
+            self._parked.pop(oldest, None)
+            self._parked_bytes.pop(oldest, None)
+            self.dropped += 1
+
+    @property
+    def parked_bytes(self) -> int:
+        return int(sum(self._parked_bytes.values()))
 
     def resume(self, seq: Sequence) -> bool:
         """会话回来：把它之前 park 的 KV 找回来（不需要重新 prefill）。"""

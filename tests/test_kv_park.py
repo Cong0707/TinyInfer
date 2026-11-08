@@ -76,3 +76,20 @@ def test_parked_sessions_are_bounded():
     assert pool.resume(seqs[-1])
     assert pool.resume(seqs[-2])
 
+
+def test_parked_bytes_are_bounded_too():
+    """条数上限保护不了内存：一条 1M 会话的 KV 是 6.9GB。"""
+    import pytest as _p
+
+    torch = _p.importorskip("torch")
+    from tinyinfer.sequence import KVPool, Sequence
+
+    # 4 字节一个元素，每条 1KB。上限 2KB -> 最多 2 条
+    pool = KVPool(1, max_parked=64, max_parked_bytes=2048)
+    for i in range(5):
+        s = Sequence(prompt=[i])
+        pool.acquire(s)
+        s.state["kv"] = torch.zeros(256, dtype=torch.uint16)   # 512 B
+        pool.park(s)
+    assert pool.parked_bytes <= 2048, pool.parked_bytes
+    assert len(pool._parked) == 4, len(pool._parked)
