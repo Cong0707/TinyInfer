@@ -529,7 +529,16 @@ class MLACompressedAttention:
         elif s == 1:
             # 用 index_copy_ + device 下标写，而不是 buf[:, start_pos % window] = ...
             # 后者是 Python 整数索引，图里位置会被钉死成捕获时的 start_pos。
-            _pos = torch.tensor([start_pos % self.window], dtype=torch.long, device=kv.device)
+            #
+            # **捕获期不能 torch.tensor([...], device=...)：那是 unpinned H2D，
+            # 捕获窗口里直接抛
+            #   Cannot copy between CPU and CUDA tensors during CUDA graph capture
+            #   unless the CPU tensor is pinned.
+            if torch.cuda.is_current_stream_capturing():
+                from ..nn import _pos_buf
+                _pos = (_pos_buf(kv.device) % self.window).to(torch.long).reshape(1)
+            else:
+                _pos = torch.tensor([start_pos % self.window], dtype=torch.long, device=kv.device)
             buf.index_copy_(1, _pos, kv[:, :1])
         else:
             if s > self.window:
