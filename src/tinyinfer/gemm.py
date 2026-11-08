@@ -323,6 +323,14 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
                         for i in range(xf.size(0))]
                 out = torch.cat(rows, dim=0)
                 return out.view(*x.shape[:-1], out.shape[-1])
+            # 只有 1 行、且 x 是 3 维（[b, s, d] 的 s==1，或 [1, 1, d]）：
+            # 把它拍成 2 维再往下走，否则下面的 M=1 分支会因为 x.dim()==3 而
+            # 拒绝（"no path for M=1"）—— 而它其实只是「1 行」而已。
+            # 实测：引擎跑过一次之后再送 1 个 token，MoE 里的 fp8 投影就抛这个错，
+            # 被 _forward_gpu_only 的 except 吞掉返回 None，上层回落到错误的
+            # 降级路径，最终 logits 全是 NaN。
+            if x.dim() != 2:
+                x = xf
     # Prefill (M > 8 or a shape the GEMV does not cover): the native tensor-core GEMM.
     # This used to be the tilelang _k.fp8_gemm; the mma kernel is the replacement and
     # takes M >= 128, which is what a prefill chunk is.
