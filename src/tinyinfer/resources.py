@@ -608,6 +608,10 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     if has_experts and has_gpu and slots > 0:
         for _ in range(6):
             _sb = slots * expert_b
+            # 注意：`_used_with` 与 `layers_that_fit` 的记账口径必须一致，且**只扣一次**。
+            # 之前这里既在 layers_that_fit 里传 slot_bytes、又在外面减 _sb，
+            # 槽位被算了两次，24GB 卡从 268 掉到 208（不够覆盖 240 个可路由专家，
+            # 直接退化成每 token 有磁盘 IO）。
             _r = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0,
                                               slot_bytes=_sb))
             _spare = max(0.0, V - _used_with(_r, embed_gpu, head_gpu) - _sb)
@@ -615,6 +619,13 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             if _r == resident and _s == slots:
                 break
             resident, slots = _r, max(0, _s)
+        # 兜底：大卡上装得下全模型的层时，槽位不该比「单会话可路由的专家数」还少
+        # ——那是最基本的覆盖率，低于它每次 token 必然有磁盘 IO。
+        if resident >= n_layers and need_slots:
+            slots = max(slots, min(need_slots,
+                                   int(max(0.0, V - _used_with(resident, embed_gpu,
+                                                                  head_gpu))
+                                       // max(1.0, expert_b))))
 
     # The wave size is whatever the spare VRAM can hold at WS_PER_TOKEN each; the lower
     # bound keeps a chunk from degenerating into single rows. The old upper bound of 64
