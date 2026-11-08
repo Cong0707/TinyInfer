@@ -1854,16 +1854,28 @@ class SlotManager:
         ]
         self._sessions: OrderedDict[str, int] = OrderedDict()
         self._lock = threading.Lock()
+        # 换出回调：调用方（服务端）在这里把该会话的 KV 沉到内存。
+        # 签名 (session_id, slot_id) -> None。没接就是旧行为（丢 KV）。
+        self.on_evict = None
 
     def _take_slot_locked(self) -> tuple[Slot, bool]:
         for slot in self._slots:
             if not slot.busy and slot.session_id is None:
                 return slot, bool(slot.requests) or slot.n_prompt_tokens > 0
+        # 没有空槽位：把一个不忙的会话挪走。
+        # 关键区别：以前只是把它从 _sessions 删掉，KV 直接丢 —— 那个会话下次
+        # 回来要整段重新 prefill（1M 上下文就是几分钟）。现在先让调用方把它的
+        # KV 换出到内存（self.on_evict 回调），回来时再换入，上下文不丢。
         for session_id in list(self._sessions):
             slot = self._slots[self._sessions[session_id]]
             if not slot.busy:
                 del self._sessions[session_id]
                 slot.session_id = None
+                if self.on_evict is not None:
+                    try:
+                        self.on_evict(session_id, slot.slot_id)
+                    except Exception:
+                        pass
                 return slot, True
         raise APIError(
             f"all {self.max_slots} slots are busy; retry shortly",
