@@ -378,9 +378,16 @@ class MLAWindowAttention:
         else:
             if positions is not None and positions.numel() == b and b > 1:
                 from ..nn import window_idxs_per_row
-                old_per_row = [max(0, min(self.window, int(p) - (s - 1)))
-                               for p in positions.tolist()]
-                idxs = window_idxs_per_row(positions, s, old_per_row, self.window, x.device)
+                # positions 在这里是 [b, s]（每行每个位置），而
+                # window_idxs_per_row 要的是 [b]（每行的**首列**绝对位置）。
+                # 以前把这个二维张量原样传进去，它内部 tolist() 得到一行列表、
+                # 再 int() 就 TypeError —— 这是 batch>1 跑不起来的第一个硬错误。
+                _pos2 = positions.reshape(b, -1)
+                _first = _pos2[:, 0]
+                # 每行已经积累了多少历史：首列位置减去本行在前面 chunk 里的长度。
+                # 单行时它就等于 min(window, start_pos)，多行时各行不同。
+                old_per_row = [max(0, min(self.window, int(p))) for p in _first.tolist()]
+                idxs = window_idxs_per_row(_first, s, old_per_row, self.window, x.device)
             else:
                 from ..nn import window_idxs_ring_cached
                 idxs = window_idxs_ring_cached(start_pos, s, self.window,

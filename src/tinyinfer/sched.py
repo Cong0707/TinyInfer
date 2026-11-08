@@ -189,12 +189,13 @@ class ServingEngine:
         # the model itself is already resident. Asking for 8 on a 7 GB card would OOM on
         # the second sequence, so the ceiling is measured and the request is clamped
         # rather than trusted. This runs last: it reads the fields above.
-        # 这个 checkpoint 的某些层在前向里假设 batch 维一致：多序列拼批后
-        # batch 维会从 1 变成 2，而 _last_hidden / pre_mix 的缓存形状还停在 1，
-        # 于是 engine.forward 里抛
-        #   output with shape [1, T, 512] doesn't match [2, T, 512]
-        # （实测 10 次请求 2-3 次 500）。在按请求隔离这些缓存之前，批大小为 1
-        # 是唯一能保证正确性的上限。TI_MAX_BATCH 可以覆盖。
+        # 以前这里被迫把 max_batch 压到 1：多序列拼批会让 batch 维从 1 变 2，
+        # 而 attention 里按行算窗口的那段把 positions([b, s]) 当标量用，
+        #   TypeError: int() argument must be ... not 'list'
+        # 于是每次并发请求都有 20-30% 概率 500。那个 bug 已经修掉
+        # （tests/test_batched_forward.py 锁住 batch=2 的前向），所以这里的
+        # 上限只由 _fit() 按真实显存算出的数字决定，不再人为压到 1。
+        # TI_MAX_BATCH 仍然可以覆盖（压测要能固定住）。
         _mb_env = __import__("os").environ.get("TI_MAX_BATCH")
         if _mb_env is not None:
             self.max_batch = max(1, int(_mb_env))
