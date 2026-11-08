@@ -293,19 +293,12 @@ class MLAWindowAttention:
         #               decode 时 s=1，每行一个位置）',
         #   [b, s]   —— 每行每个位置（prefill 混批时用）',
         # 以前只处理了后者的形状检查、却按前者分配，两种都对不上。',
-        if positions is not None and b > 1:
-            _pr = positions.reshape(b, -1)
-            if _pr.size(1) >= s:
-                # [b, s]：直接 gather 每行每个位置
-                freqs = self.freqs_cis.index_select(0, _pr[:, :s].reshape(-1))
-                freqs = freqs.view(b, s, -1)
-            else:
-                # [b]：每行只有一个位置，把它当这一行的起点（s 个连续位置）
-                _p0 = _pr[:, 0].clamp(min=0)
-                _idx = (_p0.unsqueeze(1)
-                        + torch.arange(1 - s, 1, device=_p0.device).unsqueeze(0))
-                freqs = self.freqs_cis.index_select(0, _idx.reshape(-1))
-                freqs = freqs.view(b, s, -1)
+        # 两种 positions 约定统一成 [b, s]（见 nn.normalize_positions）。
+        from ..nn import normalize_positions
+        _pos2d, _, _ = normalize_positions(positions, b, s)
+        if _pos2d is not None and b > 1:
+            freqs = self.freqs_cis.index_select(0, _pos2d.reshape(-1))
+            freqs = freqs.view(b, s, -1)
         else:
             freqs = self.freqs_cis[start_pos:start_pos + s]
 
@@ -389,13 +382,8 @@ class MLAWindowAttention:
         # 每行的位置可能不同（batch>1 且各行历史长度不一），所以槽位必须逐行算。
         # 以前这里用同一个 start_pos 给所有行写同一格，两行会互相覆盖对方的历史
         # （实测 batch=2 时第 0 行输出偏离 4.70）。
-        _rowpos = None
-        if positions is not None:
-            _p = positions.reshape(b, -1)
-            if _p.size(1) == s:
-                _rowpos = _p                       # [b, s] 每行每个位置
-            elif _p.size(1) >= 1:
-                _rowpos = _p[:, :1].expand(-1, s)  # [b, 1] -> 每行起点
+        from ..nn import normalize_positions
+        _rowpos, _, _ = normalize_positions(positions, b, s)
         if _rowpos is not None and b > 1:
             # 逐行写：第 r 行第 j 列写进槽位 (rowpos[r, j] % window)。
             # 用 index_copy_ 逐行做（下标是 device tensor，图捕获时不会被钉死）。

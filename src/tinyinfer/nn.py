@@ -135,6 +135,41 @@ def window_idxs_ring_cached(start_pos: int, seqlen: int, window: int, device) ->
     return t
 
 
+
+
+def normalize_positions(positions, b: int, s: int):
+    """把两种 positions 约定统一成 [b, s] 的「每行每个位置的绝对位置」。
+
+    这个工程里 positions 有两种来源，历史上每处调用各按各的理解用，出过三次
+    静默错误（不报错、数值偏）：
+
+      [b]      —— 每行**最后一个**位置（engine._forward_chunk 的约定，decode 时
+                  s=1 就是每行一个位置）
+      [b, s]   —— 每行每个位置（prefill 混批时用）
+
+    统一到这里之后，调用方只看到一个形状，不再需要各自做减法：
+
+      first_col  每行第一个位置（window_idxs_per_row 要的就是它）
+      last_col   每行最后一个位置（写 KV 槽位用它）
+
+    返回 (pos2d, first_col, last_col)；positions 为 None 时返回 None。
+    """
+    if positions is None:
+        return None, None, None
+    p = positions.reshape(int(b), -1)
+    if p.size(1) == int(s):
+        pos2d = p
+    elif p.size(1) == 1:
+        # 每行一个位置 = 这一行最后一个位置；向前推 s 个得到整段
+        last = p[:, 0]
+        off = torch.arange(1 - int(s), 1, device=p.device, dtype=last.dtype)
+        pos2d = last.unsqueeze(1) + off.unsqueeze(0)
+    else:
+        # 形状不认识：保守地当成「每行起点」重复 s 次，至少让 s=1 路径正确
+        pos2d = p[:, :1].expand(-1, int(s))
+    return pos2d, pos2d[:, 0], pos2d[:, -1]
+
+
 def window_idxs_per_row(positions, seqlen: int, old_len, window: int, device=None) -> torch.Tensor:
     """Window slots for a batch whose rows are at different depths.
 

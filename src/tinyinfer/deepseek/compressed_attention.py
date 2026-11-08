@@ -523,14 +523,11 @@ class MLACompressedAttention:
             win_idxs = self._decode_win_idxs
         else:
             if positions is not None and b > 1:
-                # window_idxs_per_row 要的是「每行的**首列**绝对位置」，而
-                # 这里的 positions 约定是「每行最后一个位置」（见函数签名）。
-                # 直接把后者传进去，多行 decode 会按错的位置算窗口 ——
-                # 不报错，数值偏。这里换算成首列。
-                _p = positions.reshape(b, -1)
-                _first = (_p[:, -1] - (s - 1)).clamp(min=0) if _p.size(1) == 1 \
-                    else _p[:, 0]
-                # 同一步里所有层算的是同一份每行窗位，改走跨层缓存
+                # window_idxs_per_row 要「每行的首列绝对位置」；positions 的约定
+                # 是「每行最后一个位置」。换算统一走 nn.normalize_positions，
+                # 免掉每个调用点各做一次减法（这块已经出过三次静默错误）。
+                from ..nn import normalize_positions
+                _, _first, _ = normalize_positions(positions, b, s)
                 win_idxs = self._win_idxs_per_row(_first, s, n_old, x.device)
             else:
                 # tensor 版而不是 cached：cached 的 key 是 int start_pos，每步一个新 tensor
