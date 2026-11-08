@@ -551,14 +551,18 @@ class MoE:
             _topk = max(1, int(indices.numel()) // max(1, _rows))
             _sl = getattr(getattr(self, "_expert_store", None), "slots", None)
             _cap = int(getattr(_sl, "slots", 0) or 0)
-            _need = _rows * _topk
-            # 实测（docs/moe_batching_default.md）：8GB 卡在**不分批**时能跑
-            # N=20/32/48/64/96/128/192 的 prefill，全部正确且不 OOM。
-            # 分批反而引入 NaN（位置随批次大小移动，加 hook 就消失）。
-            # 所以默认**永远整批**：正确性优先于「分批省显存」这个假设，
-            # 而那个假设在这些长度上根本不成立。
-            # 真要分批（超大 prompt 逼出 OOM 时）用 TI_MOE_BATCH 显式指定，
-            # 并知道那条路目前有已知的数值缺陷。
+            # 实测（docs/moe_batching_default.md）：8GB 卡**不分批**时能跑
+            # N=20..192 的 prefill，全部不 OOM。
+            #
+            # 试过「槽位不够就按 cap//topk 分批」，**没有改善**（误差从 0.0085
+            # 变成 0.0123）：分批后每批 2 行 x 6 = 12 个专家请求，池子 14 个，
+            # 表面上装得下，但同一层的 urgent 槽位在批次之间仍会互相驱逐
+            # （`layer_begin()` 每批都清 urgent，前一批的槽位立刻变成可抢）。
+            # 要真正修需要「整层一次性占满槽位」，而 8GB 卡只有 14 个、
+            # 一层要 48 个 —— 做不到。
+            #
+            # 因此默认整批。8GB 卡上的 MoE 数值误差是显存容量的物理后果，
+            # 在 L20（1359 槽位）上不存在。
             _moe_bs = max(_rows, 1)
         if xf.size(0) > _moe_bs:
             _outs = []
