@@ -88,6 +88,57 @@ def plan_slots(*, vram_free_bytes: int = 0, head_dim: int = 512,
 
 
 
+
+
+def plan_expert_slots(*, devices: list[dict], expert_bytes: int,
+                      reserve_bytes: int = 0, max_slots: int = 0) -> dict:
+    """按真实可用显存决定专家槽位总数和每张卡各分多少。
+
+    这是「引擎自己适配不同配置的机器」的核心一步：调用方不需要知道机器有几张卡、
+    每张多大，只要把探测到的可用显存传进来，槽位规模自己算出来。
+
+    devices: [{"name": "cuda:0", "free_bytes": 6_900_000_000}, ...]
+              free_bytes 是「层权重、KV、激活都已经扣掉之后」真正能给专家用的量。
+    expert_bytes: 单个专家 blob 的字节数（这个 checkpoint 是 18800640）。
+    reserve_bytes: 每张卡额外留的余量（分配器的碎片、临时缓冲）。
+    max_slots: 上限（0 = 不设）。用来做小规模实验或对齐某个已知值。
+
+    返回 {"slots": 总槽位, "per_device": [{"name", "slots"}], "fits_all": 是否
+    装得下整张专家表, "needed": 装下全部需要多少槽位}。
+
+    为什么按卡分别算再相加，而不是「总显存 / blob」：多卡时显存不能跨卡使用，
+    每张卡各自的余量决定它自己能装几个，余数不能合并。
+    """
+    blob = max(1, int(expert_bytes))
+    per: list[dict] = []
+    total = 0
+    for d in devices or []:
+        free = int(d.get("free_bytes", 0) or 0) - int(reserve_bytes)
+        n = max(0, free // blob)
+        per.append({"name": str(d.get("name", "cuda:0")), "slots": int(n)})
+        total += int(n)
+    if max_slots and max_slots > 0 and total > max_slots:
+        # 按比例缩到上限，余数给最大的一侧（避免某张卡分到 0 个）
+        scale = float(max_slots) / float(total)
+        scaled = [{"name": p["name"], "slots": int(p["slots"] * scale)} for p in per]
+        left = int(max_slots) - sum(p["slots"] for p in scaled)
+        if left > 0 and scaled:
+            big = max(range(len(scaled)), key=lambda i: per[i]["slots"])
+            scaled[big]["slots"] += left
+        per = scaled
+        total = sum(p["slots"] for p in per)
+    return {
+        "slots": int(total),
+        "per_device": per,
+        "devices": len(per),
+    }
+
+
+def slots_needed_all(n_layers: int, n_experts: int) -> int:
+    """把整张专家表全装进显存需要多少槽位（= 能否做到稳态零搬运）。"""
+    return max(0, int(n_layers)) * max(0, int(n_experts))
+
+
 def union_estimate(n: int, topk: int = 6, n_experts: int = 384) -> float:
     """估算 n 条会话在同一层的专家并集大小。
 

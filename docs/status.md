@@ -63,3 +63,32 @@ OUT     '2'                                    <- 正确
 | 每步 | ~3.7s | ~80ms |
 | 单路 | 0.27 tok/s | ~12 tok/s |
 | 并发 | 1 | 5-7 |
+
+## 多卡槽位规划（本轮新增）
+
+`kv_tiers.plan_expert_slots(devices, expert_bytes, reserve_bytes, max_slots)`：
+
+输入每张卡**真实剩余**的可用显存，输出总槽位数和每张卡各分多少。调用方不需要
+知道机器有几张卡、每张多大 —— 这就是「引擎自己适配」的那一层。
+
+```python
+plan_expert_slots(
+    devices=[{"name": "cuda:0", "free_bytes": 90e9},
+             {"name": "cuda:1", "free_bytes": 30e9}],
+    expert_bytes=18_800_640,
+)
+# -> {"slots": 6380, "per_device": [{"cuda:0": 4786}, {"cuda:1": 1594}], "devices": 2}
+```
+
+为什么按卡分别算再相加：多卡时显存不能跨卡使用，每张卡的余数不能合并。
+
+`slots_needed_all(40, 384) = 15360` —— 全装下才谈得上稳态零搬运。
+
+## 现状核实：多卡链路是通的
+
+`engine` → `expert_store.set_devices(devices, caps)` → `VramSlotCache.set_devices`
+按比例分散槽位。这条链完整，只是从来没有在两张卡上跑过。
+
+**发现一个死字段**：`resources.plan()` 算出的 `card_slots` 没有任何消费者。
+它和 `_expert_dev`（静态专家分配）一样，属于「算出来没人用」。静态分配那处已经
+在打印时标注了「static reference only」，`card_slots` 还没标。

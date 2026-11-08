@@ -131,3 +131,64 @@ def test_more_slots_never_reduce_the_bound():
         n = batch_slots_bound(slots=slots, n_layers=40, topk=6)
         assert n >= prev, (slots, n, prev)
         prev = n
+
+def test_plan_expert_slots_single_card():
+    """8GB 卡的 6.5GB 可用 -> 约 345 个槽位。"""
+    from tinyinfer.kv_tiers import plan_expert_slots
+
+    r = plan_expert_slots(
+        devices=[{"name": "cuda:0", "free_bytes": 6_500_000_000}],
+        expert_bytes=18_800_640)
+    assert r["devices"] == 1
+    assert 300 < r["slots"] < 400, r
+    assert r["per_device"][0]["slots"] == r["slots"]
+
+
+def test_plan_expert_slots_asymmetric_cards():
+    """96GB + 32GB：大卡拿大头，但不能超过自己的余量。"""
+    from tinyinfer.kv_tiers import plan_expert_slots
+
+    r = plan_expert_slots(
+        devices=[
+            {"name": "cuda:0", "free_bytes": 90_000_000_000},
+            {"name": "cuda:1", "free_bytes": 30_000_000_000},
+        ],
+        expert_bytes=18_800_640)
+    a, b = r["per_device"][0]["slots"], r["per_device"][1]["slots"]
+    assert a > b * 2, (a, b)
+    assert r["slots"] == a + b
+
+
+def test_plan_expert_slots_clamps_to_max():
+    from tinyinfer.kv_tiers import plan_expert_slots
+
+    r = plan_expert_slots(
+        devices=[{"name": "cuda:0", "free_bytes": 6_500_000_000}],
+        expert_bytes=18_800_640, max_slots=100)
+    assert r["slots"] == 100, r
+
+
+def test_plan_expert_slots_reserve_reduces_capacity():
+    from tinyinfer.kv_tiers import plan_expert_slots
+
+    full = plan_expert_slots(devices=[{"name": "cuda:0", "free_bytes": 2_000_000_000}],
+                             expert_bytes=18_800_640)
+    less = plan_expert_slots(devices=[{"name": "cuda:0", "free_bytes": 2_000_000_000}],
+                             expert_bytes=18_800_640, reserve_bytes=1_000_000_000)
+    assert less["slots"] < full["slots"], (full, less)
+
+
+def test_plan_expert_slots_no_devices():
+    from tinyinfer.kv_tiers import plan_expert_slots
+
+    r = plan_expert_slots(devices=[], expert_bytes=18_800_640)
+    assert r["slots"] == 0
+    assert r["devices"] == 0
+
+
+def test_slots_needed_all():
+    """40 层 x 384 专家 = 15360 —— 全装下才谈得上零搬运。"""
+    from tinyinfer.kv_tiers import slots_needed_all
+
+    assert slots_needed_all(40, 384) == 15360
+    assert slots_needed_all(40, 6) == 240
