@@ -310,7 +310,11 @@ class MLACompressedAttention:
         hit = getattr(rt, "_grp0_hit", None)
         if hit is not None and hit[0] == key and hit[1] is positions:
             return hit[2]
+        # positions 现在可能是 [b]（每行最后一个位置）也可能 [b, s]：
+        # 两种都按「每个位置 // ratio」算，形状不变地返回。
         out = (positions // self.ratio).to(torch.long)
+        if out.dim() == 1 and int(out.numel()) == int(b) and int(s) == 1:
+            out = out.unsqueeze(1)
         rt._grp0_hit = (key, positions, out)   # 持引用：地址在缓存期间不会被回收
         return out
 
@@ -518,9 +522,16 @@ class MLACompressedAttention:
         if full and self._decode_win_idxs is not None:
             win_idxs = self._decode_win_idxs
         else:
-            if positions is not None and positions.numel() == b and b > 1:
-                # 同一步里所有层算的是同一份每行窗位，改走跨层缓存（见 _win_idxs_per_row）
-                win_idxs = self._win_idxs_per_row(positions, s, n_old, x.device)
+            if positions is not None and b > 1:
+                # window_idxs_per_row 要的是「每行的**首列**绝对位置」，而
+                # 这里的 positions 约定是「每行最后一个位置」（见函数签名）。
+                # 直接把后者传进去，多行 decode 会按错的位置算窗口 ——
+                # 不报错，数值偏。这里换算成首列。
+                _p = positions.reshape(b, -1)
+                _first = (_p[:, -1] - (s - 1)).clamp(min=0) if _p.size(1) == 1 \
+                    else _p[:, 0]
+                # 同一步里所有层算的是同一份每行窗位，改走跨层缓存
+                win_idxs = self._win_idxs_per_row(_first, s, n_old, x.device)
             else:
                 # tensor 版而不是 cached：cached 的 key 是 int start_pos，每步一个新 tensor
                 # （地址变），图里引用的还是捕获时那一块，replay 会读错槽位。
@@ -547,10 +558,11 @@ class MLACompressedAttention:
         # shared start the whole batch lands at the same group offset, so two sequences
         # at different depths overwrite each other's compressed history -- measured as
         # row A drifting 16.18 against the same prompt run alone.
-        if positions is not None and positions.numel() == b:
-            # 每行压缩组号。同一 forward 里所有层看到的是同一个 positions 张量、
-            # 且没有一层写它，所以这一格除法可以跨层复用（见 _grp0_for）。
-            # 数值不变：同一输入、同一整数除法，结果逐位相同。
+        if positions is not None and (positions.numel() == b or b == 1):
+            # 每行压缩组号。positions 的约定是「每行最后一个位置」，除 ratio 得到
+            # 该行最后一个位置所在的组 —— 这正是写 latent 时要用的组号。
+            # 同一 forward 里所有层看到的是同一个 positions 张量，且没有一层写它，
+            # 所以这一格除法可以跨层复用（见 _grp0_for）。
             _grp0 = self._grp0_for(positions, start_pos, s, b)
         else:
             _grp0 = None
