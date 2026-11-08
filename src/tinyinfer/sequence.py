@@ -89,10 +89,17 @@ class KVPool:
     one's history or the new conversation starts with someone else's tokens in context.
     """
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, max_parked: int = 64):
         self.capacity = max(1, int(capacity))
         self._free = list(range(self.capacity))
         self._owner: dict[int, int] = {}       # slot -> sequence id
+        # 被换出但还会回来的会话：seq.id -> 它的 KV（已搬到主机内存）。
+        # 上限按会话条数算（内存放得下几十条 1M 会话），超了丢最老的。
+        self._parked: dict[int, dict] = {}
+        self.max_parked = max(0, int(max_parked))
+        self.parked = 0
+        self.restored = 0
+        self.dropped = 0
 
     def acquire(self, seq: Sequence) -> int | None:
         if not self._free:
@@ -100,7 +107,13 @@ class KVPool:
         slot = self._free.pop(0)
         self._owner[slot] = seq.id
         seq.slot = slot
-        seq.state.clear()                   # a recycled slot carries no history
+        # 这个槽位可能刚被别的会话用过：清掉残留，否则新会话带着别人的上下文开始。
+        # 但如果这个会话**自己**之前被换出过（seq.id 在 swap 里），先把历史取回来。
+        seq.state.clear()
+        parked = self._parked.pop(seq.id, None)
+        if parked is not None:
+            seq.state.update(parked)
+            self.restored += 1
         return slot
 
     def release(self, seq: Sequence) -> None:
@@ -111,6 +124,40 @@ class KVPool:
             del self._owner[slot]
             self._free.append(slot)
         seq.slot = None
+
+    def park(self, seq: Sequence) -> int:
+        """把一个会话的 KV 从槽位上换下来（整条，不切段）。返回省下的字节数。
+
+        和 release 的区别：release 是「这条会话结束了」，park 是「它还要回来」。
+        被 park 的会话下次 acquire 时历史会原样装回去 —— 这才是「并发」和
+        「长上下文」能同时成立的原因：不活跃的会话沉到内存，活跃的留在卡上。
+        """
+        n = 0
+        try:
+            for v in seq.state.values():
+                if hasattr(v, "numel"):
+                    n += int(v.numel() * v.element_size())
+        except Exception:
+            n = 0
+        if seq.state:
+            # 按会话条数限流：内存放得下几十条 1M 会话，但不能无限涨。
+            # 超了就丢最老的那条 —— 它下次回来要重新 prefill，但至少不会 OOM。
+            if self.max_parked and len(self._parked) >= self.max_parked:
+                try:
+                    oldest = next(iter(self._parked))
+                    self._parked.pop(oldest, None)
+                    self.dropped += 1
+                except StopIteration:
+                    pass
+            self._parked[seq.id] = dict(seq.state)
+            self.parked += 1
+        self.release(seq)
+        return n
+
+    def resume(self, seq: Sequence) -> bool:
+        """会话回来：把它之前 park 的 KV 找回来（不需要重新 prefill）。"""
+        parked = self._parked.get(seq.id)
+        return parked is not None
 
     @property
     def free(self) -> int:
