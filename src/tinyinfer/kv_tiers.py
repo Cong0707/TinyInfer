@@ -1,23 +1,25 @@
-"""KV 分层的容量决策：1M 上下文一条请求就是约 7GB，不能按上限预分配。
+"""会话 KV 的分层换入换出：卡上只放活跃的，其余沉到内存。
 
-实测（本机按模型真实结构算）：
-  N=128k  compressed KV = 0.89 GB
-  N=1M    compressed KV = 6.92 GB
-而 L20 只有 44GB，扣掉 40 层权重（6.5GB）、激活、专家槽位后，剩给 KV 的
-大概 30GB —— 按上限预分配的话，一条 1M 请求就把并发打成 1。
+为什么需要：实测一条 1M 上下文的压缩 KV 是 6.91GB。L20 的 44GB 扣掉 40 层
+权重、激活、专家槽位后剩约 30GB —— 不做换出的话，卡上同时能驻留的会话数
+就是 4。而真实服务要的是「很多个长会话轮流推进」，不是「4 个跑完再换」。
 
-所以 KV 也必须走同一套「按容量覆盖」：
-  - 显存里放的是**当前活跃**的那部分；
-  - 不活跃的历史沉到内存（371GB，放得下几十条 1M 会话）；
-  - 用到哪一段才把哪一段拉回来。
+内存有 371GB，放得下五十多条 1M 会话的 KV。所以：
+  - 卡上是「当前这一步真正在算的」那几条；
+  - 其余的整条换出到内存（D2H 一次、H2D 一次，按需）；
+  - 换出/换入是整段连续区间，不做 LRU 单格覆盖 —— KV 是有序的，
+    覆盖掉中间一段就是上下文断裂。
 
-注意这和专家槽位不同：KV 是**有序的**，不能按 LRU 乱覆盖 —— 覆盖掉中间一段
-就是上下文断裂。所以 KV 的分层单位是「整段连续区间」，不是单格。
+这一层和专家槽位用的是两套策略，但**同一个容量来源**：都问「这块卡现在
+还剩多少」，而不是写死数字。
 """
 
 from __future__ import annotations
 
 import threading
+from typing import Any
+
+
 
 
 class KvTierPlan:
@@ -43,7 +45,118 @@ class KvTierPlan:
         per = max(1, int(head_dim) * max(1, int(bytes_per_value)))
         return int(self.kv_budget() * float(share)) // per
 
+    def sessions_that_fit(self, bytes_per_session: int) -> int:
+        """这块预算能同时驻留几条会话（并发能力的上界）。"""
+        n = max(1, int(bytes_per_session))
+        return self.kv_budget() // n
+
     def describe(self) -> dict:
         return {"vram_free_gb": self.vram_free / 2**30,
                 "reserve_gb": self.reserve / 2**30,
                 "kv_budget_gb": self.kv_budget() / 2**30}
+
+
+class KvSwapPool:
+    """按「整条会话」换出 KV 的主机侧仓库。
+
+    entries 里存的是已经搬到 CPU 的张量（pinned 更好：回搬时能走异步 DMA）。
+    容量按字节记账，超了就按最久没用的换出去 —— 注意这是**整条会话**的粒度，
+    不是它内部的某一段，所以顺序性不会被破坏。
+    """
+
+    def __init__(self, capacity_bytes: int = 0):
+        self.capacity = max(0, int(capacity_bytes))
+        self._entries: dict[str, tuple[dict, int]] = {}   # key -> (snap, nbytes)
+        self._order: list[str] = []
+        self._used = 0
+        self._lock = threading.Lock()
+        self.swapped_out = 0
+        self.swapped_in = 0
+        self.dropped = 0
+
+    @staticmethod
+    def _nbytes(snap: Any) -> int:
+        total = 0
+        try:
+            items = snap.values() if hasattr(snap, "values") else []
+            for v in items:
+                if hasattr(v, "numel"):
+                    total += int(v.numel() * v.element_size())
+                elif isinstance(v, (tuple, list)):
+                    for t in v:
+                        if hasattr(t, "numel"):
+                            total += int(t.numel() * t.element_size())
+        except Exception:
+            pass
+        return total
+
+    def put(self, key: str, snap: dict) -> int:
+        """把一条会话的 KV 放进主机仓库（调用方已经搬到 CPU）。"""
+        n = self._nbytes(snap)
+        with self._lock:
+            old = self._entries.get(key)
+            if old is not None:
+                self._used -= old[1]
+                try:
+                    self._order.remove(key)
+                except ValueError:
+                    pass
+            self._entries[key] = (snap, n)
+            self._used += n
+            self._order.append(key)
+            self.swapped_out += 1
+            # 满了就丢最久没用的整条会话（调用方负责在丢之前落盘）
+            while self.capacity and self._used > self.capacity and len(self._order) > 1:
+                victim = self._order.pop(0)
+                ent = self._entries.pop(victim, None)
+                if ent is not None:
+                    self._used -= ent[1]
+                    self.dropped += 1
+            return n
+
+    def get(self, key: str) -> dict | None:
+        with self._lock:
+            ent = self._entries.get(key)
+            if ent is None:
+                return None
+            try:
+                self._order.remove(key)
+            except ValueError:
+                pass
+            self._order.append(key)
+            self.swapped_in += 1
+            return ent[0]
+
+    def drop(self, key: str) -> bool:
+        with self._lock:
+            ent = self._entries.pop(key, None)
+            if ent is None:
+                return False
+            self._used -= ent[1]
+            try:
+                self._order.remove(key)
+            except ValueError:
+                pass
+            return True
+
+    def stats(self) -> dict:
+        return {"entries": len(self._entries),
+                "used_gb": self._used / 2**30,
+                "capacity_gb": self.capacity / 2**30,
+                "swapped_out": self.swapped_out,
+                "swapped_in": self.swapped_in,
+                "dropped": self.dropped}
+
+
+def to_host(snap: dict) -> dict:
+    """把一份 KV snapshot 搬到 CPU（非阻塞留着给下一次 forward 用）。"""
+    out = {}
+    for k, v in snap.items():
+        if hasattr(v, "to"):
+            out[k] = v.to("cpu", non_blocking=False)
+        elif isinstance(v, tuple):
+            out[k] = tuple(t.to("cpu", non_blocking=False) if hasattr(t, "to") else t
+                           for t in v)
+        else:
+            out[k] = v
+    return out
