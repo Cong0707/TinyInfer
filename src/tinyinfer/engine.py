@@ -1611,9 +1611,11 @@ class Engine:
                 _cur = a._kv_window
                 if _cur is not None:
                     _gbufs[i] = _cur          # 钉住，图退役前不许回收
-                    _kv = _cur.clone()        # eager 走这一份
-                else:
-                    _kv = None
+                # Python 侧回到捕获前的状态，**不是**复制捕获期那块脏 buffer。
+                # 捕获期的 buffer 里已经写进了 warmup 那一步的 KV，eager 从它开始
+                # 就会多读一个 token（实测 POST-EAGER 出 nan）。snap 是 warmup
+                # 之前拍的，那里的 kv 就是「没有」（reset 之后没跑过）。
+                _kv = None if entry.get("kv") is None else entry["kv"].clone()
             elif entry.get("kv") is None:
                 _kv = None
             else:
