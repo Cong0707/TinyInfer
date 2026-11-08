@@ -2675,6 +2675,13 @@ class VramSlotCache:
         if n <= 0:
             return None
         def _evictable(i: int) -> bool:
+            # 关键：refs==0 只说明 Python 侧没人引用了，**不说明读这个槽位的 kernel
+            # 已经跑完**。kernel 是异步 launch 的，release() 把 refs 减到 0 时，
+            # 那个 kernel 很可能还在 SM 上读这块显存。此时覆盖它的 DMA 会与读重叠，
+            # 读到的就是新专家的字节 —— 数值乱，且不报错。
+            # 实测：5 层模型跑出的 NaN 有 129280 个元素（整个最后一行），
+            # 而在同一处加一个 torch.cuda.synchronize() 就完全正常 → 竞态确认。
+            # 覆盖前必须等这个槽位上一次的 kernel 落地。
             return (self._refs[i] == 0
                     and self._state[i] != self.COPYING
                     and self._key[i] not in self._pinned)
@@ -2708,6 +2715,7 @@ class VramSlotCache:
                 self._cur = (i + 1) % n
                 return i
         return None
+
 
     def _find_victim_locked(self) -> int | None:
         for idx in range(self.slots):
