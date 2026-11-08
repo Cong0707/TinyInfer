@@ -2745,18 +2745,28 @@ class Engine:
         # keeps the SMs busy; 256 is the fastest measured point (3.5x chunk=8).
         if chunk is None and T > 256:
             step = max(1, min(step, 256))
-        if T <= step:
-            return self._forward_chunk(ids, start_pos, positions=positions)
-        logits = None
-        for off in range(0, T, step):
-            logits = self._forward_chunk(ids[:, off:off + step], start_pos + off)
-            # the prefill borrows its expert reads from a private pool region; give the
-            # whole region back between chunks (no DMA can be in flight here)
-            _store = getattr(self, "expert_store", None)
-            _reset = getattr(_store, "reset_prefill_pool", None)
-            if _reset is not None:
-                _reset()
-        return logits
+        # 这一轮 forward 结束时告诉分级管理器「空闲了」：预热线程只在两次
+        # forward 之间读盘，不和 decode 抢带宽。用 finally 保证异常路径也放行。
+        _mgr = getattr(getattr(self, "expert_store", None), "_tier_mgr", None)
+        try:
+            if T <= step:
+                return self._forward_chunk(ids, start_pos, positions=positions)
+            logits = None
+            for off in range(0, T, step):
+                logits = self._forward_chunk(ids[:, off:off + step], start_pos + off)
+                # the prefill borrows its expert reads from a private pool region; give
+                # the whole region back between chunks (no DMA can be in flight here)
+                _store = getattr(self, "expert_store", None)
+                _reset = getattr(_store, "reset_prefill_pool", None)
+                if _reset is not None:
+                    _reset()
+            return logits
+        finally:
+            if _mgr is not None:
+                try:
+                    _mgr.idle()
+                except Exception:
+                    pass
 
     def stream_generate(self, prompt_ids, max_new_tokens: int = 64, temperature: float = 0.0,
                         top_p: float = 1.0, top_k: int = 0, stop_ids=None, chunk: int | None = None):

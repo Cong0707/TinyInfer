@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Iterable
 
 
@@ -43,6 +44,9 @@ class ExpertTierManager:
                       "placed": 0, "miss": 0, "warm": 0}
         self._warm_stop = threading.Event()
         self._warm_thread: Any = None
+        # 推理正在跑的时候不要读盘：预热是「没事干才做的事」，和 decode 抢
+        # 磁盘只会把关键路径拖慢（实测磁盘是低预算机器的瓶颈）。
+        self._busy = threading.Event()
         if warm:
             self.start_warm()
 
@@ -145,6 +149,14 @@ class ExpertTierManager:
         """一层开始：它要用的专家从这一刻起不许被别的层顶掉。"""
         if self.slots is not None:
             self.slots.clear_urgent()
+        # 告诉预热线程「我在忙」：它会在下一个 chunk 之前让路。
+        # 注意不在每层结束时清掉 —— 层间没有真正的空档，一轮 40 层连着跑，
+        # 清了就等于没让路。真正的空闲是「两次 forward 之间」，由 engine 清。
+        self._busy.set()
+
+    def idle(self) -> None:
+        """整轮 forward 结束：预热线程可以去做「没事干时该做的事」了。"""
+        self._busy.clear()
 
     def capabilities(self) -> dict:
         """这一套布局能做什么，供上层（EP / 规划器）自适应。
@@ -209,6 +221,14 @@ class ExpertTierManager:
                 for i in range(0, len(mine), 8):
                     if stop.is_set():
                         return
+                    # 推理在忙的时候让路：预热是「没事干才做的事」，和 decode 抢
+                    # 磁盘只会把关键路径拖慢。_busy 由 MoE 每层置位。
+                    # 注意不能用 _busy.wait()：那是等「被置位」，而这里要等的是
+                    # 「被清空」。事件已置位时 wait() 立刻返回，等于没让路。
+                    while self._busy.is_set():
+                        if stop.is_set():
+                            return
+                        time.sleep(0.005)
                     chunk = mine[i:i + 8]
                     try:
                         self.ram.prefetch(layer, chunk).result(timeout=300)
