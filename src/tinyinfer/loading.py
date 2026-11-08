@@ -3713,7 +3713,25 @@ class ExpertStore:
                     # 命不中。改成按「这批会不会挤爆缓存」判断：只有本次专家数超过缓存
                     # 能装的容量时才跳过 admit。
                     _cap = getattr(self.ram, "capacity_entries", 0) or 0
-                    _admit_ok = bool(cache) and (not _cap or len(experts) <= _cap)
+                    # prefill 过去是 cache=False：故意不填 RAM 缓存，怕把 decode 热集挤掉。
+                    # 但这条在大内存机器上是纯损失：L20 有 371GB 内存、缓存容量
+                    # 13150 项，专家总共 15360 项 —— 装得下绝大部分。prefill 每层读
+                    # 240 个专家、40 层约 9600 次读盘全被丢弃，随后 decode 再读一遍。
+                    # 实测：prefill 单次 126.5 秒读了 14896 次盘（约 280GB）。
+                    # 判据：缓存容量装得下模型 75% 以上时，prefill 也 admit。
+                    _cache_all = bool(cache)
+                    if not _cache_all and self.ram is not None:
+                        try:
+                            _cap_e = int(getattr(self.ram, "capacity_entries", 0) or 0)
+                            _tot_e = int(getattr(self.ram, "n_layers", 0) or 0) * int(
+                                getattr(self.ram, "n_experts", 0) or 0)
+                            if _tot_e <= 0:
+                                _tot_e = 40 * 384
+                            if _cap_e >= int(_tot_e * 0.75):
+                                _cache_all = True
+                        except Exception:
+                            pass
+                    _admit_ok = _cache_all and (not _cap or len(experts) <= _cap)
                     if _admit_ok:
                         datas = self.ram._read_many_pooled(blobs) if blobs else []
                     else:
