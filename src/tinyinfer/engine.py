@@ -2849,6 +2849,36 @@ class Engine:
         """
         from .deepseek import hc as _hc
 
+        # **每层的 KV 环形 buffer 也必须在窗口外建好。**
+        #
+        # 图里的 attention kernel 会把这块 buffer 的地址写死进参数。它如果是在
+        # 捕获窗口内第一次分配的，就落进 graph pool；而 prefill 走
+        # _forward_impl（窗口外），拿到的可能是另一块地址 —— 于是「图 replay 读
+        # 的 KV」和「prefill 写的 KV」是两套 cache，历史一个字节都不通。
+        #
+        # 这里提前按 [1, window, head_dim] 建一次并挂到该层的 state 上，捕获期
+        # 就会直接复用这块普通显存。
+        try:
+            _win = int(self.cfg.sliding_window)
+            _hd = int(self.cfg.head_dim)
+            for _lid, _blk in getattr(self, "_blocks", {}).items():
+                _att = getattr(_blk, "attn", None)
+                if _att is None:
+                    continue
+                _old = getattr(_att, "_active_layer", None)
+                try:
+                    _att._active_layer = int(_lid)
+                    _cur = _att._kv_buf
+                    if (_cur is None or _cur.shape[0] != 1 or _cur.shape[1] != _win
+                            or _cur.shape[2] != _hd):
+                        _att._kv_buf = torch.zeros(1, _win, _hd, dtype=torch.bfloat16,
+                                                   device=self.device)
+                finally:
+                    if _old is not None:
+                        _att._active_layer = _old
+        except Exception:
+            pass
+
         b, s = int(ids.shape[0]), int(ids.shape[1])
         d = int(self.cfg.dim)
         hc_mult = int(self.cfg.hc_mult)

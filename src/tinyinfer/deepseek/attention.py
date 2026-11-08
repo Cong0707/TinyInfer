@@ -368,6 +368,19 @@ class MLAWindowAttention:
         # 再拷一次、然后把 buf[:, :n_old+s] 这个不连续的切片交给 attention，于是
         # sparse_attn_cuda 里又是一次 .contiguous() 全量拷贝。三份拷贝换来的只是
         # 「历史在 buffer 里连续」这一点，而窗口索引本来就该按槽位算。
+        # **图用的 KV buffer 必须就是 eager 那块，不能是第二块。**
+        #
+        # 以前捕获期会 new 一块 _graph_kv_buf 顶替 _kv_buf：图内 kernel 记住的是
+        # 新地址，而 prefill 走 _forward_impl（图外）写的仍是原来那块 —— 两套 cache
+        # 互不相通。图第一次 replay 时看到的 KV 里只有捕获那一步写进去的内容，
+        # 整个 prompt 的历史一个字节都没有，于是解码退化成
+        #   '<｜begin▁of▁sentence｜># 关于“ 关于“ 关于“新'
+
+        # 这种复读；而同一个 prompt 走 eager 是完整中文。
+        #
+        # 正确做法：图从一开始就用 eager 那块 buffer。地址在捕获时就定死了，之后
+        # prefill 和 replay 写读的是同一块，历史天然连续。形状不符才重建（那说明
+        # 这是新对话的第一层访问，反正也要重新捕获）。
         buf = self._kv_buf
         # **捕获期：KV buffer 必须按层独占，地址一次定死。**
         #
@@ -383,13 +396,17 @@ class MLAWindowAttention:
         # 捕获期用一块挂在 self 上的常驻 buffer（图退役前不释放），pool 就不会把它
         # 分配给别的层。
         if torch.cuda.is_current_stream_capturing():
-            _gb = getattr(self, "_graph_kv_buf", None)
+            # 图内的 kernel 会把这块 buffer 的地址写死进参数，所以它必须在进入
+            # 捕获窗口之前就存在，而且必须**就是** eager 用的那一块。（原来这里
+            # 新建 _graph_kv_buf 顶替，导致 prefill 写 _kv_buf、replay 读
+            # _graph_kv_buf，两套 cache 从不互通。）
+            _gb = buf
             if (_gb is None or _gb.shape[0] != b or _gb.shape[1] != self.window
                     or _gb.dtype != kv.dtype or _gb.device != kv.device):
                 _gb = torch.zeros(b, self.window, self.head_dim, dtype=kv.dtype,
                                   device=kv.device)
-                self._graph_kv_buf = _gb
             self._kv_buf = _gb
+            self._graph_kv_buf = _gb
             buf = _gb
         if (buf is None or buf.shape[0] != b or buf.shape[1] != self.window
                 or buf.dtype != kv.dtype or buf.device != kv.device):
