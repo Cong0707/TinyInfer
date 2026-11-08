@@ -313,6 +313,23 @@ class BoundLaunch:
             else:
                 raw[i] = a & 0xFFFFFFFF
         ptrs = self._ptrs
+        # **捕获期每次调用必须用独立的参数块。**
+        # self._raw / self._ptrs 是这个 launcher 复用的，同一层内反复调用没问题；
+        # 但捕获期 L0、L1 交替调用同一个 launcher（键相同 -> 同一个 BoundLaunch），
+        # 后者会把 _raw 覆盖掉。cuLaunchKernel 在 capture 模式下并不保证立刻复制
+        # 参数块，于是图里前一次 launch 读到的可能是后一次写进去的参数 —— 实测
+        # hc_post 输出 absmax 2.36e37（bf16 把别人的字节当数值解释），而 eager
+        # 完全正常；layers=[0,0] 也对（两次参数一模一样，覆盖了也看不出来）。
+        _cap = False
+        try:
+            _cap = torch.cuda.is_current_stream_capturing()
+        except Exception:
+            _cap = False
+        if _cap:
+            raw = (ctypes.c_uint64 * self._n)(*raw)
+            ptrs = (ctypes.c_void_p * self._n)()
+            for _i in range(self._n):
+                ptrs[_i] = ctypes.cast(ctypes.byref(raw, _i * 8), ctypes.c_void_p)
         if stream is None:
             # 缓存 Stream wrapper。per-kernel-launch 调 torch.cuda.current_stream() 会在
             # 内部走 _get_device_index + 构造 Stream 对象，py-spy 采样里 Stream.__new__
