@@ -142,6 +142,22 @@ _RING_IDX: dict = {}
 
 def window_idxs_ring_cached(start_pos: int, seqlen: int, window: int, device) -> torch.Tensor:
     key = (int(start_pos), int(seqlen), int(window), str(device))
+    # **捕获期不能用这个按 start_pos 建的缓存。**
+    #
+    # 命中缓存意味着拿到一张常量表 —— 它被写进图的 kernel 参数，replay 多少次都
+    # 是同一个 start_pos 的槽位。而 decode 每步的 start_pos 不同，图内却一直用
+    # 捕获那一步的位置去读 KV 环形窗口。
+    #
+    # 症状：prefill 的第一个 token 正确（它不在图里），从第二个 decode token 开始
+    # 崩 —— 实测「用一句话解释什么是张量」首 token 是「张」(30.75) 排第一，之后
+    # 变成 'The tensor is the tensor of the tensor tensor...' 的英文复读；
+    # 「中国的首都是」能答出「北京」，但后面接的是日期和 Markdown 标题。
+    #
+    # 捕获期绕过缓存，window_idxs_ring 才会被真的捕获进图，其中的
+    # base = _pos_buf(device) 让它在每次 replay 时读 _POS_BUF 的当前值
+    # （_graph_run 每次 replay 前都会重写那个 buffer）。
+    if torch.cuda.is_current_stream_capturing():
+        return window_idxs_ring(start_pos, seqlen, 0, window, device)
     hit = _RING_IDX.get(key)
     if hit is not None:
         return hit
