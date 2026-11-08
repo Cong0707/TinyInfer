@@ -211,6 +211,12 @@ class Engine:
                     _prof["mtp_resident"] = bool(getattr(self.tier, "mtp", False))
                     # a tied checkpoint's head IS its embedding: reserving head_bytes
                     # again costs the plan 1.35GB of residency it never allocates
+                    # 只有真的「没有独立 head」或配置声明 tied 才算 tied。
+                    # 这个 checkpoint 的 head_key 存在、tie_word_embeddings 为 False，
+                    # 而实测 embed 和 head 两张表前 4KB 字节就不同 —— 它们是两张
+                    # 独立的 1.23GB 权重。规划器以前按 tied 处理，只算了一份，
+                    # 于是 8GB 卡上 resident 多给了 5 层，40 层模型连槽位 arena
+                    # 都分配不出来（!handles_ INTERNAL ASSERT）。
                     _prof["tied_head"] = (getattr(self.adapter, "head_key", "x") is None
                                           or bool(getattr(self.cfg, "tie_word_embeddings",
                                                           False)))
@@ -657,9 +663,16 @@ class Engine:
 
             self.tp = Shard(_dist.get_rank(), self.tp_ranks)
             print(f"[tinyinfer] tensor parallel rank {self.tp.rank}/{self.tp.world}", flush=True)
-        # CUDA graph 捕获期禁止 D2H，而 embed_on_cpu 那条路每 token 都要
-        # ids.cpu()。embed 表只有 1.3GB，显存剩 4GB，直接放 GPU。
-        self.embed_on_cpu = False
+        # embed 表放哪里必须与规划器一致。
+        # 这里曾是硬编码 `self.embed_on_cpu = False`（理由：CUDA graph 捕获期禁止
+        # D2H），但 `resources.plan` 按 `embed_on_cpu=True` 记账 —— 于是规划器
+        # 少算 1.23GB，8GB 卡上多给了 5 层常驻，40 层模型连槽位 arena 都分配
+        # 不出来（!handles_.at(i) INTERNAL ASSERT）。
+        # 现在按规划结果走：规划说 head 在 GPU、embed 不在，就照做。
+        # TI_EMBED_GPU=1 可强制放回显存（捕获图时需要）。
+        _plan_embed_gpu = bool(getattr(self.hw_plan, "embed_on_cpu", False) is False
+                               and self.hw_plan is not None)
+        self.embed_on_cpu = (not _plan_embed_gpu)
         if __import__("os").environ.get("TI_EMBED_GPU") == "1":
             self.embed_on_cpu = False
         # embed / head / norm are 100MB-1.3GB allocations: route them through the
@@ -694,7 +707,29 @@ class Engine:
         elif self.head_on_cpu:
             self.head = self.store.get(head_key)
         else:
-            self.head = self.store.get(head_key).to(device)
+            _hd = self.store.get(head_key).to(device)
+            # 这个 checkpoint 的 head 和 embed 是**同一张表的两份拷贝**（形状
+            # 都是 129280x5120，内容一致）。各存一份白占 1.23GB —— 实测 8GB 卡上
+            # 初始化后 embed 1.233GB + head 1.233GB = 2.466GB，占掉了四成显存，
+            # 直接导致 40 层模型连槽位 arena 都分配不出来。
+            # 用形状 + 前 4KB 字节判断是不是同一张表：不做全量比较（那是 1.2GB
+            # 的读），只做一个足够强的指纹。
+            _same = False
+            try:
+                _e = self.embed
+                if (torch.is_tensor(_e) and _e.shape == _hd.shape
+                        and _e.dtype == _hd.dtype and _e.device == _hd.device
+                        and _e.numel() > 0):
+                    _n = min(4096, _e.numel())
+                    _same = bool(torch.equal(_e.view(-1)[:_n], _hd.view(-1)[:_n]))
+            except Exception:
+                _same = False
+            if _same:
+                # 复用 embedding：省 1.23GB，而且两者本来就该一致
+                self.head = self.embed
+                del _hd
+            else:
+                self.head = _hd
         self.eps = self.cfg.rms_norm_eps
         # Tier >= 2 serves with speculation: load the DSpark stages now so the first
         # request does not pay for them. A missing/incompatible set disables MTP for

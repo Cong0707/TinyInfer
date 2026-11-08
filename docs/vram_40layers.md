@@ -68,3 +68,43 @@ slots=1113, chunk=139`，40 层全常驻、1100+ 槽位 —— 那个配置下 8
    走 `TI_NO_SLOTS` 路径 —— 至少让模型能跑，只是慢。
 
 **在那之前，8GB 卡只能跑较少层数（4-11 层已验证），40 层不行。**
+
+## 本轮修好的一个真实 bug
+
+**`embed` 表被硬编码搬进显存，而规划器按「它在主机」记账。**
+
+```python
+# engine.py 第 668 行（修复前）
+self.embed_on_cpu = False      # 硬编码
+```
+
+而 `resources.plan` 一直在算 `embed_on_cpu=True`。于是规划器少算 1.23GB，
+8GB 卡上多给了 5 层常驻。实测：
+
+| | alloc | free |
+| --- | --- | --- |
+| 修复前 | 6.18GB | 0.33GB |
+| **修复后** | **4.95GB** | **1.50GB** |
+
+省下的正是那张 1.23GB 的 embed 表。现在 `embed_on_cpu` 跟随规划结果，
+`TI_EMBED_GPU=1` 仍可强制放回显存（CUDA 图捕获需要）。
+
+## 但 40 层在 8GB 上仍然装不下
+
+修完之后 free=1.50GB，第一次 prefill 仍然：
+
+```
+dequant fast path unavailable (CUDA_ERROR_OUT_OF_MEMORY from cuMemSetAccess)
+RuntimeError: !handles_.at(i) INTERNAL ASSERT FAILED
+```
+
+1.50GB 不够一次 prefill wave（chunk=8 需要 ~1.6GB 的激活 + 反量化缓存）。
+
+**结论：8GB 卡的实际上限是 11 层左右**（`layers=11` 时放得下，40 层不行）。
+这不是 bug，是 8GB 显存和 40 层 x 164MB 权重的算术。
+
+## 顺带发现的另一个问题
+
+这个 checkpoint 的 `head` 和 `embed` 是**两张独立的 1.23GB 表**（形状相同、
+前 4KB 字节不同），不是 tied 关系。所以两者都要占显存，规划器的 non-tied
+假设是对的 —— 错的是引擎硬编码把两张都放进了显存（应该只放 head）。
