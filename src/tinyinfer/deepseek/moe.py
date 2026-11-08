@@ -683,19 +683,7 @@ class MoE:
             nmid = int(self.cfg.moe_inter_dim)
             blob = int(sl.blob_bytes)   # 槽位池自己的 blob 尺寸，不是猜的
             off = self._ts_offsets(self.layer_id)
-            # 捕获期：scratch 必须是持久 buffer，且**每层独占**。
-            # _scratch 按 self 保存，本来每层各一份；但捕获期第一次分配出来的地址
-            # 若被 allocator 在别处复用，图里两层的 kernel 就会互相踩内存。
-            # 这里在捕获期显式建一块归属 self 的常驻 buffer，地址一次定死。
-            _need = n_exp * (nmid + (nmid >> 5))
-            if torch.cuda.is_current_stream_capturing():
-                _sb = getattr(self, "_scratch_cap", None)
-                if _sb is None or _sb.numel() < _need or _sb.device != arena[0].device:
-                    _sb = torch.empty(_need, dtype=torch.uint8, device=arena[0].device)
-                    self._scratch_cap = _sb
-                scr = _sb
-            else:
-                scr = self._scratch(_need, arena[0].device)
+            scr = self._scratch(n_exp * (nmid + (nmid >> 5)), arena[0].device)
             # moe_fused_down 的 y 形参是 __nv_bfloat16*：这里必须是 bf16。分配成
             # fp32 时 kernel 只写进每 4 字节的低半部分，读回来是位模式垃圾 ——
             # 实测 MoE 输出 absmax 从 ~1 变成 217，这就是整条链输出乱码的根因。
