@@ -2989,6 +2989,14 @@ class Engine:
                 # 图已经把捕获期那些 buffer 的地址记进 kernel 参数了；从这一刻起
                 # restore 不能再换 buffer（见 restore 里的 KEEP 分支）。
                 self._graph_captured_done = True
+                # 环的游标只对「捕获那一遍」有意义；下一张图（或下一轮进程内的
+                # 重新捕获）必须从 0 开始，否则新图里每个 kernel 绑到的 buffer
+                # 和上一次捕获的位置错开，两张图共用池时会互相踩。
+                try:
+                    from .deepseek.hc import _CAP_PRE_IDX as _cpi
+                    _cpi.clear()
+                except Exception:
+                    pass
             finally:
                 self.restore(snap)
                 self._graph_just_captured = False

@@ -251,6 +251,9 @@ def _launch(fn, grid, block, args):
 
 # fused hc_pre + rms_norm; None = untried, False = unavailable
 _FUSED_PRE_NORM = None
+# 捕获期的输出 buffer 环：图里 pool 分配的中间张量在跨 kernel 使用时内容不稳定
+_CAP_PRE_OUT: dict = {}
+_CAP_PRE_IDX: dict = {}
 # dynamic shared memory holds one fp32 row; beyond this the fused path is not worth the
 # opt-in attribute call, so the two-kernel chain stays in charge
 _PRE_NORM_MAX_D = 8192
@@ -293,7 +296,28 @@ def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
                     xc = x.reshape(b * s, hc, d).contiguous()
                     pc = pre_mix.reshape(b * s, hc).float().contiguous()
                     w = weight.contiguous()
-                    out = torch.empty((b * s, d), dtype=x.dtype, device=x.device)
+                    # **捕获期 out 必须落在常驻 buffer 上。**
+                    # 它在 graph pool 里分配，返回后被 attn 当输入用（wqkv 的 h）。
+                    # 实测同一个张量在 hc_pre_rms_norm 返回时和图里用的时候内容不同：
+                    # attn 入口 eager [0.032715, -0.005859, ...] vs graph
+                    # [0.039551, 0.011047, ...]，于是 wqkv 的输出偏 0.097、
+                    # q 偏 4.95、最终 argmax 都不一样。
+                    if torch.cuda.is_current_stream_capturing():
+                        # 捕获期用一个环：每次调用取下一块。同一块不能给两次调用 ——
+                        # 层与层之间的中间量要同时存活（L0 的输出就是 L1 的输入，
+                        # 而 L0 的另一个中间量在 L1 算完之后才被用），共用一块会让后
+                        # 面的调用覆盖前面的结果。
+                        _ring = _CAP_PRE_OUT.get((b * s, d, x.dtype))
+                        if _ring is None or _ring[0].device != x.device:
+                            _ring = [torch.empty((b * s, d), dtype=x.dtype,
+                                                 device=x.device) for _ in range(8)]
+                            _CAP_PRE_OUT[(b * s, d, x.dtype)] = _ring
+                            _CAP_PRE_IDX[(b * s, d, x.dtype)] = 0
+                        _i = _CAP_PRE_IDX[(b * s, d, x.dtype)]
+                        out = _ring[_i]
+                        _CAP_PRE_IDX[(b * s, d, x.dtype)] = (_i + 1) % len(_ring)
+                    else:
+                        out = torch.empty((b * s, d), dtype=x.dtype, device=x.device)
                     # same block size the unfused rms_norm picks (vllm_ops.py):
                     # min(hidden/8, 1024 for a single row), so the reduction tree matches
                     _blk = min(d // 8, 1024 if b * s < 256 else 256)
