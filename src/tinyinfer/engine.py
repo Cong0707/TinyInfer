@@ -2781,7 +2781,19 @@ class Engine:
                     _keep_rt = None
                 # 分块捕获：每 TI_GRAPH_CHUNK 层一张图，所有图共享同一个 graph pool。
                 # 块与块之间的 h/pre_mix 都在 pool 内、地址固定，replay 时依次执行。
-                _chunk = max(1, int(__import__("os").environ.get("TI_GRAPH_CHUNK", "4")))
+                # **默认整段捕获，不再每 4 层切一块。**
+                #
+                # 分块捕获要求每块图能从上一块的中间状态接着算，但 _forward_impl
+                # 每次都从 embed 开始：第 2 块跳过 L0-3 之后，h 拿到的仍是
+                # embedding 输出而不是 L3 的输出，于是整条链从第 5 层起就
+                # 算的是错的东西 —— 实测逐块 replay 时第 0 块就已经是 NaN。
+                #
+                # 要真正分块，得让块与块之间显式传递 h/pre_mix（各存一块固定
+                # buffer，块内只写它们）。在那之前，一块图跑完全部 40 层是唯一
+                # 正确的做法：捕获一次，replay 一次。
+                _chunk = max(1, int(__import__("os").environ.get("TI_GRAPH_CHUNK", "0") or 0))
+                if _chunk <= 0 or _chunk >= self.max_layers:
+                    _chunk = int(self.max_layers)
                 _pool = torch.cuda.graph_pool_handle()
                 _graphs = []
                 out = None
