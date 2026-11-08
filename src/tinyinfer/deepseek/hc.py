@@ -531,15 +531,14 @@ class HCBlockMixin:
                 from ..kernels import native as _nv
 
                 _key = (bool(bfs), int(b * s), int(hc), int(d))
+                _nm = "hc_post_bf" if bfs else "hc_post_f"
                 _fn = _BOUND.get(_key)
                 if _fn is None:
-                    _nm = "hc_post_bf" if bfs else "hc_post_f"
                     _fn = _nv.BoundLaunch(_kern(_nm), ((n + 255) // 256,), (256,), "TTTTOiii")
                     _BOUND[_key] = _fn
                 if torch.cuda.is_current_stream_capturing():
                     # 捕获期走通用 launch：它每次调用都新建 ctypes 参数块，
                     # 不会像 BoundLaunch 那样让两次 launch 共用 self._raw。
-                    from ..kernels import native as _nv
                     _nv.launch(_kern(_nm), ((n + 255) // 256,), (256,),
                               [xc, rc, pc, cc, out, b * s, hc, d])
                 else:
