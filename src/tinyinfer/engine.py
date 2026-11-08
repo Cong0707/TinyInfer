@@ -2750,6 +2750,17 @@ class Engine:
         out = g["out"]
         if out.shape[0] != ids.shape[0]:
             return None
+        # **图是「一次一个 token」的图，形状必须逐维对齐。**
+        #
+        # 只比 batch 维会漏掉 seqlen：prefill 送进来 (1,7) 时图里那块输入是 (1,1)，
+        # copy_ 直接抛
+        #   RuntimeError: output with shape [1, 1] doesn't match the broadcast shape [1, 7]
+        # 而调用方把这次异常一路上抛成了「槽位表就绪但图不存在」。
+        #
+        # 实测：warmup 之后第一次 decode 建好图（pos=5），紧接着换一个 7 token 的
+        # prompt 就炸；同一进程里连续问第二句话必挂。
+        if g["in"].shape != ids.shape:
+            return None
         # 位置相关的 cos/sin 在每步 replay 前重写（图内不会重跑 Python 写入）
         try:
             from .deepseek.compressed_attention import refresh_cos_sin
@@ -3193,7 +3204,20 @@ class Engine:
         """
         for attempt in range(3):
             try:
-                if start_pos >= 0 and chunk is None:
+                # **图只覆盖「一次一个 token」的解码步。**
+                #
+                # prefill（ids.shape[1] > 1）走的是一批 token 的矩阵乘、窗口还没满、
+                # kv_source 的压缩机也要凑够一整组才产出 index_k —— 这些都和图里
+                # 固化的那份形状/地址不是一回事。以前这里没有按 seqlen 分流，prefill
+                # 也会进来调 _graph_try_capture：它内部 _graph_capture_shape 直接
+                # 返回 False，于是紧接着的 raise 把一次正常 prefill 判成致命错误。
+                #
+                # 实测：warmup 建好图之后，换一个 7 token 的 prompt 立刻抛
+                #   RuntimeError: slot table ready but decode graph missing
+                #   (ids=(1, 7) start_pos=0)
+                # 也就是「同一进程里问第二句话就挂」。
+                _graph_ok = ids.shape[1] == 1
+                if start_pos >= 0 and chunk is None and _graph_ok:
                     hit = self._graph_run(ids, start_pos)
                     if hit is not None:
                         return hit
