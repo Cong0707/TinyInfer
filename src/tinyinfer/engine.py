@@ -3163,7 +3163,7 @@ class Engine:
                 # 都走 _st()，键就是 _active_layer。捕获期最后一层是 L39，若不先
                 # 还原，40 层的 KV 历史会全部写进 L39 的 state 槽，其余 39 层的
                 # _kv_buf 保持捕获期那块图专用 buffer —— eager 接着用就是 NaN。
-                _restore_active_layers()
+                self._restore_active_layers()
                 self.restore(snap)
                 self._graph_just_captured = False
                 self._graph_captured_done = False
