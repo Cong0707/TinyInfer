@@ -552,12 +552,14 @@ class MoE:
             _sl = getattr(getattr(self, "_expert_store", None), "slots", None)
             _cap = int(getattr(_sl, "slots", 0) or 0)
             _need = _rows * _topk
-            if _cap <= 0 or _cap >= _need:
-                # 装得下（或没有槽位池）：整批，不分批
-                _moe_bs = max(_rows, 1)
-            else:
-                # 只装得下一部分：按「一批不超过容量」切
-                _moe_bs = max(1, _cap // _topk)
+            # 实测（docs/moe_batching_default.md）：8GB 卡在**不分批**时能跑
+            # N=20/32/48/64/96/128/192 的 prefill，全部正确且不 OOM。
+            # 分批反而引入 NaN（位置随批次大小移动，加 hook 就消失）。
+            # 所以默认**永远整批**：正确性优先于「分批省显存」这个假设，
+            # 而那个假设在这些长度上根本不成立。
+            # 真要分批（超大 prompt 逼出 OOM 时）用 TI_MOE_BATCH 显式指定，
+            # 并知道那条路目前有已知的数值缺陷。
+            _moe_bs = max(_rows, 1)
         if xf.size(0) > _moe_bs:
             _outs = []
             for _s0 in range(0, xf.size(0), _moe_bs):
