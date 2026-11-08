@@ -202,11 +202,9 @@ class ExpertServer:
                 except Exception:
                     self.errors += 1
             self.batches += 1
-            # 备完了（不论是否真的搬了新的）就通知 GPU：它可以继续读这一批。
-            try:
-                self.ready.bump()
-            except Exception:
-                self.errors += 1
+            # 备完了就通知 GPU：它可以继续读这一批。注意 bump 是 pure-host
+            # 写一个 int32（host-mapped），不发 CUDA 调用 —— 卖家线程绝不碰
+            # CUDA，否则会和主线程的 cuModuleLoad/cuLaunchKernel 互等死锁。
 
     def pending(self) -> int:
         try:

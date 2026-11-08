@@ -382,6 +382,43 @@ class MoE:
             self._miss_ids_host[:_cnt].copy_(self._miss_ids_dev[:_cnt], non_blocking=False)
         return _cnt
 
+    def _async_experts(self):
+        """异步专家链路（GPU 报缺 / CPU 备货 / 流里等就绪）。
+
+        全机一个，挂在 store 上：分级和搬运是「这块卡上的专家数据」的属性，
+        不是某一层的属性。capture 期间、CPU-only、没有槽位池时不启用。
+        """
+        st = self._expert_store
+        if st is None or getattr(st, "slots", None) is None:
+            return None
+        if __import__("os").environ.get("TI_ASYNC_EXPERTS", "1") == "0":
+            return None
+        ea = getattr(st, "_expert_async", None)
+        if ea is not None:
+            return ea
+        import threading as _th
+
+        lock = getattr(st, "_async_lock", None)
+        if lock is None:
+            lock = st._async_lock = _th.Lock()
+        with lock:
+            ea = getattr(st, "_expert_async", None)
+            if ea is None:
+                try:
+                    from ..expert_async import ExpertAsync
+
+                    ea = ExpertAsync(self._tier_manager(),
+                                     device=str(getattr(self, "device", "cuda")))
+                    ea.start()
+                except Exception as _exc:
+                    ea = None
+                    if not getattr(self, "_async_warned", False):
+                        self._async_warned = True
+                        print(f"[async] expert pipeline unavailable ({_exc!r}); "
+                              f"falling back to the per-layer sync path", flush=True)
+                st._expert_async = ea
+        return ea
+
     def _tier_manager(self):
         """分级管理器：一个 store 只有一个，全部 40 层共用。
 
@@ -557,28 +594,35 @@ class MoE:
             sids = _sb[:_sn]
             torch.index_select(tab[self.layer_id], 0,
                                indices.view(-1).clamp_(0, 383), out=sids)
-            # miss 自己补：缺的专家当场 fetch 进槽位，重建 sids。同一条路，不是第二套。
-            # 「有没有缺」由 GPU 判断（moe_miss_scan 在 device 上扫 slot_ids），CPU 只
-            # 拿回缺的那几个专家 id 去搬 —— 不再把整条 sids/indices 拉回来自己比。
-            _nmiss = 0
-            if (not getattr(self, "_all_pinned", False)
-                    and not torch.cuda.is_current_stream_capturing()):
-                _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
-            if __import__("os").environ.get("TI_SLOT_TRACE") == "1":
-                print(f"[trace] L{self.layer_id} bykey={len(sl._by_key)} "
-                      f"free={len(getattr(sl, '_free', []))} nmiss={_nmiss} "
-                      f"sids={sids.tolist()} tab={[int(tab[self.layer_id, int(e)]) for e in indices.view(-1).tolist()]}",
-                      flush=True)
-            if _nmiss:
-                # GPU 已经把缺失表写好了（moe_miss_scan），CPU 只管照单备货：
-                # 显存里有就直接用，没有就看内存，内存也没有才让磁盘供。
-                # 备货的决策全在 ExpertTierManager 里，这一层不碰 _by_key/表。
-                _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
-                if _miss:
-                    _mgr = self._tier_manager()
-                    _mgr.need(self.layer_id, _miss)
-                    _mgr.ready(self.layer_id, _miss)
-                    tab = sl._slot_tab
+            # 卖家模式：GPU 自己把「缺谁」写进 host-mapped 环（kernel 级操作，
+            # 不触发同步），CPU 侧的卖家线程去备货，本层的 kernel 在流里等
+            # 就绪计数。主机侧在这里一次同步都没有 —— 这是每 token 130ms 的
+            # 来源（40 层 x 3.3ms 的 D2H）。
+            _async = self._async_experts()
+            if _async is not None and _async.enabled:
+                # 卖家线程刚可能改过槽位表：先把待写的槽位号刷进 device 表
+                # （在本线程的 stream 上，不跨线程发 kernel），再发布请求。
+                sl.table_flush()
+                _async.post(sids, int(indices.numel()), self.layer_id)
+                _async.wait(self.layer_id)
+                # 等完之后表已经包含本层的槽位号，但 sids 是等之前索引的；
+                # 表变了就得重索引一次（一次 index_select，几微秒）。
+                tab = sl._slot_tab
+                torch.index_select(tab[self.layer_id], 0,
+                                   indices.view(-1).clamp_(0, 383), out=sids)
+            else:
+                # 没有异步链路（例如 CPU-only 或捕获期）：退回同步补缺。
+                _nmiss = 0
+                if (not getattr(self, "_all_pinned", False)
+                        and not torch.cuda.is_current_stream_capturing()):
+                    _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
+                if _nmiss:
+                    _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
+                    if _miss:
+                        _mgr = self._tier_manager()
+                        _mgr.need(self.layer_id, _miss)
+                        _mgr.ready(self.layer_id, _miss)
+                        tab = sl._slot_tab
                     # 写进持久 buffer：index_select 每次新建张量，driver-API 的 kernel 只拿裸
                 # 指针，函数返回后这批显存会被 allocator 立刻复用（多行 prefill 时
                 # 就是 slot_ids 读到 INT_MAX、权重地址偏 4e16 的来源）。原地写同一块

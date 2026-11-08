@@ -96,10 +96,10 @@ class ExpertTierManager:
         return out
 
     def need(self, layer: int, experts: Iterable[int]) -> int:
-        """让这些专家进显存。返回本次真正需要搬的个数。
+        """备货（可以在任何线程）：把缺失的专家字节取出来、挑好槽位。
 
-        已经在显存里的一律不看内存、不看磁盘 —— 这是 decode 稳态唯一的
-        热点路径，多一次查询就是每 token 240 次无谓的开销。
+        只做主机侧的事：查内存、读盘、挑槽位、把字节拷进 pinned 中转区。
+        **不发任何 CUDA 调用** —— 卖家线程跨线程发 CUDA 会和主线程互等死锁。
         """
         if self.slots is None or not self.slots.slots:
             return 0
@@ -112,11 +112,17 @@ class ExpertTierManager:
         data = self._provide(layer, miss)
         if not data:
             return 0
-        _asked, placed = self.slots.ensure(
+        staged = self.slots.stage(
             layer, list(data.keys()),
             lambda lay, want_e: {e: data[e] for e in want_e if e in data})
-        self.stats["placed"] += int(placed)
-        return int(placed)
+        self.stats["placed"] += int(staged)
+        return int(staged)
+
+    def commit(self, layer: int | None = None) -> int:
+        """把备好的货发出去（主线程调，只在本线程 stream 上）。"""
+        if self.slots is None:
+            return 0
+        return int(self.slots.commit(layer))
 
     def ready(self, layer: int, experts: Iterable[int]) -> None:
         """让 compute stream 等这批专家的 DMA。已落地的槽位不插等待。"""

@@ -56,7 +56,11 @@ class ExpertAsync:
         self.ring.post(sids, int(n_exp), int(layer), int(self._base + self._posted))
 
     def wait(self, layer: int | None = None) -> None:
-        """在 compute stream 上等这一层发布的请求被备好。"""
+        """在 compute stream 上等这一层发布的请求被备好。
+
+        注意这不是「等主机」：排进流里就返回，主机继续往下发 kernel。
+        真正的等待发生在 GPU 上（cuStreamWaitValue32，或退化成自旋 kernel）。
+        """
         if not self.enabled:
             return
         target = int(self._base + self._posted)

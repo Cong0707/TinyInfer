@@ -2125,6 +2125,12 @@ class VramSlotCache:
         # 弹出；只有在池子填满之后才开始转游标，摊还也是 O(1)。
         self._free: list[int] = []
         self._cur = 0
+        # 待写进 device 槽位表的 (layer, expert, slot)。reserve 只在这里记账，
+        # 真正的写发生在调用方的 stream 上（见 table_flush）—— reserve 会在
+        # 卖家线程里被调用，跨线程发 kernel 会和主线程的 cuModuleLoad 死锁。
+        self._tab_dirty: list[tuple[int, int, int]] = []
+        # 卖家线程把字节拷进这里（纯主机 memcpy），主线程的 commit() 负责 DMA。
+        self._stage_bufs: dict[int, memoryview] = {}
         # 槽位分配代次：每次 _by_key 变动就 +1。kernel 侧按槽位编号寻址，编号一变
         # 旧的编号数组就指向别人的字节 —— 调用方用这个代次给缓存做键。
         self._gen = 0
@@ -2482,48 +2488,84 @@ class VramSlotCache:
             if ev is not None and not ev.query():
                 stream.wait_event(ev)
 
-    def ensure(self, layer: int, experts, loader) -> tuple[int, int]:
-        """把这一层要用的专家全部安排进槽位。
+    def stage(self, layer: int, experts, loader) -> int:
+        """只做主机侧：挑槽位、记归属、把字节拷到 pinned staging。**不碰 CUDA**。
 
-        调用方只交两样东西：这一层要哪几个专家、以及「怎么取字节」的回调。
-        槽位怎么选（空优先，否则按游标覆盖最老的）、表怎么写、DMA 什么时候
-        算完 —— 都在这里，外层不再碰 _by_key / _state / 表。返回
-        (缺失数, 放置数)。
+        为什么拆成两段：卖家线程跨线程发 CUDA 调用会和主线程的 cuModuleLoad /
+    cuLaunchKernel 争同一把连接锁，实测直接死锁（faulthandler 抓到
+    _copy_blocking 和 native.module 互等）。CUDA 只有主线程碰，卖家线程负责
+    把字节准备好 —— 这也正是「CPU 备货」该做的事。
 
-        loader(layer, [expert, ...]) -> {expert: bytes-like}，缺失的由它取。
+        loader(layer, [expert, ...]) -> {expert: bytes-like}。
+        返回本次新占用的槽位数。
         """
         miss = [int(e) for e in experts if (layer, int(e)) not in self._by_key]
         if not miss:
-            return 0, 0
+            return 0
+        if getattr(self, "_staging", None) is None:
+            return 0
         data_map = loader(layer, miss) or {}
-        placed = 0
+        staged = 0
         for e in miss:
             data = data_map.get(e)
             if data is None:
                 continue
             with self._lock:
-                _ev0 = self.evictions
                 idx = self._reserve_locked((layer, e))
                 if idx is None:
                     continue
                 self._refs[idx] = 1
-                self._state[idx] = self.IN_USE
-            if __import__("os").environ.get("TI_SLOT_TRACE") == "1":
-                print(f"[ensure] L{layer} e={e} idx={idx} ev+={self.evictions - _ev0} "
-                      f"bykey={len(self._by_key)} free={len(self._free)} "
-                      f"state={self._state[idx]}", flush=True)
-            ev = self._copy_blocking(idx, data)
+                self._state[idx] = self.RESERVED
+            # 拷进 pinned 中转区（纯主机 memcpy，不碰 CUDA API）。主线程的
+            # commit() 会把它 DMA 上去。
+            try:
+                buf = self._stage_bufs.get(idx)
+                if buf is None:
+                    buf = memoryview(bytearray(self.blob_bytes))
+                    self._stage_bufs[idx] = buf
+                buf[:] = memoryview(data)[: self.blob_bytes]
+            except Exception:
+                with self._lock:
+                    self._evict_locked(idx)
+                continue
+            staged += 1
+        return staged
+
+    def commit(self, layer: int | None = None) -> int:
+        """主线程：把 staged 的槽位 DMA 上去并发布，然后写表。
+
+        只在本线程的 stream 上操作，不跨线程，所以不会和别的 CUDA 调用互等。
+        """
+        if not self._stage_bufs:
+            self.table_flush(layer)
+            return 0
+        done = []
+        for idx, buf in list(self._stage_bufs.items()):
+            key = self._key[idx]
+            if key is None or key[0] != layer if layer is not None else key is None:
+                continue
+            try:
+                ev = self._copy_blocking(idx, buf)
+            except Exception:
+                with self._lock:
+                    self._evict_locked(idx)
+                self._stage_bufs.pop(idx, None)
+                continue
             self._event[idx] = ev
             with self._lock:
-                if self._state[idx] == self.IN_USE:
+                if self._state[idx] in (self.RESERVED, self.IN_USE):
                     self._state[idx] = self.STAGED
-                # refs 留 1：ensure 的语义是「我接下来就要读它」。调用方用完
-                # 调 release() 归还；归还之后这一格才允许被覆盖。
-                # （refs 归零还不够，必须等本层 kernel 真的跑完 —— 所以没有
-                # 「放完就还」这种捷径。）
                 self._cond.notify_all()
-            placed += 1
-        return len(miss), placed
+            self._stage_bufs.pop(idx, None)
+            done.append(idx)
+        self.table_flush(layer)
+        return len(done)
+
+    def ensure(self, layer: int, experts, loader) -> tuple[int, int]:
+        """同线程版本：stage + commit 一次做完（没有异步卖家时用）。"""
+        n = self.stage(layer, experts, loader)
+        placed = self.commit(layer)
+        return n, placed
 
     def _claim_slot_locked(self) -> int | None:
         """拿一个槽位：先掏空的，掏不到就环形覆盖一个没人在用的。
@@ -2591,6 +2633,29 @@ class VramSlotCache:
                              device=self.device)
             self._slot_tab = tab
         return tab
+
+    def table_flush(self, layer: int | None = None) -> int:
+        """把排队的槽位号一次刷进 device 表（只在调用方线程的 stream 上）。"""
+        if not self._tab_dirty:
+            return 0
+        tab = getattr(self, "_slot_tab", None)
+        if tab is None:
+            self._tab_dirty.clear()
+            return 0
+        with self._lock:
+            pending = self._tab_dirty
+            self._tab_dirty = []
+        n = 0
+        for (lay, exp, slot) in pending:
+            if layer is not None and lay != layer:
+                self._tab_dirty.append((lay, exp, slot))
+                continue
+            try:
+                tab[lay, exp] = int(slot)
+                n += 1
+            except Exception:
+                pass
+        return n
 
     def table_set(self, layer: int, expert: int, slot: int) -> None:
         tab = getattr(self, "_slot_tab", None)
@@ -2680,15 +2745,13 @@ class VramSlotCache:
         self._state[idx] = self.RESERVED
         self._lru.append(idx)
         self.loads += 1
-        # 表由池子自己维护：槽位装进哪个专家，就写哪一格。以前这一步散在 moe.py
-        # 里（fetch 之后手工 table_set），漏一处就是「表指向别人的权重」这种静默
-        # 错误 —— 槽位和它的编号必须由同一个对象负责。
-        _tab = getattr(self, "_slot_tab", None)
-        if _tab is not None:
-            try:
-                _tab[int(key[0]), int(key[1])] = int(idx)
-            except Exception:
-                pass
+        # 表由池子自己维护 —— 但**不能在这里直接写 GPU 上的表**：
+        #   - reserve 会在卖家线程里被调用，那是跨线程发 kernel；
+        #   - 主线程同时在 cuModuleLoad 时，两个线程争 primary context 的锁，
+        #     实测直接死锁（faulthandler 抓到 loading.py:2689 和 native.py:96）。
+        # 所以这里只记在 Python 侧的一份「待写」列表里，由调用方在 GPU 侧
+        # 一次批量刷（table_flush），刷的过程只碰自己的 stream，不跨线程。
+        self._tab_dirty.append((int(key[0]), int(key[1]), int(idx)))
         return idx
 
     # -- prefetch path ----------------------------------------------------
