@@ -497,12 +497,21 @@ class Engine:
         # The VRAM slot pool is faster but not bit-reproducible yet (a slot can be
         # re-targeted while the GEMV that reads it is still queued; docs/analysis.md
         # section 10). TI_NO_SLOTS=1 trades about 40% of decode for deterministic logits.
-        # CPU 空闲时往内存里预热还没加载的专家 —— 显存放不下整个专家集，内存
-        # 放得下（371GB 对 289GB）。预热完之后 decode 只剩 RAM->VRAM 的 DMA，
-        # 不再有读盘；低预算机器撑并发靠的就是这一步。TI_WARM=0 可关。
+        # **冷启动 = 进程一起来就让磁盘开工，并且请求不被它挡住。**
+        #
+        # 两件事同时成立，缺一个都不对：
+        #   1) 磁盘从启动那一秒就不该闲着 —— 后台线程持续把专家读进 RAM，
+        #      没有请求时也读，读到装不下为止（覆盖式回收，不主动释放）；
+        #   2) 请求不排队等它 —— 请求要哪个专家就自己直接读哪个，
+        #      不等「预热队列轮到它」，也不等预热整体跑完才开始接请求。
+        #
+        # 两者共享磁盘：请求是最高优先级，预热填请求之间的空隙（`_busy` 让路）。
+        # 所以默认开启（TI_WARM=0 可关），而不是等第一个请求才动手 ——
+        # 那会把启动后的空闲期白白浪费掉。
+        _warm_env = __import__("os").environ.get("TI_WARM", "1")
         if (self.expert_store is not None
                 and device != "cpu"
-                and __import__("os").environ.get("TI_WARM", "1") != "0"):
+                and _warm_env != "0"):
             try:
                 from .expert_tiers import ExpertTierManager
 
