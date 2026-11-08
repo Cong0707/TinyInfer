@@ -82,9 +82,23 @@ class ExpertTierManager:
         if not missing:
             return out
         # 内存里没有：CPU 去盘上取（批量 pread，一个专家一次读）。
+        #
+        # **读的时候直接读进 pool**：以前用 `read_many` 返回 bytearray，再调
+        # `ram.admit` 把每个 18.8MB 的 bytearray 又 `slot[:] = data` 拷进 pool ——
+        # 每个专家两份 18.8MB 的内存搬运。40 层 x 240 专家 = 9600 次 x 37.6MB
+        # ≈ 361GB 的 CPU 拷贝，全部在主线程上。py-spy 三次采样全落在
+        # `_insert_locked` 的 `slot[:] = data` 那一行，就是这个原因：
+        # prefill 114 秒、decode 每步 300-1900ms，GPU 利用率 0-16%。
+        #
+        # `_read_many_pooled` 直接把字节读进 pool 的 slot，返回 memoryview，
+        # admit 见到 memoryview 就不再拷第二遍（见 _insert_locked 的注释）。
         try:
             blobs = [self.index.expert_blob(layer, e) for e in missing]
-            datas = self.reader.read_many(blobs)
+            pooled = getattr(self.ram, "_read_many_pooled", None)
+            if pooled is not None:
+                datas = pooled(blobs)
+            else:
+                datas = self.reader.read_many(blobs)
         except Exception:
             return out
         for e, d in zip(missing, datas):
