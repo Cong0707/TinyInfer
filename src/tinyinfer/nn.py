@@ -94,6 +94,16 @@ def window_idxs_general(start_pos: int, seqlen: int, old_len: int, window: int, 
 _POS_BUF = None   # window_idxs_ring 的全局位置 buffer（捕获期不能新建 tensor）
 
 
+
+_POS_BUF = None
+
+def _pos_buf(device=None):
+    global _POS_BUF
+    dev = device or 'cuda'
+    if _POS_BUF is None or _POS_BUF.device != torch.device(dev):
+        _POS_BUF = torch.zeros((), dtype=torch.long, device=dev)
+    return _POS_BUF
+
 def window_idxs_ring(start_pos: int, seqlen: int, old_len: int, window: int, device=None) -> torch.Tensor:
     """环形 cache 的窗口槽位：位置 p 存在 p % window 这一格。
 
@@ -109,7 +119,14 @@ def window_idxs_ring(start_pos: int, seqlen: int, old_len: int, window: int, dev
     # start_pos 给 tensor 也能算：arange 只生成 [0, seqlen)，位置靠广播加进去。
 
 
-    base = start_pos if torch.is_tensor(start_pos) else torch.tensor(start_pos, device=device)
+    if torch.is_tensor(start_pos):
+        base = start_pos
+    elif torch.cuda.is_current_stream_capturing():
+        # capture forbids an unpinned H2D copy; the position is fixed for the
+        # captured graph and rewritten outside it before each replay
+        base = _pos_buf(device)
+    else:
+        base = torch.tensor(start_pos, device=device)
     gpos = (base + torch.arange(seqlen, device=device))[:, None] - back[None, :]
     idx = gpos % window
     valid = gpos >= 0
