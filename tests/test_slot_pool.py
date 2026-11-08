@@ -37,7 +37,8 @@ def test_coverage_allocation_never_wedges(pool):
         for e in want:
             idx = pool._by_key.get((0, e))
             assert idx is not None and 0 <= idx < pool.slots
-        # 用完了才还（MoE 是在本层 forward 末尾对 _last_ids 做同样的事）
+        # 一层算完：它的槽位降级成「历史」，可以被下一层覆盖
+        pool.clear_urgent()
         for e in want:
             pool.release(0, e)
 

@@ -2611,20 +2611,26 @@ class VramSlotCache:
         n = self.slots
         if n <= 0:
             return None
-        for k in range(n):
-            i = self._cur + k
-            if i >= n:
-                i %= n
-            if (self._refs[i] != 0
-                    or self._state[i] == self.COPYING
-                    or self._key[i] in self._pinned):
-                continue
-            # 分级覆盖：当前层（urgent）只能抢非 urgent 的槽位，
-            # 否则它会把同一步里自己刚搬进来的专家顶掉（实测 hits=0）。
-            if protect_urgent and i in self._urgent:
-                continue
-            self._cur = (i + 1) % n
-            return i
+        def _evictable(i: int) -> bool:
+            return (self._refs[i] == 0
+                    and self._state[i] != self.COPYING
+                    and self._key[i] not in self._pinned)
+
+        # 两轮扫描：第一轮只碰「非 urgent」的（别的层已算完的、历史专家），
+        # 这样同一层刚搬进来的 6 个专家不会被它自己的下一个请求顶掉 ——
+        # 那是 hits=0 的直接原因。第一轮找不到才退一步允许覆盖 urgent，
+        # 否则池子一到紧急状态就整个卡死（没有兜底时实测会 still not resident）。
+        for allow_urgent in ((not protect_urgent), True):
+            for k in range(n):
+                i = self._cur + k
+                if i >= n:
+                    i %= n
+                if not _evictable(i):
+                    continue
+                if not allow_urgent and i in self._urgent:
+                    continue
+                self._cur = (i + 1) % n
+                return i
         return None
 
     def _find_victim_locked(self) -> int | None:
