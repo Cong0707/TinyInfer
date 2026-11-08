@@ -353,11 +353,36 @@ class MLAWindowAttention:
         buf = self._kv_buf
         if (buf is None or buf.shape[0] != b or buf.shape[1] != self.window
                 or buf.dtype != kv.dtype or buf.device != kv.device):
-            buf = kv.new_empty(b, self.window, self.head_dim)
+            # 必须清零，不能用 new_empty：没写到的槽位会被窗口索引扫到，
+            # 里面是分配器给的未初始化内存（实测一个 token 之后 buf[0] 有 58 个
+            # 非零槽位）。单行时索引会把这些槽位排除掉所以看不出来；batch>1 时
+            # 每行的有效槽位不同，垃圾值会跟着算进结果 —— 两行完全相同的数据
+            # 输出差 2.9 就是这么来的。
+            buf = torch.zeros(b, self.window, self.head_dim, dtype=kv.dtype,
+                              device=kv.device)
             self._kv_buf = buf
             self._decode_idxs = None
-        # 写入这一批的新 token：slot = position % window，一次 index_copy_
-        if s == 1:
+        # 写入这一批的新 token：slot = position % window。
+        # 每行的位置可能不同（batch>1 且各行历史长度不一），所以槽位必须逐行算。
+        # 以前这里用同一个 start_pos 给所有行写同一格，两行会互相覆盖对方的历史
+        # （实测 batch=2 时第 0 行输出偏离 4.70）。
+        _rowpos = None
+        if positions is not None:
+            _p = positions.reshape(b, -1)
+            if _p.size(1) == s:
+                _rowpos = _p                       # [b, s] 每行每个位置
+            elif _p.size(1) >= 1:
+                _rowpos = _p[:, :1].expand(-1, s)  # [b, 1] -> 每行起点
+        if _rowpos is not None and b > 1:
+            # 逐行写：第 r 行第 j 列写进槽位 (rowpos[r, j] % window)。
+            # 用 index_copy_ 逐行做（下标是 device tensor，图捕获时不会被钉死）。
+            # 之前的 scatter_ 把 [b,s,d] 的源塞进 [b,1,s] 的下标形状，broadcast
+            # 出来的对应关系是错的 —— 实测两行完全相同的数据写进去之后 buf 的
+            # 两行差了 6.0。
+            _slots = (_rowpos % self.window).to(torch.long)          # [b, s]
+            for _r in range(b):
+                buf[_r].index_copy_(0, _slots[_r], kv[_r])
+        elif s == 1:
             buf[:, start_pos % self.window] = kv[:, 0]
         else:
             # 一个 chunk 比窗口还长时，只有最后 window 个位置能留在 cache 里；带上
