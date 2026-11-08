@@ -670,7 +670,24 @@ class MLACompressedAttention:
             # 退化成「本步不带压缩历史」，至少不炸整批。
             compress_kv = compress_idxs = None
         else:
-            compress_kv = self.rt.compress_kv[:, :compress_len]
+            # 每行能看到的压缩组数必须按**自己的**位置算，不能用整批的最大值。
+            # 以前就是 `[:, :compress_len]`（compress_len 按本批最大 end_pos 算），
+            # 于是浅的行会读到深的行才写出来的组 —— 那些组对它来说是「未来」，
+            # 语义上不该可见。这里是拼批正确性的最后一块。
+            _full = self.rt.compress_kv
+            if b > 1 and _grp0 is not None:
+                _own = _grp0.reshape(b, -1)[:, -1] + int(latent.size(1)) \
+                    if latent is not None else None
+                if _own is not None:
+                    # 用一个 [b, full_len, d] 的掩码把每行的可见范围之外清零
+                    _gidx = torch.arange(_full.size(1), device=_full.device)
+                    _vis = (_gidx.unsqueeze(0) < _own.unsqueeze(1))
+                    compress_kv = _full[:, :compress_len] * _vis[:, :compress_len] \
+                        .unsqueeze(-1).to(_full.dtype)
+                else:
+                    compress_kv = _full[:, :compress_len]
+            else:
+                compress_kv = _full[:, :compress_len]
             if self.indexer is not None:
                 if _pt is not None:
                     _t2 = __import__("time").perf_counter()
