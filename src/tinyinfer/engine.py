@@ -2856,7 +2856,22 @@ class Engine:
             rc = getattr(getattr(blk, "ffn", None), "_route_counts", None)
             if not rc:
                 continue
-            need = [int(e) for e in rc.keys() if not slots.has(lid, int(e))]
+            # **按这一轮实际用到的 topk 取，不是「历史上路由过的全部」。**
+            #
+            # _route_counts 是 warmup + 前面若干 token 累积出来的，一层可能是几十个
+            # 专家。全装进来会瞬间吃满 1057 个槽位，装不下的就留 -1 —— 而图里的 MoE
+            # 没有 miss 扫描，那些专家直接被跳过，和 eager 的参与集合不一致。
+            #
+            # 实测：L0 的输入相同、hc 两次归一化也相同，但 L0 的输出 x 不同
+            # （eager 0.2334 vs graph 0.23242，第二维 -0.01782 vs 0.06982），
+            # 一路传到 L1 的 attn、gate 路由、最终 argmax。
+            #
+            # 图内一次 forward 每层最多路由 topk 个专家，按计数从高到低取这么多就够，
+            # 而且取的是「这一轮最可能用到的」——正是 eager 也会加载的那批。
+            topk = int(getattr(blk.ffn, "topk", 0) or 0)
+            ranked = sorted(rc.items(), key=lambda kv: -int(kv[1]))
+            want = [int(e) for e, _c in ranked[:max(topk, 1)]]
+            need = [e for e in want if not slots.has(lid, e)]
             if not need:
                 continue
             try:
