@@ -693,11 +693,19 @@ class MoE:
             else:
                 y.zero_()
 
-            fa = _MOE_FUSED.get("act")
+            # grid 里的 n_exp **不能缓存**：BoundLaunch 把 grid 固化在对象里，
+            # 而 n_exp = rows * topk 随输入长度变化（11 行是 66，1 行是 6）。
+            # 缓存意味着第一次 prefill 之后，所有 decode 都用 (72, 66, 1) 的
+            # grid，kernel 会按 blockIdx.y = 0..65 去索引 aq + e*k_in，
+            # 而 aq 只有 6*5120 字节 —— 越界读 10 倍，读回来的是别的专家的激活，
+            # 结果就是 NaN。这正是「引擎跑过一次之后，短输入必 NaN」的根因。
+            # 现在按 (device, grid) 作键缓存，不同 grid 各建一个。
+            _fa_key = ("act", int(n_exp), int(nmid))
+            fa = _MOE_FUSED.get(_fa_key)
             if fa is None:
                 fa = native.BoundLaunch(native.kernel("moe_fused", "moe_fused_act"),
                                         ((nmid + 31) // 32, n_exp, 1), (512,), "TTTTTOOiiiiiiiif")
-                _MOE_FUSED["act"] = fa
+                _MOE_FUSED[_fa_key] = fa
             # kernel 按 [row, expert] 索引激活，所以这里把每行的激活铺成 n_exp 份。
             # 之前只传了一行（5120 字节），e=1..5 时读的是越界地址 —— 不报错但数值是垃圾。
             _k = int(self.cfg.dim)
