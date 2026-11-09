@@ -306,7 +306,22 @@ class Block(HCBlockMixin):
         import os as _os
         from ..cpu_kernels import slab
 
-        st = None if _os.environ.get("TI_SLAB") is None else slab()
+        # **默认就要用 pinned slab。** 原来这里要求显式设 TI_SLAB 环境变量，
+        # 不设就 st=None，于是每层的每个张量各自 .to(device) —— 那是 31~37 次
+        # 独立分配，且旧的那块要等 GC 才还。实测（CI 的 L2 层抓到）：
+        #
+        #   decode1 alloc=14.50GB (+3.26)
+        #   decode2 alloc=15.84GB (+1.34)
+        #   decode3 分配失败 !handles_ INTERNAL ASSERT
+        #
+        # 而分配器快照显示 model.py:335 那条 else 分支累计 1501 次分配、9.24GB。
+        # 物理显存只有 8.5GB，超出的落到 WDDM 共享内存，所以不是立刻崩、是撑几步。
+        #
+        # slab 路径（上面的 if 分支）本来就是为了把一层合成一次 pinned H2D，
+        # 它同时避免了「每张量一次分配」。把它设成默认，TI_SLAB=0 可以显式关掉
+        # （诊断用：确认某问题是不是 slab 路径引入的）。
+        _slab_env = _os.environ.get("TI_SLAB")
+        st = None if _slab_env == "0" else slab()
         if st is not None:
             # one layer = one pinned memcpy + one pinned H2D. Pageable per-tensor copies
             # were 763 transfers x 781us (8.3GB/s); a 190MB pinned H2D is ~7ms at 26GB/s.  # noqa: E501
@@ -322,7 +337,25 @@ class Block(HCBlockMixin):
                 for (owner, name, t), o, n in zip(paths, offsets, nbytes):
                     cpu = self._cpu_refs[self._wkey(owner, name)]
                     st[o:o + n].copy_(cpu.reshape(-1).view(torch.uint8), non_blocking=False)
-                gpu = st[:total].to(device, non_blocking=False)  # single pinned H2D
+                # **复用一块 device staging，而不是每次新建。**
+                #
+                # 原来每个 streamed 层都 `st[:total].to(device)`，那是一块新的
+                # device tensor，旧的只能等 GC。33 个 streamed 层 x ~174MB = 5.7GB
+                # 累积下来，8.5GB 的卡跑到第 27 层就 OOM（CI 的 L2 抓到：
+                # alloc=11.03GB / 物理 8.5GB，free=0MB）。
+                #
+                # 注意：这里不能复用同一块给「同时活着」的层 —— 但 streamed 层是
+                # 依次算完就丢的（下一层覆盖上一层），所以一块就够。真正需要保活
+                # 的是 slab 覆盖的那些层，它们走 _flat_state 的环形缓冲，不走这里。
+                # 用临时块搬：拷完立刻不再持有，让分配器能复用它。
+                #
+                # 一开始想缓存成 self._weight_stage_dev 复用，但那样会永久占住
+                # 一块 ~174MB，在这个已经贴到上限的卡上直接导致 free=0MB。
+                # 而 per-layer 的临时块在函数返回后引用计数归零、分配器立即可复用
+                # （同一 size 的块下次直接命中缓存），不需要我们持有。
+                _wbuf = torch.empty(int(total), dtype=torch.uint8, device=device)
+                _wbuf.copy_(st[:total], non_blocking=False)
+                gpu = _wbuf
                 for (owner, name, t), o, n in zip(paths, offsets, nbytes):
                     set_weight(owner, name, gpu[o:o + n].view(t.dtype).view(t.shape))
             else:
