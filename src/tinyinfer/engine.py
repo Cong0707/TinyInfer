@@ -2301,6 +2301,17 @@ class Engine:
             b = self.block(i)
             paths = b._weight_paths()
             offs = lay[i][0]
+            # 先记下这些权重在 pool 里的位置：拷进 slab 之后要把它们还回去。
+            # build_pool 是 "读到哪算哪" 的 bump 分配器，权重读进来占了约
+            # 6.5GB，而 slab 块是从同一块 pool 里另切的 —— 不释放的话池子被
+            # 两倍占用，slab 只装得下 14/33 层（实测 slab_total=7.29GB 却只
+            # 用到 3.36GB 就停了，日志是 "partial slab 14/33"）。
+            _rel_after = []
+            for (owner, name, t) in paths:
+                _o = getattr(t, "_tiny_pool_off", -1)
+                _n = getattr(t, "_tiny_pool_len", 0)
+                if isinstance(_o, int) and _o >= 0 and _n:
+                    _rel_after.append((_o, int(_n)))
             for (owner, name, t), (o, n) in zip(paths, offs):
                 dst = blk[o:o + n].view(t.dtype).view(t.shape)
                 try:
@@ -2312,6 +2323,18 @@ class Engine:
             for (owner, name, t), (o, n) in zip(paths, offs):
                 _refs[Block._wkey(owner, name)] = blk[o:o + n].view(t.dtype).view(t.shape)
             b._cpu_refs = _refs
+            # **换完引用再还内存。** 顺序反了就是悬空：b._cpu_refs 还指着旧 tensor
+            # （在 pool 里）的时候 release 掉那块，之后的 any 访问都是野指针。
+            if _rel_after:
+                _pool_rel = getattr(self, "host_pool", None)
+                _rel_fn = getattr(_pool_rel, "release", None) if _pool_rel is not None else None
+                if callable(_rel_fn):
+                    for _o, _n in _rel_after:
+                        try:
+                            _rel_fn(_o, _n)
+                        except Exception:
+                            pass
+                _rel_after = []
             b._device = "cpu"
             host_map[i] = blk
             del paths, offs

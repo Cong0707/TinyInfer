@@ -90,7 +90,9 @@ def act_quant(x: torch.Tensor, block_size: int = 128, scale_fmt=None,
     if inplace:
         y = torch.empty_like(flat)
         _launch(flat, y, s_flat, "act_quant_dequant")
-        x.copy_(y.view_as(x))
+        # non_blocking：device->device 的拷，不需要 CPU 同步等待。
+        # 默认 False 会让这里每层同步一次（见 compressed_attention.py 同处的说明）。
+        x.copy_(y.view_as(x), non_blocking=True)
         return x
     y = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=z.device)
     _launch(flat, y, s_flat, "act_quant")
