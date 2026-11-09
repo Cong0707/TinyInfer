@@ -1007,10 +1007,24 @@ class TinyModelBackend(BaseBackend):
             # 是池子被占死、还是路由真的变了 —— 只有 hits/loads 一个数字时
             # 分不清这两件事。
             "expert_slots": self._slot_snapshot(model),
+            # 统一观测：层/槽位/命中/存储的完整快照。expert_slots 保留是为了
+            # 兼容已有的排障习惯（只想知道槽位时不用翻整棵树）。
+            "observability": self._observability(model),
             "tokenizer": type(self._tokenizer).__name__ if self._tokenizer is not None else None,
             "slot_caches": len(self._slot_kv),
             "expert_store": self._expert_store is not None,
         }
+
+    @staticmethod
+    def _observability(model) -> dict | None:
+        """统一的观测出口。所有指标的口径定义在 observability.py 里，这里只转发。"""
+        if model is None:
+            return None
+        try:
+            from .observability import collect_observability
+            return collect_observability(model)
+        except Exception:
+            return None
 
     @staticmethod
     def _slot_snapshot(model) -> dict | None:

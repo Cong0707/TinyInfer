@@ -163,6 +163,10 @@ def main() -> None:
         nxt = int(o[0, -1].argmax())
         pos += 1
 
+    # 观测统一从 collect_observability 取，不在 bench 里另算一套口径。
+    # 以前这里直接读 ram._stats.hits/misses，和 ExpertTiers 的 vram_hit 是两个口径。
+    from .observability import collect_observability, format_summary
+    obs = collect_observability(eng)
     st = getattr(eng, "expert_store", None)
     hit = None
     entries = None
@@ -208,11 +212,16 @@ def main() -> None:
         "expert_cache_hit": None if hit is None else round(hit, 3),
         "expert_cache_entries": entries,
         "disk_gb_s": round(_disk_rate(args.model), 2),
+        "observability": obs,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         "ram_gb": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30, 1)
         if hasattr(os, "sysconf") else None,
     }
     print(json.dumps(out, indent=2))
+    print("", flush=True)
+    print("[summary]", flush=True)
+    for ln in format_summary(obs).splitlines():
+        print("  " + ln, flush=True)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(out, fh, indent=2)

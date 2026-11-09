@@ -666,7 +666,18 @@ class MoE:
             if _nmiss:
                 _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
                 if _miss:
-                    _mgr.need(self.layer_id, _miss)
+                    # **need() 要的是「本层全部想用的专家」，不是「已经确认缺失的」。**
+                    # 它内部自己做 `miss = [e for e in want if 不在槽位]`，然后
+                    # `stats["vram_hit"] += len(want) - len(miss)`。
+                    #
+                    # 以前这里传的是 _miss 本身，于是 len(want) == len(miss)，
+                    # vram_hit 恒等于 0 —— 观测上表现为「槽位搬了 2600 多次，
+                    # 显存命中率 0%」，而实际命中是有的。
+                    #
+                    # want 用本步路由到的全部专家（_last_ids 是去重后的），
+                    # 这样 vram_hit 才等于「本来就够用、不需要搬」的专家个数。
+                    _want = getattr(self, "_last_ids", None) or _miss
+                    _mgr.need(self.layer_id, _want)
                     _mgr.commit(self.layer_id)
                     _mgr.ready(self.layer_id, _miss)
             tab = sl._slot_tab   # 池子自有的 device 表，下面立刻索引用
