@@ -465,6 +465,26 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # 槽位数白算少（实测无条件计入后 slots 从 11 掉到 1，而 MTP 明明是关的）。
     _mtp_b = float(model.get("mtp_bytes", 0.0) or 0.0)
     runtime_b = (_engram_b * 0.5 + 0.15 * GB + PREFILL_TEMP)
+    # ---- 槽位专项预留 --------------------------------------------------------
+    #
+    # 槽位是唯一直接吃 `spare` 的项，所以「运行期还剩多少空间」完全由它决定。
+    # 原来把 spare 的 90% 全给槽位，等于假设运行期不需要额外空间。
+    #
+    # 实测（8GB 卡）：24 个槽位吃掉 452MB，spare 只剩约 48MB，forward 以 86%
+    # 的概率产出 NaN；4 个槽位只吃 75MB、剩约 425MB，连续 11 次干净。
+    # 差额约 377MB 就是运行期真正还需要的部分（dequant 展开的 fp32 中间量、
+    # KV 增长、attention 临时张量、MoE workspace 加起来）。
+    #
+    # 这不是「性能换正确性」——一个 86% 概率输出垃圾的配置本来就是不可运行的，
+    # 它的吞吐数字没有意义。所以规划器的职责是先保证能算对，再谈槽位多少。
+    #
+    # 377MB 是这台机器的实测值，不是通用常数；训练器扫出来会写进 tuned.json
+    # 的 slots_reserve_gb，规划器优先用它。
+    _slot_reserve = 0.377 * GB
+    if calibrate:
+        _sr = calibrate.get("slots_reserve_gb")
+        if isinstance(_sr, (int, float)) and 0.0 <= float(_sr) < 4.0:
+            _slot_reserve = float(_sr) * GB
     if speculation and V < 16 * GB:
         # Drafting pays only when the acceptance rate is high; here it is 0.08 (docs/
         # analysis.md section 2), so the draft stages just cost resident layers and the
@@ -621,14 +641,18 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     if not _force_resident:
         # the solver only keeps slot room when it chose the residency itself; a caller
         # that asked for a specific count (TI_RESIDENT) wants those layers, not slots
-        while resident > 0 and int(spare * SLOT_FRACTION // max(1.0, expert_b)) < MIN_SLOTS:
+        while resident > 0 and int(max(0.0, spare - _slot_reserve)
+                                    * SLOT_FRACTION // max(1.0, expert_b)) < MIN_SLOTS:
             resident -= 1
             used = _used(resident)
             spare = max(0.0, V - used)
     if not has_experts:
         slots = 0
     else:
-        slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
+        # 先扣掉槽位专项预留，剩下的才按 SLOT_FRACTION 切给专家槽位。
+        # 直接 `spare * SLOT_FRACTION` 等于假设运行期不需要额外空间，实测会 NaN。
+        slots = int(max(0.0, spare - _slot_reserve)
+                    * SLOT_FRACTION // max(1.0, expert_b))
         slots = max(slots, 2) if has_gpu else 0
 
     # ---- expert coverage beats a device-resident table ---------------------------
@@ -696,7 +720,10 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             _r = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0,
                                               slot_bytes=_sb))
             _spare = max(0.0, V - _used_with(_r, embed_gpu, head_gpu))
-            _s = int(_spare * SLOT_FRACTION // max(1.0, expert_b))
+            # 同上的槽位专项预留：这个定点迭代会重算 slots，如果这里不扣，
+            # 上面那次扣减就被覆盖掉了（实测三个不同 reserve 都给出 21）。
+            _s = int(max(0.0, _spare - _slot_reserve)
+                     * SLOT_FRACTION // max(1.0, expert_b))
             if _r == resident and _s == slots:
                 break
             resident, slots = _r, max(0, _s)
