@@ -132,7 +132,13 @@ def main() -> None:
     build_s = time.perf_counter() - t_build
 
     if args.breakdown:
-        _print_breakdown(eng, tok)
+        try:
+            _print_breakdown(eng, tok)
+        finally:
+            try:
+                eng.close()
+            except Exception:
+                pass
         return
 
     ids = tok.encode(args.prompt, add_special_tokens=False)
@@ -225,6 +231,13 @@ def main() -> None:
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(out, fh, indent=2)
+    # 把引擎占的主机池还回去。进程退出时 OS 也会收，但那是「靠进程死」的回收：
+    # 一旦以后有人把这套流程嵌进长命进程（服务端的基准接口就是这样用的），
+    # 每跑一次就漏一份几十 GB 的池子。
+    try:
+        eng.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

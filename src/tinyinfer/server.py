@@ -1068,7 +1068,17 @@ class TinyModelBackend(BaseBackend):
         return models
 
     def close(self) -> None:
+        # **必须显式关引擎，不能只丢引用。** 引擎持有几十 GB 的主机池、占满的显存
+        # 槽位和一个进程锁；丢引用只让 GC 有机会回收 Python 对象，而 cudaHostAlloc /
+        # VirtualAlloc 拿到的内存和 engine lock 都不归 GC 管。后果有两个：内存只涨
+        # 不跌，以及下一次加载直接被 EngineLockBusy 挡在门外。
+        _m = self._model
         self._model = None
+        if _m is not None:
+            try:
+                _m.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("closing engine failed", exc_info=True)
         self._cfg = None
         self._slot_kv.clear()
         expert_store, self._expert_store = self._expert_store, None

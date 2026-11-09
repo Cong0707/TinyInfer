@@ -63,32 +63,68 @@ class Engine:
         全放弃会让剩下的资源彻底留在那里。
         """
         import contextlib
+        import gc
 
-        # 1) CUDA graph
+        # 0) **先停后台预热线程。** 它是个 daemon，一直在往主存池和专家缓存里写；
+        #    池子被拆掉之后它还在写，就是 0xC0000005（实测 bench 跑完后 close 必崩）。
+        #    停线程必须排在任何释放动作之前。
+        with contextlib.suppress(Exception):
+            _store0 = getattr(self, "expert_store", None)
+            _mgr0 = getattr(_store0, "_tier_mgr", None)
+            if _mgr0 is not None and hasattr(_mgr0, "stop_warm"):
+                _mgr0.stop_warm()
+
+        # 1) 再把所有指向池子的 Python 引用断干净。
+        #
+        # **这一步不能省，否则会直接崩在访问违例。** 主机池里切出去的内存被
+        # torch.frombuffer 包成了 tensor，层权重、blob pool、KV 都持有它们。
+        # 如果先 cudaFreeHost 再清引用，那些 tensor 就成了野指针，析构或读一下
+        # 就是 0xC0000005（实测 bench 完整跑完后在 close 处崩掉）。
+        # 所以顺序是「断引用 -> 强制回收 -> 确认没有残留 -> 才还内存」。
         with contextlib.suppress(Exception):
             g = getattr(self, "_graph", None)
             if isinstance(g, dict):
-                for _k, _v in list(g.items()):
+                for _v in list(g.values()):
                     if hasattr(_v, "reset"):
                         with contextlib.suppress(Exception):
                             _v.reset()
             self._graph = None
 
-        # 2) 显存槽位池（device 侧）
+        # 1) 层权重和 blob pool：真正持有池子切片的那些对象
+        with contextlib.suppress(Exception):
+            self._blocks = {}
         with contextlib.suppress(Exception):
             _store = getattr(self, "expert_store", None)
             _slots = getattr(_store, "slots", None)
             if _slots is not None:
-                for _attr in ("_buffers", "_arena", "_staging"):
+                for _attr in ("_buffers", "_arena", "_staging", "_by_key"):
                     with contextlib.suppress(Exception):
-                        setattr(_slots, _attr, None)
+                        setattr(_slots, _attr, None if _attr != "_by_key" else {})
                 with contextlib.suppress(Exception):
                     _slots._n = 0
-
-        # 3) 主机池：这是几十 GB 的那一块
+            if _store is not None:
+                with contextlib.suppress(Exception):
+                    _store._pool = None
         with contextlib.suppress(Exception):
             self.host_pool = None
         with contextlib.suppress(Exception):
+            self.expert_store = None
+
+        # 2) 强制回收，让上面断掉引用的 tensor 真的析构
+        with contextlib.suppress(Exception):
+            for _ in range(3):
+                gc.collect()
+
+        # 3) 显存还回去
+        with contextlib.suppress(Exception):
+            import torch as _torch
+
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+
+        # 4) 主机池：这是几十 GB 的那一块，必须最后动
+        with contextlib.suppress(Exception):
+            gc.collect()
             from .budget import budget as _budget_fn
 
             _b = _budget_fn()
@@ -97,12 +133,7 @@ class Engine:
                 print(f"[tinyinfer] released {_freed / (1 << 30):.1f}GB host pool",
                       flush=True)
 
-        # 4) 显存缓存 + engine lock
-        with contextlib.suppress(Exception):
-            import torch as _torch
-
-            if _torch.cuda.is_available():
-                _torch.cuda.empty_cache()
+        # 5) engine lock 最后放
         with contextlib.suppress(Exception):
             self._engine_lock.release()
             self._engine_lock = None
