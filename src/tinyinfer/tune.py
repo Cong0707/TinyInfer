@@ -190,7 +190,7 @@ def _run_one(model_dir, env_extra, warmup=24, measure=8):
     env.setdefault("PYTHONPATH", str(_P(__file__).resolve().parents[1]))
     env.update({k: str(v) for k, v in env_extra.items()})
     code = (
-        "import sys,time,json,statistics,os" + NL +
+        "import sys,time,json,statistics" + NL +
         "sys.path.insert(0,%r)" % str(_P(__file__).resolve().parents[1]) + NL +
         "import torch" + NL +
         "from tinyinfer.engine import Engine" + NL +
@@ -201,17 +201,36 @@ def _run_one(model_dir, env_extra, warmup=24, measure=8):
         "with torch.inference_mode():" + NL +
         "    e.forward(torch.tensor([[1,2,3]],device='cuda'),0)" + NL +
         "    torch.cuda.synchronize()" + NL +
-        "    for i in range(%d): e.forward(torch.tensor([[100+i]],device='cuda'),pos+i)" % warmup + NL +
-        "    torch.cuda.synchronize()" + NL +
-        "    s=[]" + NL +
-        "    for i in range(%d):" % measure + NL +
-        "        t0=time.perf_counter()" + NL +
-        "        e.forward(torch.tensor([[900+i]],device='cuda'),pos+%d+i)" % (warmup + 10) + NL +
+        "    # 预热到稳定：连续 3 步的读盘量变化 < 10%。不这样做测出来的是" + NL +
+        "    # 「warm 线程跑到哪了」，不是配置的好坏（本机以此判据 28 步才稳）。" + NL +
+        "    r0=e.expert_store.reader" + NL +
+        "    prev=None; stable=0" + NL +
+        "    for k in range(60):" + NL +
+        "        b0=r0.bytes_read" + NL +
+        "        e.forward(torch.tensor([[100+k]],device='cuda'),pos+k)" + NL +
         "        torch.cuda.synchronize()" + NL +
-        "        s.append((time.perf_counter()-t0)*1e3)" + NL +
-        "    out=dict(step_ms=round(statistics.median(s),1),slots=int(sl.slots)," + NL +
+        "        gb=(r0.bytes_read-b0)/1e9" + NL +
+        "        if prev is not None and prev > 0 and abs(gb-prev) < prev*0.10:" + NL +
+        "            stable += 1" + NL +
+        "            if stable >= 3: break" + NL +
+        "        else: stable = 0" + NL +
+        "        prev = gb" + NL +
+        "    pos += 70" + NL +
+        "    # 多轮取样：每轮 6 步，跑 3 轮，最后对全部样本取中位数。" + NL +
+        "    # 单轮不够：本机同一配置相邻两轮能差 50%（外部进程/页缓存温度）。" + NL +
+        "    samples=[]" + NL +
+        "    for rd in range(3):" + NL +
+        "        for i in range(6):" + NL +
+        "            t0=time.perf_counter()" + NL +
+        "            e.forward(torch.tensor([[900+rd*10+i]],device='cuda'),pos+rd*10+i)" + NL +
+        "            torch.cuda.synchronize()" + NL +
+        "            samples.append((time.perf_counter()-t0)*1e3)" + NL +
+        "    med=statistics.median(samples)" + NL +
+        "    spread=(max(samples)-min(samples))/max(1.0,med)" + NL +
+        "    out=dict(step_ms=round(med,1),slots=int(sl.slots)," + NL +
         "             resident=int(getattr(e,'gpu_layers',0) or 0)," + NL +
-        "             loads=int(sl.stats().get('loads',0)))" + NL +
+        "             loads=int(sl.stats().get('loads',0))," + NL +
+        "             spread=round(spread,3),n=len(samples))" + NL +
         "e.close()" + NL +
         "print('TUNEJSON'+json.dumps(out))" + NL
     )
