@@ -831,6 +831,17 @@ class Engine:
             self.enable_prefetch = bool(getattr(self.tier, "prefetch", False))
         else:
             self.enable_prefetch = bool(int(_pf_env))
+        # PID 式运行时调优：用「每步 IO 时间占比」做反馈，控制预取深度。
+        # 离线训练（tune.py）给的是起点，这个是运行中的闭环 —— 状态一直在变
+        # （预热进度、页缓存温度、别的进程抢内存），开环参数跟不上。
+        try:
+            from .autotune import PrefetchController
+
+            self._prefetch_ctrl = PrefetchController()
+            self._prefetch_depth = int(self._prefetch_ctrl.depth)
+        except Exception:
+            self._prefetch_ctrl = None
+            self._prefetch_depth = 2
         self.cache_wo_a = False
         self.profile = False
         # CPU-side learned expert prefetcher (context tables; ~95% hit rate measured)
@@ -2631,10 +2642,15 @@ class Engine:
                                 nxt = flat_seq[k + d]
                                 if nxt not in self._flat_ev:
                                     self._flat_prefetch(nxt, (k + d) % _ring)
-                    if k + 2 < len(flat_seq) and self.enable_prefetch:
-                        # RAM prefetch two layers ahead: the read has ~2 layers of compute
-                        # time to land, and it never touches the VRAM slot pool
-                        ahead = flat_seq[k + 2]
+                    # 提前几层由 PID 控制器给，不再写死 2。
+                    #
+                    # 2 是一个静态折中：提前太少，这层的专家还没读到就已经要算；
+                    # 提前太多，预取的专家把缓存里正在用的挤掉。最优点随盘速、
+                    # 预热进度和路由分布漂移，所以它应该被实时调，不该被写死。
+                    # autotune.PrefetchController 用「每步 IO 时间占比」做反馈。
+                    _adv = int(getattr(self, "_prefetch_depth", 2) or 0)
+                    if _adv > 0 and k + _adv < len(flat_seq) and self.enable_prefetch:
+                        ahead = flat_seq[k + _adv]
                         r = self._last_routing.get(ahead)
                         if r:
                             self._prefetch_layer(ahead, r)
@@ -3544,6 +3560,41 @@ class Engine:
 
     def forward(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None,
                 positions=None):
+        """对外入口：包一层 PID 反馈，测量每步的 IO 占比并调预取深度。
+
+        测量放在这一层而不是 _forward_inner 里，是因为 _forward_inner 内部有
+        多个 return（graph 命中、正常路径、OOM 阶梯），逐个加采样点容易漏。
+        try/finally 只在这里出现一次。
+        """
+        _mon = ids.shape[1] == 1 and chunk is None
+        if not _mon:
+            return self._forward_inner(ids, start_pos, chunk=chunk, positions=positions)
+        import time as _tt
+
+        _t0 = _tt.perf_counter()
+        _reader = getattr(getattr(getattr(self, "expert_store", None), "reader", None),
+                          "read_seconds", None)
+        _io0 = float(_reader) if _reader is not None else 0.0
+        try:
+            return self._forward_inner(ids, start_pos, chunk=chunk, positions=positions)
+        finally:
+            try:
+                _step_ms = (_tt.perf_counter() - _t0) * 1e3
+                _reader2 = getattr(
+                    getattr(getattr(self, "expert_store", None), "reader", None),
+                    "read_seconds", None)
+                _io_ms = ((float(_reader2) - _io0) * 1e3
+                          if _reader2 is not None else 0.0)
+                ctrl = getattr(self, "_prefetch_ctrl", None)
+                if ctrl is not None:
+                    self._prefetch_depth = ctrl.observe(_io_ms, _step_ms)
+                    self._last_io_ms = _io_ms
+                    self._last_step_ms = _step_ms
+            except Exception:
+                pass
+
+    def _forward_inner(self, ids: torch.Tensor, start_pos: int = 0,
+                       chunk: int | None = None, positions=None):
         """Decode/prefill entry point: CUDA graph replay when captured, else the OOM ladder.
 
         positions: optional [b] per-row absolute position of each row's last token. A
