@@ -676,7 +676,15 @@ class QwenBackend(BaseBackend):
         # max_tokens cannot share one
         self._graphs: dict[tuple[int, int], Any] = {}
         self._prep: dict[tuple[int, int], list[int]] = {}
-        self._gen_lock = threading.Lock()
+        # **RLock，不是 Lock。**
+        #
+        # generate() 在 TI_SERVE_LOOP=0 的路径上先 with self._gen_lock:
+        # 再调 _generate_locked()，而后者内部的 reset_slot() 也要拿同一把锁
+        # —— 不可重入锁在同线程里直接自死锁，请求永远不返回。
+        #
+        # 这里用 RLock 是对的语义：同一线程在生成过程中重置自己的槽位是合法的
+        # 重入，不是并发冲突。跨线程的互斥仍然成立。
+        self._gen_lock = threading.RLock()
         self._lock = threading.Lock()
         self.ready = False
 
@@ -981,7 +989,15 @@ class TinyModelBackend(BaseBackend):
         # request resume from the prefix instead of re-prefilling it (TI_SERVER_PREFIX=1)
         self._slot_prefix: dict = {}
         self._lock = threading.Lock()
-        self._gen_lock = threading.Lock()
+        # **RLock，不是 Lock。**
+        #
+        # generate() 在 TI_SERVE_LOOP=0 的路径上先 with self._gen_lock:
+        # 再调 _generate_locked()，而后者内部的 reset_slot() 也要拿同一把锁
+        # —— 不可重入锁在同线程里直接自死锁，请求永远不返回。
+        #
+        # 这里用 RLock 是对的语义：同一线程在生成过程中重置自己的槽位是合法的
+        # 重入，不是并发冲突。跨线程的互斥仍然成立。
+        self._gen_lock = threading.RLock()
         if load_at_init:
             self.load()
 
