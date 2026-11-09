@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "训练器（python -m tinyinfer.tune）扫出来的最优参数，按机器指纹分组。",
+    "",
+    "这个文件的作用是**冷启动**：新机器第一次起来时规划器不再从推断值开始猜，",
+    "而是先找有没有同一类机器的历史最优；命中了就直接用，没命中才走推断 + 实测。",
+    "",
+    "为什么需要它：引擎里曾经写死一堆「这台 47GB 笔记本」调出来的常数（6GB 余量、",
+    "0.5 的 pin 比例、16 个读线程），换一台机器就静默地不对 —— 表现为「明明有",
+    "300GB 内存却只用了 32GB」。这些数应该由训练器实测得出，而不是由人拍。",
+    "",
+    "字段说明：",
+    "  key        机器指纹（GPU 名 + 显存 + RAM + OS），tune 自动生成",
+    "  measured   这次训练实测到的数据（带宽、各候选的吞吐），留着做回归对比",
+    "  chosen     训练器选定的参数，规划器冷启动时直接用这几个",
+    "  note       这条记录是在什么条件下得到的，方便以后判断还能不能用"
+  ],
+  "version": 1,
+  "entries": {
+    "gpu=NVIDIA_GeForce_RTX_5060_Laptop_GPU|vram=7G|ram=47G|os=win32": {
+      "key": "gpu=NVIDIA_GeForce_RTX_5060_Laptop_GPU|vram=7G|ram=47G|os=win32",
+      "model": "DeepSeek-V4.1-Flash-1017",
+      "ts": "2026-11-09T13:02:00",
+      "measured": {
+        "baseline": {
+          "step_ms": 2437.9,
+          "read_gb": 2.049
+        },
+        "pin_0.3": {
+          "step_ms": 2585.9,
+          "read_gb": 1.987
+        },
+        "pin_0.5": {
+          "step_ms": 2613.3,
+          "read_gb": 1.88
+        },
+        "pin_0.7": {
+          "step_ms": 2573.6,
+          "read_gb": 2.2
+        },
+        "pin_1.0": {
+          "step_ms": 2497.6,
+          "read_gb": 2.024
+        },
+        "best_step_ms": 2437.9
+      },
+      "chosen": {
+        "pin_ratio": 0.5,
+        "read_threads": 16
+      }
+    }
+  }
+}

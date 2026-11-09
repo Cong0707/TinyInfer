@@ -220,18 +220,54 @@ def save(model_dir: str | Path, result: dict) -> None:
 
 
 def calibrate(model_dir: str | Path, *, force: bool = False, quick: bool = True) -> dict:
-    """跑一遍标定（有缓存就直接用）。"""
+    """跑一遍标定（有缓存就直接用）。
+
+    冷启动有三级，越靠前越便宜：
+
+      1. **训练结果**（tuned.json）：这台机器以前扫描过，直接用当时选定的参数。
+         这是「冷启动规划性能」的来源 —— 新机器第一次起来就能拿到经验值，
+         而不是先跑一套很差的配置再慢慢调整。
+      2. **本机缓存**（calibration.json）：同一台机器上一次启动的实测结果。
+      3. **现场实测**：都没有才真的去测（本机约 1.2s），测完缓存起来。
+
+    现场实测永远只测「便宜且必要」的项。要扫参数组合用 tinyinfer.tune，
+    那个是分钟级的，离线跑、结果进 tuned.json。
+    """
+    res: dict = {"cached": False, "ts": time.time()}
+    # 1) 训练器固化的结果优先
+    _tuned = None
+    try:
+        from .tune import lookup as _lookup
+
+        _tuned = _lookup(model_dir)
+    except Exception:
+        _tuned = None
+    if _tuned:
+        res["source"] = "tuned"
+        if _tuned.get("read_threads"):
+            res["read_threads"] = int(_tuned["read_threads"])
+        if _tuned.get("pin_ratio") is not None:
+            res["pin_ratio"] = float(_tuned["pin_ratio"])
     if not force:
         cached = load(model_dir)
         if cached:
             cached["cached"] = True
+            if _tuned:
+                cached["source"] = "tuned"
+                # 训练结果里有的项以训练结果为准（它是扫参选出来的，比单次实测稳）
+                for k in ("read_threads", "pin_ratio"):
+                    if _tuned.get(k) is not None:
+                        cached[k] = _tuned[k]
             return cached
-    res: dict = {"cached": False, "ts": time.time()}
+    # 2) 现场实测
+    res.setdefault("source", "measured")
     res.update(measure_disk(model_dir))
     if quick:
         tr = tune_read_threads(model_dir)
-        res["read_threads"] = tr.get("threads")
         res["read_threads_measured"] = tr.get("measured")
+        # 已经有训练结果就不覆盖它：训练是扫多组取最优，单次实测只是验证
+        if not res.get("read_threads"):
+            res["read_threads"] = tr.get("threads")
     try:
         save(model_dir, res)
     except Exception:

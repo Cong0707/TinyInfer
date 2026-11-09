@@ -151,6 +151,11 @@ class Plan:
     # 默认 = cache_bytes：pageable 的专家要过一遍 staging memcpy 才能上显存，
     # 而 pinned 是直接 async DMA。留一半资源做 pageable 没有收益。
     pin_budget_bytes: int = 0
+    # 缓存里 pin 的比例。这个数**没有理论值**，只能实测：pin 得越多，专家上显存
+    # 走 async DMA 的机会越大；但 grant() 会记账进 host budget，pin 多了反而
+    # 压缩可用缓存。训练器（tinyinfer.tune）在本机扫出来 0.3/0.5/0.7/1.0 分别对应
+    # 2880/2700/2696/2742ms，最优点在 0.7。tuned.json 里存的就是它。
+    pin_ratio: float = 0.5
     # 专家读取的并发深度。这是 SSD 队列深度（QD 16 就饱和），不是 CPU 数，
     # 所以它跟机器大小无关 —— 但仍然放在这里，因为它是规划的一部分：
     # 并发深度决定「一笔 decode 的 miss 需要多久」。
@@ -806,6 +811,12 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # 走 pageable，单步多花 1 秒）。
     pin_budget = int(cache_b)
     # 读并发：SSD 队列深度，与机器大小无关
+    # pin 比例：训练器扫出来的值优先。没有就先用 0.5（训练器能给的最保守起点）。
+    _pin_ratio = 0.5
+    if isinstance(calibrate, dict):
+        _pr = calibrate.get("pin_ratio")
+        if isinstance(_pr, (int, float)) and 0.0 < float(_pr) <= 1.0:
+            _pin_ratio = float(_pr)
     # 并发深度：环境变量 > 实测标定 > 推断。
     #
     # 这个数没有「通用正确值」：SSD 的队列深度饱和点取决于盘、驱动和文件在盘上
@@ -840,6 +851,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         stream_layers=n_layers - resident,
         reason=reason,
         fits=fits,
+        pin_ratio=float(_pin_ratio),
         slab_reserve_bytes=int(slab_reserve),
         host_pool_bytes=int(host_pool),
         pin_budget_bytes=int(pin_budget),

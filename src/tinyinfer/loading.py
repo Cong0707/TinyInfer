@@ -3522,7 +3522,8 @@ class ExpertStore:
             #
             # 也就是说 pin 预算不是「越多越好」，它和缓存容量共享同一个 budget，
             # 两者存在一个实际的最优点。0.5 是当前实测最优点，改它之前先测。
-            max_pinned_bytes = _hb().grant(int(cache_bytes * 0.5))
+            _pr = float(getattr(_plan_hint, "pin_ratio", 0.5) or 0.5)
+            max_pinned_bytes = _hb().grant(int(cache_bytes * _pr))
         self.ram = ExpertCache(self.index, self.reader, cache_bytes, policy,
                                max_pinned_bytes=max_pinned_bytes,
                                pin_budget_bytes=max_pinned_bytes,
