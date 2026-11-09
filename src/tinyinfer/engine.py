@@ -339,10 +339,43 @@ class Engine:
                                                           False)))
             except Exception:
                 _prof = None
+            # ---- 配置：先读，没有就生成 ----
+            #
+            # 「启动时根据经验公式生成默认参数写成配置」——这里是那一步的落点。
+            # 配置里已有的参数优先于公式；没有的才让公式算。
+            _cfg = None
+            try:
+                from . import config as _cfgmod
+
+                _cfg = _cfgmod.params(source_path)
+            except Exception:
+                _cfg = None
+            _cal = dict(getattr(self, "_calib", None) or {})
+            if _cfg:
+                # 配置里的 expert_slots 直接约束规划器的输出
+                if _cfg.get("expert_slots") is not None:
+                    _cal["expert_slots"] = int(_cfg["expert_slots"])
+                for _k in ("pin_ratio", "read_threads", "pool_ratio", "runtime_gb"):
+                    if _cfg.get(_k) is not None:
+                        _cal[_k] = _cfg[_k]
             # speculation reserves its draft stages up front (tier 2 is the default)
             self.hw_plan = _hw_plan(None, self.cfg.n_layers, model=_prof,
-                                    calibrate=getattr(self, "_calib", None),
+                                    calibrate=_cal,
                                     speculation=bool(getattr(self.tier, "mtp", False)))
+            # 把公式算出来的值写回配置（source=formula），下次启动就有据可依；
+            # 已有实测值时不要用公式覆盖它。
+            try:
+                from . import config as _cfgmod
+
+                if _cfgmod.get_model(source_path).get("source") != "measured":
+                    _cfgmod.update(source_path, {
+                        "expert_slots": int(self.hw_plan.expert_slots),
+                        "pin_ratio": float(self.hw_plan.pin_ratio),
+                        "read_threads": int(self.hw_plan.read_threads),
+                        "resident_layers": int(self.hw_plan.gpu_layers),
+                    }, source="formula")
+            except Exception:
+                pass
         else:
             self.hw_plan = None
         if self.hw_plan is not None:

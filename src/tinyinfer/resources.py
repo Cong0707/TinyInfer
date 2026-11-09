@@ -643,6 +643,16 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     else:
         slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
         slots = max(slots, 2) if has_gpu else 0
+    # 配置里明确给了槽位数就用它 —— 那是训练器或运行时实测出来的值，
+    # 比公式按字节数估的更可信（公式不知道「显存吃到零余量会静默算错」）。
+    # 但不超过公式能装下的上限：配置可能来自一台显存更大的机器。
+    if calibrate and calibrate.get('expert_slots') is not None and has_experts:
+        try:
+            _want = int(calibrate['expert_slots'])
+            _cap = max(2, int(spare * SLOT_FRACTION // max(1.0, expert_b)))
+            slots = max(1, min(_want, _cap))
+        except (TypeError, ValueError):
+            pass
 
     # ---- expert coverage beats a device-resident table ---------------------------
     # A token can route to topk*n_layers distinct experts. Once the slot pool covers
@@ -710,6 +720,13 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
                                               slot_bytes=_sb))
             _spare = max(0.0, V - _used_with(_r, embed_gpu, head_gpu))
             _s = int(_spare * SLOT_FRACTION // max(1.0, expert_b))
+            # 配置明确要求的槽位数要穿过这个迭代 —— 否则上面那次 min() 白做，
+            # 迭代会把 slots 重新算成公式值（实测 slots=4/8 都变成 7）。
+            if calibrate and calibrate.get('expert_slots') is not None:
+                try:
+                    _s = max(1, min(int(calibrate['expert_slots']), max(2, _s)))
+                except (TypeError, ValueError):
+                    pass
             if _r == resident and _s == slots:
                 break
             resident, slots = _r, max(0, _s)

@@ -248,6 +248,25 @@ def calibrate(model_dir: str | Path, *, force: bool = False, quick: bool = True)
             res["read_threads"] = int(_tuned["read_threads"])
         if _tuned.get("pin_ratio") is not None:
             res["pin_ratio"] = float(_tuned["pin_ratio"])
+        # **布局（槽位数 / 驻留层数）也要读回来 —— 这是训练器的主要产出。**
+        #
+        # 原来这里只取 read_threads 和 pin_ratio，而 tune.py 的 tune_layout()
+        # 扫出来的 chosen.layout 里有 slots/resident，规划器却从来看不到它。
+        # 结果是训练器扫一整轮、写进 tuned.json、下次启动规划器照旧按公式算 ——
+        # 「下次启动用训练结果」这条链在最后一米断了。
+        _layout = _tuned.get("layout") or {}
+        if isinstance(_layout, dict):
+            _env = _layout.get("env") or {}
+            for _k, _dst in (("TI_SLOTS", "expert_slots"),
+                             ("TI_RESIDENT", "resident_layers")):
+                _v = _env.get(_k)
+                if _v is None:
+                    _v = _layout.get(_dst)
+                try:
+                    if _v is not None:
+                        res[_dst] = int(_v)
+                except (TypeError, ValueError):
+                    pass
     if not force:
         cached = load(model_dir)
         if cached:
