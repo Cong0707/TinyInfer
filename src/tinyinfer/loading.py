@@ -2150,6 +2150,8 @@ class VramSlotCache:
         self._copy_stream: Any = None
         self._copy_events: list[Any] = []
         self._state = [self.FREE] * self.slots
+        # 冷度时间戳：越小越冷。选 victim 用它，而不是游标轮转。
+        self._last_used = [0.0] * self.slots
         self._key: list[tuple[int, int] | None] = [None] * self.slots
         self._refs = [0] * self.slots
         self._event: list[Any] = [None] * self.slots
@@ -2159,6 +2161,8 @@ class VramSlotCache:
         # 只有这些槽位在下次 DMA 覆盖前需要 wait；用 _event 不行，那个字段每个
         # 槽位都有值（publish 时写的），等于每次拷贝都插一个跨 stream 同步点。
         self._dirty: set[int] = set()
+        # 冷度时间戳（见 _claim_slot_locked）：每个槽位最后一次被用到是什么时候。
+        self._last_used: list[float] = []
         # 覆盖式分配：空槽位按 LIFO 取，取空之后环形游标扫一个「没人在用」的
         # 直接覆盖。这里刻意没有「释放」这个动作 —— 槽位在池子里转，覆盖即回收。
         # decode 稳态只要 40x6=240 个槽位，池子按 1359 开，绝大多数时候是 O(1)
@@ -2252,6 +2256,8 @@ class VramSlotCache:
                     # 此刻是第一次分配（_ensure 只会走到这里一次），它们都还是初始
                     # 状态，直接重开即可。
                     self._state = [self.FREE] * self.slots
+                    # 冷度时间戳：越小越冷。选 victim 用它，而不是游标轮转。
+                    self._last_used = [0.0] * self.slots
                     self._key = [None] * self.slots
                     self._refs = [0] * self.slots
                     self._event = [None] * self.slots
@@ -2343,6 +2349,8 @@ class VramSlotCache:
                 if len(_per) == 1:
                     self.slots = len(self._buffers)
                     self._state = [self.FREE] * self.slots
+                    # 冷度时间戳：越小越冷。选 victim 用它，而不是游标轮转。
+                    self._last_used = [0.0] * self.slots
                     self._key = [None] * self.slots
                     self._refs = [0] * self.slots
                     self._event = [None] * self.slots
@@ -2418,6 +2426,8 @@ class VramSlotCache:
                 self.slots = max(1, int(getattr(self, "_planner_slots", 0) or 1359))
                 self._buffers, self._arena = [], None
                 self._state = [self.FREE] * self.slots
+                # 冷度时间戳：越小越冷。选 victim 用它，而不是游标轮转。
+                self._last_used = [0.0] * self.slots
                 self._key = [None] * self.slots
                 self._refs = [0] * self.slots
                 self._event = [None] * self.slots
@@ -2725,9 +2735,13 @@ class VramSlotCache:
             self._event[idx] = ev
             done.append(idx)
         with self._lock:
+            _now = time.perf_counter()
             for idx in done:
                 if self._state[idx] in (self.RESERVED, self.IN_USE):
                     self._state[idx] = self.STAGED
+                # 刚装进来的就是最热的，刷新冷度时间戳。
+                if idx < len(self._last_used):
+                    self._last_used[idx] = _now
                 self._stage_bufs.pop(idx, None)
             for idx in failed:
                 self._evict_locked(idx)
@@ -2742,6 +2756,95 @@ class VramSlotCache:
         n = self.stage(layer, experts, loader)
         placed = self.commit(layer)
         return n, placed
+
+    def try_grow(self) -> int:
+        """模型完全就位之后，把槽位池扩到这块卡此刻允许的上限。
+
+        **这是「显存尽可能占满」的落地点，而它以前只存在于注释里。**
+        第 2234 行写着「真正的自动扩容在模型就位之后由 try_grow() 完成」，
+        但那个函数从来没被写过 —— 于是槽位永远停在 planner 的保守值
+        （本机 24 个 / 451MB），显存里一多半是空的，而每步要搬两百多个专家。
+
+        为什么不在 _ensure 里顺手做：_ensure 可能在任何一次 fetch 时被触发，
+        那时层权重还没全上显存，mem_get_info 报的 free 偏大（实测按它算出
+        1823 个槽位，随后模型加载直接 OOM）。所以扩容必须等权重全部就位之后，
+        由一个明确的调用点发起。
+
+        **策略是「试到失败」，不是「估算减去一个余量」。**
+        估算要留多少 MB、要不要按比例，每台机器都不一样，写哪个数都会在
+        某类机器上错（写 512MB 在 96GB 卡上白留，在 4GB 卡上又不够）。
+        直接按 free 申请，失败就回退到上一个能成功的数量 —— 这是唯一不需要
+        在代码里写机器常数的做法。成功后的值由训练器记进 tuned.json，
+        下次冷启动直接拿到，不用再试。
+        """
+        import torch as _t
+
+        if not getattr(self, "_buffers", None):
+            return 0
+        _prev = int(self.slots)
+        try:
+            _devs = list(getattr(self, "devices", None) or [self.device])
+            _dev0 = _t.device(_devs[0])
+            _free, _total = _t.cuda.mem_get_info(_dev0)
+        except Exception:
+            return 0
+        # free 里要先划出**运行期真正会临时申请的**那部分，再谈槽位。
+        #
+        # 这个数不是猜的：规划器已经算过 workspace（ws0）和各阶段临时区，
+        # 引擎把它放在 _vram_reserve_bytes 上。全拿走 free 的后果是实测过的：
+        # try_grow 成功建起 arena，随后第一次 forward 就在 activation 上
+        # CUDA OOM —— 因为 allocator 一点余量都没有了。
+        #
+        # 如果调用方没给这个数，就用 blob 的整数倍留一格（至少一格槽位的空间），
+        # 这是运行期临时区的最小合理假设。
+        _reserve = int(getattr(self, "_vram_reserve_bytes", 0) or 0)
+        if _reserve <= 0:
+            _reserve = int(self.blob_bytes)
+        _usable = int(_free) - _reserve
+        if _usable <= 0:
+            return 0
+        _want = int(_usable // max(1, self.blob_bytes))
+        if _want <= _prev + 7:
+            return 0     # 涨不到 8 个就不折腾：重建本身有成本
+        print("[slots] try_grow: free=%.2fGB -> want %d slots (now %d)"
+              % (_free / 2**30, _want, _prev), flush=True)
+        # 从 want 开始，失败就按固定比例递减，直到能建起来或者不划算
+        _try = _want
+        while _try > _prev:
+            _bufs, _arena, _ok = [], [], False
+            try:
+                _left = int(_try)
+                while _left > 0:
+                    _take = min(32, _left)
+                    _a = _t.empty((_take, self.blob_bytes),
+                                  dtype=self._dtype or _t.uint8, device=_dev0)
+                    _arena.append(_a)
+                    for _k in range(_take):
+                        _bufs.append(_a[_k])
+                    _left -= _take
+                _ok = True
+            except Exception:
+                _bufs, _arena = [], []
+                try:
+                    _t.cuda.empty_cache()
+                except Exception:
+                    pass
+            if _ok:
+                with self._lock:
+                    self.slots = int(_try)
+                    self._buffers = _bufs
+                    self._arena = _arena
+                    self._state = [self.FREE] * self.slots
+                    self._key = [None] * self.slots
+                    self._refs = [0] * self.slots
+                    self._event = [None] * self.slots
+                    self._last_used = [0.0] * self.slots
+                    self._by_key.clear()
+                print("[slots] grew %d -> %d" % (_prev, self.slots), flush=True)
+                return int(self.slots - _prev)
+            _try = int(_try * 0.85)
+        print("[slots] try_grow gave up above %d" % _prev, flush=True)
+        return 0
 
     def _claim_slot_locked(self, *, protect_urgent: bool = False,
                            want_layer: int = -1) -> int | None:
@@ -2780,8 +2883,23 @@ class VramSlotCache:
         #   3. 本层但已算完的（非 urgent）
         #   4. 兜底：urgent 也抢（否则池子一到紧急状态就整个卡死）
         # 「本层不抢自己」是关键：一层 6 个专家互相顶掉就是 hits=0 的直接原因。
+        # **按「最冷」选 victim，不是按游标轮转。**
+        #
+        # 槽位的语义是两条互斥的队列：
+        #   demand（_urgent）  GPU 这层要用的，绝不能被换出
+        #   cold              GPU 已消费、短期不打算再用的，CPU 从最冷的开始换
+        # 一个 (layer, expert) 同时出现在两边就说明它其实不冷 —— 那是 bug，
+        # 所以下面每一轮都先排除 _urgent，最后一档兜底才允许动它（并计数）。
+        #
+        # 「最冷」用 _last_used 时间戳判断：每次命中或装入都刷新它。选本轮窗口
+        # 内时间戳最小的那个，窗口从游标位置起限长 _SCAN，保证每层是 O(1) 而不是
+        # O(slots)（池子 1359 个时全池扫是每层一千多次解释器迭代，那正是当年改成
+        # 游标的原因；但纯游标丢掉了「冷」这个判据，退化成谁先到谁被换）。
+        _SCAN = min(n, 64)
         for mode in ("other", "stale", "any"):
-            for k in range(n):
+            _best_i = -1
+            _best_t = None
+            for k in range(_SCAN):
                 i = self._cur + k
                 if i >= n:
                     i %= n
@@ -2805,8 +2923,13 @@ class VramSlotCache:
                     # 这里记下次数，让上层能知道「这一层可能算歪了」。
                     if i in self._urgent:
                         self.urgent_evictions += 1
-                self._cur = (i + 1) % n
-                return i
+                # 冷度：时间戳越小越冷（None 视为最冷，从没被访问过）
+                _t = self._last_used[i] if i < len(self._last_used) else None
+                if _best_t is None or _t is None or (_t is not None and _t < _best_t):
+                    _best_i, _best_t = i, _t
+            if _best_i >= 0:
+                self._cur = (_best_i + 1) % n
+                return _best_i
         return None
 
 

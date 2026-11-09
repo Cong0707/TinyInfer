@@ -795,8 +795,11 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     _ram_avail = float(getattr(hw, "ram_avail_gb", 0) or 0) * GB
     _ram_total = float(getattr(hw, "ram_gb", 0) or 0) * GB
     if _ram_avail > 0:
-        # 留 15% 给加载期临时、python/torch 自身和非池化的小对象
-        host_pool = int(max(0.0, _ram_avail - _ram_avail * 0.15))
+        # **全给池子，不减余量。** 加载期临时、torch 自身那些开销由 claim()
+        # 的失败路径兜底（拿不到就缩）。预设 15% 在 47GB 上是 7GB、在 371GB
+        # 上是 55GB，两个数都没有依据，而且会让「这台机器能用多少」变成
+        # 一个写死的猜测。
+        host_pool = int(_ram_avail)
     elif _ram_total > 0:
         host_pool = int(max(0.0, _ram_total * 0.5))
     else:

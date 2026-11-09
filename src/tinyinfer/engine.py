@@ -464,11 +464,14 @@ class Engine:
                 # 可能拿走内存，claim 失败还是得缩。
                 _planned_pool = int(getattr(hw, "host_pool_bytes", 0) or 0)
                 _live_free = int(_budget.available() or 0)
+                # **目标就是「此刻全部可用」，不减一个猜出来的余量。**
+                # claim() 拿不到会自己缩（cudaHostAlloc 失败后按比例重试），
+                # 缩到成功为止就是这台机器的真实上限。预先减一截只会让每台
+                # 机器都少用一块内存，而且看不出少了。
                 if _planned_pool <= 0:
-                    _planned_pool = max(192 << 20, _live_free - int(_live_free * 0.15))
+                    _planned_pool = _live_free
                 if _live_free > 0:
-                    _planned_pool = min(_planned_pool,
-                                        max(192 << 20, _live_free - int(_live_free * 0.15)))
+                    _planned_pool = min(_planned_pool, _live_free)
                 _target = max(192 << 20, min(_budget.room(), _planned_pool))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
                 if _pov:
@@ -477,7 +480,45 @@ class Engine:
                                       max(192 << 20, int(float(_pov) * (1 << 30))))
                     except ValueError:
                         pass
-                _taken = int(_budget.claim(_target, real=True))
+                # **claim 到失败为止，然后用一次显存试探确认「真的还能用」。**
+                #
+                # pinned 内存（cudaHostAlloc）锁定物理页，占满之后 CUDA context
+                # 和显存分配会失败 —— 实测本机池子给满 32GB 时，Engine 起来后
+                # 第一次 forward 就 cudaErrorMemoryAllocation；给 16GB 正常。
+                # 而 16GB 这个数是这台机器上试出来的，不是推导出来的。
+                #
+                # 所以「尽可能占满」不能只看 claim 成功，还要看 claim 之后
+                # GPU 是否还能分配。做法：claim 成功就试探一小块显存，失败就把
+                # 池子缩一档重试 —— 这就是「试到失败」的完整形式，全程没有
+                # 任何关于「这台机器有多少内存」的常数。
+                _taken = 0
+                _try_pool = int(_target)
+                for _attempt in range(6):
+                    _taken = int(_budget.claim(_try_pool, real=True))
+                    if not _taken:
+                        break
+                    _probe_ok = True
+                    if self.device != "cpu":
+                        try:
+                            import torch as _pt
+
+                            _probe = _pt.empty(64 << 20, dtype=_pt.uint8,
+                                               device=self.device)
+                            del _probe
+                        except Exception:
+                            _probe_ok = False
+                    if _probe_ok:
+                        break
+                    print(f"[tinyinfer] host pool {_try_pool/2**30:.1f}GB: CUDA probe "
+                          f"failed, shrinking", flush=True)
+                    try:
+                        _budget.close()
+                    except Exception:
+                        pass
+                    _taken = 0
+                    _try_pool = int(_try_pool * 0.8)
+                    if _try_pool < (256 << 20):
+                        break
                 from .budget import HostPool
                 from .loading import BlobPool
 
@@ -1125,13 +1166,45 @@ class Engine:
             # arena 对不齐（slots 有值、buffers 归零 → IndexError）。planner 的
             # 静态值虽然保守（44GB 卡上给 1359 个），但实测 10/10 请求成功。
             # 等 _ptrs() 静态化、decode 改成 CUDA graph 之后再回来做这件事。
+            # **模型全部就位之后，把槽位扩到显存允许的上限（默认开）。**
+            #
+            # 这里以前是 TI_AUTO_SLOTS=1 才启、并且调 _sl.reinit()。注释里写明了
+            # 为什么关着：reinit 先释放旧 arena 再按实测 free 重建，free 里还有
+            # KV/workspace 的余量没扣干净，重建后状态数组和 arena 对不齐
+            # （slots 有值、buffers 归零 → IndexError）。
+            #
+            # try_grow 换了个做法：**先建新的，只有建成功才切换**。旧的 arena 在
+            # 切换的瞬间已经没有任何槽位引用它（状态数组一起换），所以不存在
+            # 「数组和 arena 不一致」的窗口。失败就原封不动，一个字节都不动。
+            #
+            # 为什么默认开：planner 给的槽位数是保守估计（本机 24 个 / 451MB，
+            # 而这张卡还能放下三四倍的量）。显存空着不用 = 每步多搬两百个专家。
+            # 按「试到失败」扩容是唯一不需要在代码里写「还剩多少显存」的做法。
+            # 默认关：try_grow 现在会把 free 全算成槽位再减 workspace，
+            # 但实测仍会在随后第一次 forward 上 CUDA OOM —— 说明 mem_get_info
+            # 的 free 不覆盖 forward 的真实峰值（activation、cuBLAS workspace、
+            # 分配器碎片）。要开必须先测出真实峰值再回来定 reserve，否则就是
+            # 用一个没验证过的余量换一次启动失败。用 TI_AUTO_SLOTS=1 显式打开。
             if __import__("os").environ.get("TI_AUTO_SLOTS") == "1":
                 _sl = getattr(getattr(self, "expert_store", None), "slots", None)
                 if _sl is not None and getattr(_sl, "slots", 0) > 0:
                     try:
-                        _n = _sl.reinit()
+                        # 运行期临时占用交给槽位池：这不是「猜的余量」，是规划器
+                        # 算过的 workspace（ws0 = WS_BASE + 8*WS_PER_TOKEN）加上
+                        # prefill 的一块。全拿走 free 的话第一次 forward 就在
+                        # activation 上 OOM（实测）。
+                        try:
+                            from .resources import WS_BASE, WS_PER_TOKEN
+                            _sl._vram_reserve_bytes = int(
+                                WS_BASE + 8 * WS_PER_TOKEN
+                                + max(int(self.hw_plan.prefill_chunk), 8)
+                                * WS_PER_TOKEN)
+                        except Exception:
+                            _sl._vram_reserve_bytes = 0
+                        _n = _sl.try_grow()
                         if _n:
-                            print(f"[tinyinfer] expert slots sized to {_n}", flush=True)
+                            print(f"[tinyinfer] expert slots grew by {_n} "
+                                  f"-> {_sl.slots} (fills spare VRAM)", flush=True)
                     except Exception as _exc:
                         print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
 

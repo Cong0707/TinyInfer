@@ -499,7 +499,12 @@ class HostBudget:
         if reserve_gb is not None:
             self.reserve = int(float(reserve_gb) * GB)
         else:
-            self.reserve = max(3 * GB, int(self.total * 0.15)) if self.total else 3 * GB
+            # **不预留。** 这个池子是「进程申请下来、自己切分」的，申请量本来就
+            # 由 claim() 的成败决定：cudaHostAlloc 拿不到就自动缩 10% 再试，
+            # 一直缩到能成功为止。再叠加一个 15% 的预备量只会让每台机器都少
+            # 用一块内存 —— 47GB 的机器上白扔 7GB，371GB 的机器上白扔 55GB，
+            # 而那个数没有任何依据，纯属「留一点心里踏实」。
+            self.reserve = 0
         # what this process may hand out in total (weights + slab + expert cache)
         self.limit = max(0, self.total - self.reserve)
         # **再夹一次「此刻真的能用」。**
@@ -510,9 +515,12 @@ class HostBudget:
         # 比读盘还慢，而且大块 cudaHostRegister 会直接失败。
         #
         # 只在这个方向夹：available 更大时不抬上限（那是页缓存的浮动，不该让计划跟着飘）。
+        # 不再按「可用减 6GB」夹。那种常数在每台机器上都错：47GB 的机器上
+        # 减 6GB 只剩一点，371GB 的机器上减 6GB 又几乎没约束。
+        # claim() 自己会处理失败（cudaHostAlloc 缩 10% 重试），那才是可靠的边界。
         _av = self.available()
         if _av:
-            self.limit = min(self.limit, max(0, int(_av) - (6 << 30)))
+            self.limit = min(self.limit, int(_av))
         if os.environ.get("TI_RAM_FRACTION"):
             self.limit = int(self.total * float(os.environ["TI_RAM_FRACTION"]))
         self.granted = 0
