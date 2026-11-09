@@ -2290,22 +2290,42 @@ class VramSlotCache:
                         if len(_per) == 1:
                             _n = max(0, _try)
                             if _n > 0:
-                                _a = torch.empty((_n, self.blob_bytes), dtype=dtype,
-                                                 device=_devs[0])
-                                self._arena.append(_a)
-                                for _s in range(_n):
-                                    self._buffers.append(_a[_s])
-                                    self._slot_dev.append(0)
+                                # **分多块，不要一次 torch.empty 一大块。**
+                                #
+                                # 单块申请在超过约 1GB 时会撞上 PyTorch allocator 的
+                                # "!handles_.at(i) INTERNAL ASSERT FAILED"（c10 分配器
+                                # 状态断言），而显存其实够 —— 实测 180/200/240 个槽位
+                                # （3.4/3.8/4.5GB 单块）全部失败，24 个（451MB）正常。
+                                #
+                                # 分块没有代价：槽位本来就是按行独立索引的
+                                # （_buffers 里存的是每行视图），谁来装数据都一样。
+                                # 每块 32 个槽位（约 600MB），远在安全线内。
+                                _CHUNK = 32
+                                _left = _n
+                                while _left > 0:
+                                    _take = min(_CHUNK, _left)
+                                    _a = torch.empty((_take, self.blob_bytes), dtype=dtype,
+                                                     device=_devs[0])
+                                    self._arena.append(_a)
+                                    for _s in range(_take):
+                                        self._buffers.append(_a[_s])
+                                        self._slot_dev.append(0)
+                                    _left -= _take
                         else:
                             for _i, _n in enumerate(_per):
                                 if _n <= 0:
                                     continue
-                                _a = torch.empty((_n, self.blob_bytes), dtype=dtype,
-                                                 device=_devs[_i])
-                                self._arena.append(_a)
-                                for _s in range(_n):
-                                    self._buffers.append(_a[_s])
-                                    self._slot_dev.append(_i)
+                                _CHUNK = 32
+                                _left = _n
+                                while _left > 0:
+                                    _take = min(_CHUNK, _left)
+                                    _a = torch.empty((_take, self.blob_bytes), dtype=dtype,
+                                                     device=_devs[_i])
+                                    self._arena.append(_a)
+                                    for _s in range(_take):
+                                        self._buffers.append(_a[_s])
+                                        self._slot_dev.append(_i)
+                                    _left -= _take
                         if self._buffers:
                             break
                         raise RuntimeError("no slot arena could be allocated")
@@ -2480,10 +2500,26 @@ class VramSlotCache:
         if cpu.dtype != buf.dtype:
             cpu = cpu.view(buf.dtype)
         if idx in self._dirty:
-            # 这一格刚被别人交还，可能还有 kernel 在读：DMA 改走 compute stream
-            # 的同步拷贝，靠 stream 内顺序排在上一个 kernel 后面。不建 event。
+            # 这一格刚被别人交还，可能还有 kernel 在读。
+            #
+            # **但不能用 non_blocking=False。** 那个参数的含义是「主机阻塞到拷贝
+            # 完成」，不是「排在前面 kernel 的后面」。在同一个 stream 上发的
+            # 异步拷贝本来就按提交顺序执行，所以正确做法是：发 async copy，让
+            # stream 自己保证顺序，主机立刻返回。
+            #
+            # 原来写同步拷贝，理由是「靠 stream 内顺序排在上一个 kernel 后面」——
+            # 顺序确实有，但代价是每步 240 次装载里有一部分要串行等 18.8MB 的
+            # 显存写入（每次约 2.4ms）。cProfile 里 _copy_blocking 4 步累计
+            # 2.30s，就是这一条。
             self._dirty.discard(idx)
-            buf.copy_(cpu, non_blocking=False)
+            _cs = self.slot_stream(idx) if hasattr(self, "slot_stream") else self._copy_stream
+            if _cs is not None:
+                ev = torch.cuda.Event()
+                with torch.cuda.stream(_cs):
+                    buf.copy_(cpu, non_blocking=True)
+                    ev.record(_cs)
+                return ev
+            buf.copy_(cpu, non_blocking=True)
             return None
         # prefetch thread uses the second staging buffer so it never blocks a fetch copy
         use_b = threading.current_thread().name.startswith("vram-prefetch")

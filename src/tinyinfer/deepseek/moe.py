@@ -608,8 +608,19 @@ class MoE:
                           f"blob={getattr(sl, 'blob_bytes', '?')} exc={_exc!r}", flush=True)
         tab = getattr(sl, "_slot_tab", None) if sl is not None else None
         arena = getattr(sl, "_arena", None) if sl is not None else None
-        if not arena or len(arena) != 1:
-            self._gpu_fail = "line 375"
+        # **arena 现在是多块的，判据从「恰好一块」改成「有块且每块都在」**
+        #
+        # 槽位池原先一次性 torch.empty((n, blob)) 申请；超过约 1GB 会撞上 c10 的
+        # "!handles_.at(i) INTERNAL ASSERT FAILED"，于是 180/200/240 个槽位全部
+        # 建不起来，而显存其实够。现在按每块 32 个槽位分多块申请。
+        #
+        # 这条判断原来写的是 len(arena) != 1，分块之后恒为真，于是每个 MoE 层
+        # 都立刻退化成 "pure-GPU path unavailable [line 375]" —— 分块本身是对的，
+        # 是这里把「一块」当成了「槽位池存在」的同义词。
+        _arena_ok = bool(arena) and all(a is not None for a in arena)
+        if not _arena_ok or not getattr(sl, "_buffers", None):
+            self._gpu_fail = "line 375 (arena unusable: %d blocks, %d buffers)" % (
+                len(arena or []), len(getattr(sl, "_buffers", []) or []))
             return None
         if tab is None:
             # 表是懒建的。warmup 阶段还没有路由统计，先建全 -1，miss 分支会填。
