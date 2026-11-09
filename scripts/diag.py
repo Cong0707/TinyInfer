@@ -77,11 +77,14 @@ def main(argv=None) -> int:
     with torch.inference_mode():
         eng.forward(ids, 0)
         torch.cuda.synchronize()
-        _pos = int(ids.shape[1])
+        # 预热：每步都要 reset()，位置才和实际 KV 长度一致。
+        # 不 reset 的话第二次 forward 的 start_pos 会和内部已写位置错开。
         for _ in range(a.warmup):
-            eng.forward(torch.tensor([[7]], device="cuda"), _pos)
+            if hasattr(eng, "reset"):
+                eng.reset()
             torch.cuda.synchronize()
-            _pos += 1
+            eng.forward(ids, 0)
+            torch.cuda.synchronize()
         for _ in range(a.steps):
             t0 = time.perf_counter()
             eng.forward(ids, 0)
@@ -90,7 +93,15 @@ def main(argv=None) -> int:
 
         # 正确性：同一输入两次。这是最便宜也最有价值的检查 ——
         # 一个更快的配置如果输出不确定，它的速度数字没有意义。
+        #
+        # **两次之间必须 reset()。** 不 reset 的话第二次 forward 读到的是
+        # 第一次写下的 KV，start_pos 也和实际位置对不上 —— 那测的根本不是
+        # 「同一输入两次」，而是「同一输入接在更长上下文后面」。第一版就是
+        # 这么写的，于是永远报 repeatable=False，把一个正常的引擎判成坏的。
         x = eng.forward(ids, 0)
+        torch.cuda.synchronize()
+        if hasattr(eng, "reset"):
+            eng.reset()
         torch.cuda.synchronize()
         y = eng.forward(ids, 0)
         torch.cuda.synchronize()

@@ -2487,6 +2487,10 @@ class VramSlotCache:
             self._cur = 0
             self._dirty.clear()
             self.slots = n
+        # 和 try_grow 同理：arena 换了一整套新行，device 侧那张表里的槽位号
+        # 已经没有意义了，必须作废，否则内核按旧编号读到未初始化的显存。
+        self._slot_tab = None
+        self._tab_dirty.clear()
         if self.pin_staging:
             try:
                 self._copy_events = [torch.cuda.Event() for _ in range(n)]
@@ -2897,6 +2901,19 @@ class VramSlotCache:
                     self._event = [None] * self.slots
                     self._last_used = [0.0] * self.slots
                     self._by_key.clear()
+                # **device 侧的槽位表必须一起作废。**
+                #
+                # try_grow 重建了 arena：_buffers 全是新行，_by_key 也清空了，
+                # 但 _slot_tab 是另一块显存里的 [n_layers, n_experts] int32，
+                # 里面还写着「专家 X 在第 N 格」—— 重建之后第 N 格是全新的、
+                # 未初始化的行。内核按这张表寻址，读到的就是别人的字节。
+                #
+                # 实测（max_layers=2）：这个函数在第一次 forward 的 finally 里
+                # 扩容 24->65，于是 run0 与 run1..4 不一致、而 run1..4 逐位相同
+                # —— 正是「只有第一次不同」那个指纹。作废之后 5 次全部逐位一致。
+                self._slot_tab = None
+                self._tab_dirty.clear()
+                self._dirty.clear()
                 print("[slots] grew %d -> %d" % (_prev, self.slots), flush=True)
                 return int(self.slots - _prev)
             _try = int(_try * 0.85)
@@ -3081,7 +3098,20 @@ class VramSlotCache:
         return tab
 
     def table_flush(self, layer: int | None = None) -> int:
-        """把排队的槽位号一次刷进 device 表（只在调用方线程的 stream 上）。"""
+        """把排队的槽位号一次刷进 device 表（只在调用方线程的 stream 上）。
+
+        **以池子的 _by_key 为准，pending 只是候选。**
+
+        pending 里的一条 (layer, expert, slot) 只有在「此刻该 key 仍占着
+        slot」时才可写：reserve 之后这个槽位可能已经被 evict 给别人，
+        evict 又把表写成 -1 —— 谁先谁后完全取决于提交顺序，旧的那条会把
+        表复活成一个指向别人字节的编号。实测每层 6~46 条这种陈旧条目，
+        内核按表读到的专家是错的（不报错，只是数值不对）。
+
+        layer 参数保留但**不再用于过滤**：pending 里混着预取路径
+        （need(urgent=False)）为本层之外的层挑的槽位，按层过滤会让它们
+        永远刷不进去，device 表与池子从此长期不一致。
+        """
         if not self._tab_dirty:
             return 0
         tab = getattr(self, "_slot_tab", None)
@@ -3091,10 +3121,19 @@ class VramSlotCache:
         with self._lock:
             pending = self._tab_dirty
             self._tab_dirty = []
+            live = dict(self._by_key)
         n = 0
         for (lay, exp, slot) in pending:
-            if layer is not None and lay != layer:
-                self._tab_dirty.append((lay, exp, slot))
+            cur = live.get((lay, exp))
+            if cur != slot:
+                # 陈旧条目：该 key 已被驱逐（cur 为 None）或被换了槽位。
+                # 驱逐的那种要落一条 -1，否则表里永远留着已失效的编号。
+                if cur is None:
+                    try:
+                        tab[lay, exp] = -1
+                        n += 1
+                    except Exception:
+                        pass
                 continue
             try:
                 tab[lay, exp] = int(slot)
