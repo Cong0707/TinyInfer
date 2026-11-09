@@ -2423,7 +2423,26 @@ class Engine:
                     if not _async_h2d(dst, src, n):
                         dst.copy_(src, non_blocking=True)
         else:
-            buf[:total].copy_(host[layer], non_blocking=True)
+            # **层的 H2D 也要走 _async_h2d，不能用 copy_。**
+            #
+            # 这和槽位装载是同一个坑：host[layer] 是 pool 的切片（cudaHostAlloc
+            # 得来），但 torch 不认它是 pinned，copy_ 会先做一次 pageable memcpy
+            # 到内部 staging 再发 DMA。
+            #
+            # 实测：按层量 GPU 时间，40 层合计 3220ms，每层 20~126ms（平均 80ms），
+            # 而同样一层如果权重已在显存里只要 2.35ms。80ms 传 463MB，折合
+            # 5.8GB/s —— 正好是 pageable 的量级，不是 PCIe 的 26GB/s。
+            # 整个 step 的 2200ms 里绝大部分就是它。
+            _ok = False
+            try:
+                from .loading import _async_h2d as _ah2d
+
+                _ok = bool(_ah2d(buf, host[layer], int(total),
+                                 stream=torch.cuda.current_stream()))
+            except Exception:
+                _ok = False
+            if not _ok:
+                buf[:total].copy_(host[layer], non_blocking=True)
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
             set_weight(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
         if getattr(b, "engram", None) is not None:
