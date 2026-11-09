@@ -2488,7 +2488,15 @@ def create_app(
     # 规模由硬件决定。显式传了 max_slots 就以调用方为准（诊断/压测用）。
     # max_slots <= 0 表示「自己算」；显式传正整数就以调用方为准。
     _slots = int(settings.max_slots)
-    if _slots <= 0 and __import__("os").environ.get("TI_AUTO_SLOTS", "1") != "0":
+    # **变量改名：TI_AUTO_SLOTS 在这里指的是「并发会话槽位数」，和
+    # engine.py 里那个控制「专家显存槽位扩容」的同名变量完全是两回事。**
+    #
+    # 审计（AUDIT-dead-switches.md P0-2）发现同一个环境变量在两个文件里
+    # 默认值相反：engine 那边是 == "1"（默认关），这里是 != "0"（默认开）。
+    # 于是一个人按 engine 的语义设 TI_AUTO_SLOTS=1 想开专家槽位扩容，
+    # 顺带把会话数也强制开了；反之设 0 想关一个，把另一个也关了。
+    # 同名不同义是纯粹的陷阱，改名消除。
+    if _slots <= 0 and __import__("os").environ.get("TI_AUTO_SESSIONS", "1") != "0":
         try:
             from .kv_tiers import plan_slots
 
