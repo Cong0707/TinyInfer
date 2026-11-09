@@ -485,8 +485,13 @@ class Engine:
                     # 运行时分到 7GB，覆盖 KV + activation + dequant 中间量有余。
                     # 它和「这台机器有多少内存」无关（那个才是要删的机器常数），
                     # 描述的是「池子与运行时的比例」。
+                    # 0.6 而不是 0.8：实测 0.8（本机约 28GB）会让 CUDA 报
+                    # cuMemSetAccess OOM 和 !handles_ INTERNAL ASSERT，而
+                    # 18GB 左右稳定。pinned 内存每一块都要在 device 地址空间里
+                    # 建立映射，这个资源和显存容量是两回事，耗尽的症状不是
+                    # 干净的 OOM 而是分配器断言。留 40% 给运行时和映射开销。
                     _planned_pool = min(_planned_pool,
-                                        int(_live_free * 0.8))
+                                        int(_live_free * 0.6))
                     _planned_pool = max(192 << 20, _planned_pool)
                 _target = max(192 << 20, min(_budget.room(), _planned_pool))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
