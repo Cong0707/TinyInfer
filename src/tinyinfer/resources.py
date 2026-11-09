@@ -637,9 +637,12 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             # 之前这里既在 layers_that_fit 里传 slot_bytes、又在外面减 _sb，
             # 槽位被算了两次，24GB 卡从 268 掉到 208（不够覆盖 240 个可路由专家，
             # 直接退化成每 token 有磁盘 IO）。
+            # `layers_that_fit` 内部已经把 slot_bytes 记进 fixed 了，这里再减一次
+            # 就是重复扣减 —— 注释里说 24GB 卡从 268 掉到 208 那次只修了外面，
+            # 里面这一处仍在重复：实测 8GB 卡上表算给出 77 个槽位，最终只有 8 个。
             _r = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0,
                                               slot_bytes=_sb))
-            _spare = max(0.0, V - _used_with(_r, embed_gpu, head_gpu) - _sb)
+            _spare = max(0.0, V - _used_with(_r, embed_gpu, head_gpu))
             _s = int(_spare * SLOT_FRACTION // max(1.0, expert_b))
             if _r == resident and _s == slots:
                 break

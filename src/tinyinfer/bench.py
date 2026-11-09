@@ -35,6 +35,80 @@ def _disk_rate(model_dir: str, mb: int = 512) -> float:
     return total / max(1e-9, time.perf_counter() - t0) / 2**30
 
 
+def _print_breakdown(eng, tok, iters: int = 30) -> None:
+    """单层耗时分解：attn / MoE / hc 各占多少。
+
+    只用**常驻层**（权重已在显存），所以量到的是纯计算，不含读盘和 PCIe。
+    分段由 Block 自己用 CUDA event 记录（model.py 的 self.profile + _parts），
+    这里只负责挑层、跑够次数、取平均。
+    """
+    import torch as _t
+
+    cfg = eng.cfg
+    x = _t.randn(1, 1, cfg.hc_mult, cfg.dim, dtype=_t.bfloat16, device="cuda")
+    pre = _t.rand(1, 1, cfg.hc_mult, dtype=_t.float32, device="cuda")
+
+    # 常驻层 = 注意力权重已经在 device 上的那些；streamed 层的权重还在主机，
+    # 直接跑会把 PCIe 时间算进来，失去「纯计算」的意义。
+    resident = []
+    for _lid in range(eng.max_layers):
+        try:
+            _b = eng.block(_lid)
+            _w = getattr(getattr(_b.attn, "wq_a", None), "weight", None)
+            if _t.is_tensor(_w) and _w.device.type == "cuda":
+                resident.append(_lid)
+        except Exception:
+            continue
+    if not resident:
+        print("[breakdown] no resident layer found; the plan streams every layer")
+        return
+
+    rows = []
+    with _t.inference_mode():
+        for _lid in resident:
+            _b = eng.block(_lid)
+            _b.profile = True
+            try:
+                # 每层独立预热：compressed 层的压缩 KV / indexer 状态会被上一层污染，
+                # 不预热直接测会得到离群值（实测 L4 的 attn 是 9.0ms，而其他层 1.2~1.5ms）。
+                for _ in range(8):
+                    _b.forward(x, 0, pre)
+                _t.cuda.synchronize()
+                # 逐次记录，最后取中位数：偶发的 20ms 抖动不能代表这一层。
+                samples: list[dict[str, float]] = []
+                for _ in range(iters):
+                    _b.forward(x, 0, pre)
+                    _snap = dict(getattr(_b, "_parts", None) or {})
+                    if _snap:
+                        samples.append(_snap)
+            finally:
+                _b.profile = False
+            if samples:
+                _keys = list(samples[0])
+                med = {}
+                for _k in _keys:
+                    _vals = sorted(s[_k] for s in samples if _k in s)
+                    med[_k] = _vals[len(_vals) // 2] if _vals else 0.0
+                rows.append((_lid, med))
+
+    if not rows:
+        print("[breakdown] profiler returned nothing")
+        return
+    keys = list(rows[0][1])
+    print("[breakdown] per-resident-layer GPU time (ms, CUDA events, no disk/PCIe)")
+    for _lid, _p in rows:
+        _tot = sum(_p.values())
+        _s = "  ".join(f"{k}={_p.get(k, 0.0):.3f}" for k in keys)
+        print(f"  L{_lid:<2d} total={_tot:.3f}  {_s}")
+    avg = {k: sum(p.get(k, 0.0) for _, p in rows) / len(rows) for k in keys}
+    tot = sum(avg.values())
+    print("[breakdown] average: " + "  ".join(f"{k}={v:.3f}" for k, v in avg.items()))
+    print(f"[breakdown] layer total {tot:.3f} ms -> 40 layers ~= {tot * 40:.1f} ms/token")
+    if tot > 0:
+        print("[breakdown] share: " + "  ".join(
+            f"{k}={v / tot * 100:.0f}%" for k, v in sorted(avg.items(), key=lambda kv: -kv[1])))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -42,6 +116,11 @@ def main() -> None:
     ap.add_argument("--prompt", default="Question: What is the capital of France?\nAnswer:")
     ap.add_argument("--new-tokens", type=int, default=8)
     ap.add_argument("--json", default=None)
+    # 单层耗时的分段分解（attn / MoE / hc），用常驻层的 CUDA event 计时。
+    # 这是「一次 decode 步的时间花在哪」的答案，和上面的 decode_step_s 互补：
+    # decode_step_s 含读盘，这个只含计算。
+    ap.add_argument("--breakdown", action="store_true",
+                    help="打印单层耗时分解（attn/MoE/hc）后退出")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -51,6 +130,10 @@ def main() -> None:
     t_build = time.perf_counter()
     eng = Engine.from_hf(args.model, device="cuda", tokenizer=tok, allow_missing_layers=True)
     build_s = time.perf_counter() - t_build
+
+    if args.breakdown:
+        _print_breakdown(eng, tok)
+        return
 
     ids = tok.encode(args.prompt, add_special_tokens=False)
     t = torch.tensor([ids], device="cuda")
