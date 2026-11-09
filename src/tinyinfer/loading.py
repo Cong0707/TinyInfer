@@ -2541,7 +2541,21 @@ class VramSlotCache:
                     _ok = False
                     try:
                         if isinstance(data, memoryview):
-                            _ok = _async_h2d(buf, data, int(buf.numel()), stream=_cs)
+                            # **必须提交到当前流，不能用 _cs（copy stream）。**
+                            #
+                            # 我第一版用了 _cs，理由是「和槽位所在卡的 stream 对齐」。
+                            # 但这里有个致命前提：消费者要在同一流上排在自己后面，
+                            # 或者显式 wait_event。而 MoE 那条路径**从不调
+                            # wait_event**（grep 过，moe.py 里一次都没有），它只靠
+                            # "拷贝和 kernel 排在同一条流上"来保证顺序。
+                            #
+                            # 提交到 copy stream 就断了这个前提 —— 计算可能在拷贝
+                            # 完成前就读到槽位内容。症状不是报错，是结果不确定：
+                            # 同一段输入三次跑出 15.6 / 20.4 / NaN。
+                            #
+                            # 用当前流：DMA 和后面的 kernel 天然有序，ev 只用于
+                            # 记录（wait_event 在同流上是 no-op，安全）。
+                            _ok = _async_h2d(buf, data, int(buf.numel()))
                     except Exception:
                         _ok = False
                     if not _ok:
