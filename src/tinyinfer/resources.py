@@ -223,10 +223,19 @@ def model_profile(index: Any) -> dict:
             per_layer[lid] = per_layer.get(lid, 0) + int(n)
         if per_layer:
             prof["n_layers"] = max(per_layer) + 1
-            # The streamed layer is what Block._weight_paths returns. After the RoPE
-            # table (256MB) moved to a shared constant it is the fp8 payloads plus a few
-            # small bf16 norms, i.e. ~1.0x the header bytes (measured 166MB/layer).
-            _m = 1.0
+            # **streamed 层的实际搬运量是 header 字节的 2.7 倍，不是 1.0 倍。**
+            #
+            # header 里记的是 fp8 载荷（每层约 166MB）。但一层真正拷进显存环形缓冲
+            # 的是「一块连续 buffer」，每块按最坏层开 463MB（实测），而规划器这里
+            # 只按 1.0x 算成 173MB —— 三个环就差 0.87GB。
+            #
+            # 实测：8GB 卡上规划器给 11 层常驻 + 3 个环，Engine 构建完只剩 1.90GB，
+            # 第一次 forward 就在 layer 12 上 OOM（vram free=0MB）。
+            #
+            # 2.7 这个系数来自两条独立测量：本机 463MB / 173MB = 2.68；
+            # 以及下面 plan() 里注释记的「719MB vs 355MB」= 2.03（那台机器 header
+            # 更小）。取 2.7 是保守的一侧 —— 显存算少了会 OOM，算多了只是少几个常驻层。
+            _m = 2.7
             avg = _m * sum(per_layer.values()) / len(per_layer)
             mx = _m * max(per_layer.values())
             # Two different numbers, used for two different things:
@@ -237,7 +246,9 @@ def model_profile(index: Any) -> dict:
             # model into a 92GB plan, so the solver concluded only one layer could be
             # resident, gave the host cache its 256MB floor, and every token then read
             # all 63 streamed layers from disk.
-            prof["layer_bytes"] = avg
+            # layer_bytes 走原始字节（常驻层在显存里就是这些 fp8 载荷，没有环的开销）；
+            # max_layer_bytes 走放大后的值（streaming 环按最坏层开一块连续 buffer）。
+            prof["layer_bytes"] = sum(per_layer.values()) / len(per_layer)
             prof["max_layer_bytes"] = mx
             # routing width: needed to size the expert pool / decide on coverage
             try:

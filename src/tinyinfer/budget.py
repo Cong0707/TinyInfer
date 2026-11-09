@@ -446,6 +446,17 @@ class HostBudget:
             self.reserve = max(3 * GB, int(self.total * 0.15)) if self.total else 3 * GB
         # what this process may hand out in total (weights + slab + expert cache)
         self.limit = max(0, self.total - self.reserve)
+        # **再夹一次「此刻真的能用」。**
+        #
+        # total 是物理总量，不含 pagefile，这一点是对的；但它也不知道桌面和其它进程
+        # 已经占走多少。本机 47.2GB 里桌面常占 10~14GB，按 total 算出的 40.1GB 上限
+        # 就会把缺口推进 pagefile —— pinned 页一旦落到 swap，专家访问变成 swap-in，
+        # 比读盘还慢，而且大块 cudaHostRegister 会直接失败。
+        #
+        # 只在这个方向夹：available 更大时不抬上限（那是页缓存的浮动，不该让计划跟着飘）。
+        _av = self.available()
+        if _av:
+            self.limit = min(self.limit, max(0, int(_av) - (6 << 30)))
         if os.environ.get("TI_RAM_FRACTION"):
             self.limit = int(self.total * float(os.environ["TI_RAM_FRACTION"]))
         self.granted = 0

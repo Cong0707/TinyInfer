@@ -323,8 +323,23 @@ class Engine:
                 # 时候内核会把它们让出来。按 available 算等于让模型自己的读缓存把
                 # 专家缓存挤掉（实测 371GB 的机器上池子只拿到 151GB）。
                 # 只保留 15% 的绝对余量给内核和其它进程。
+                # **池子上限必须同时受「物理总量」和「此刻真的能用」两条约束。**
+                #
+                # 只按物理总量算（total - 15%）会忽略桌面与其它进程已经占走的部分：
+                # 本机 47.2GB，桌面占 14GB，可用只剩 32.8GB，按 40.1GB 去 claim 的
+                # 缺口只能落到 pagefile —— 而 pinned 页落进 swap 意味着每次专家访问
+                # 变成 swap-in（比读盘还慢），大块上 cudaHostRegister 会直接失败
+                # （表面症状是 cuMemSetAccess OOM，而显存还有 2.6GB 空闲）。
+                #
+                # 也不能只用 available()：它对页缓存敏感，模型自己读权重留下的页缓存
+                # 会把 available 压得很低（另一台机器上实测只给出 151GB）。
+                # 取两者的小值：available 扣掉启动期必需余量，再和 total 的 85% 比。
                 _tot = int(getattr(_budget, "total", 0) or 0)
-                _base = _tot - int(_tot * 0.15) if _tot else int(_avail - (5 << 30))
+                _by_total = (_tot - int(_tot * 0.15)) if _tot else (1 << 62)
+                # 启动期余量：streamed 层权重（约 430MB/层）、engram/embed 的 pinned
+                # staging 块、操作系统与其它进程。
+                _by_avail = int(_avail) - (6 << 30)
+                _base = min(_by_total, _by_avail)
                 _target = max(192 << 20,
                               min(_budget.room(), _base))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
