@@ -512,8 +512,25 @@ class Engine:
                             _pr = float(_cand)
                     except Exception:
                         _pr = 0.4
-                    _planned_pool = min(_planned_pool,
-                                        int(_live_free * _pr))
+                    # **池子大小必须稳定，否则每次启动的 slab 层数都在跳。**
+                    #
+                    # 只用「瞬时可用量 x 比例」时，连续三次运行得到 pool
+                    # 12.7 / 8.9 / 14GB，slab 12 / 3 / 10 层，step
+                    # 2992 / 5890 / 2083ms —— 看起来像性能退化，其实是同一个
+                    # 配置在不同宿主状态下算出了不同的池子。
+                    #
+                    # 所以同时受两条约束取小：
+                    #   - 物理总量 x 比例：这个数在一次开机内不变，保证稳定性
+                    #   - 瞬时可用 x 比例：避免真的把内存吃穿
+                    # 前者定基调，后者只在内存确实紧张时才收紧。
+                    # 物理总量用 budget 已经取好的值（_physical_ram()，一次开机内
+                    # 不变）。不要用 hw_plan —— Plan 里没有内存总量字段。
+                    _ram_total = float(getattr(_budget, "total", 0) or 0)
+                    _by_total = int(_ram_total * _pr) if _ram_total > 0 else 0
+                    _by_avail = int(_live_free * _pr)
+                    if _by_total > 0:
+                        _planned_pool = min(_planned_pool, _by_total)
+                    _planned_pool = min(_planned_pool, _by_avail)
                     _planned_pool = max(192 << 20, _planned_pool)
                 _target = max(192 << 20, min(_budget.room(), _planned_pool))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
@@ -2294,7 +2311,20 @@ class Engine:
                 print(f"[flatdbg] pool total={_pool.total / 2**30:.2f}GB used="
                       f"{_pool.used / 2**30:.2f}GB free={_pool.free / 2**30:.2f}GB "
                       f"slab_total={slab_total / 2**30:.2f}GB", flush=True)
-            slab_total = min(slab_total, _pool.free)
+            # **不要用启动瞬间的 _pool.free 定死上限。**
+            #
+            # 原来这里是 slab_total = min(slab_total, _pool.free)。而 pool.free
+            # 取决于那一刻宿主机上还剩多少内存（别的进程、页缓存都会影响），
+            # 于是同一份配置、同一台机器，连续三次运行分别得到 slab 10 / 6 / 7 层，
+            # step 2083 / 4060 / 3671ms —— **波动 2 倍，而且看起来像性能退化**。
+            #
+            # 改成用 pool 的**总容量**按份额给：这个数在 claim 之后就固定了，
+            # 不随瞬时状态跳。份额就是 slab 自己那份（_slab_cap 已经算过），
+            # 再和「所有层都装下需要多少」取小。
+            _quota = slab_total
+            if _pool is not None:
+                _quota = min(slab_total, int(_pool.total))
+            slab_total = _quota
         if slab_total <= 0 and _pool is not None:
             _why = "pool-backed"
         for i in streamed:
