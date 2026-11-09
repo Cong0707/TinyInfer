@@ -934,10 +934,7 @@ class MLACompressedAttention:
                 _fn = _BTGEMV.get(_key)
                 if _fn is None:
                     _fn = _natb.BoundLaunch(
-                        # 用向量化版本：每次读 16 字节（8 个 bf16）而不是 2 字节。
-                        # 数值和旧版一致（实测 max_abs_err 完全相同），单次 kernel
-                        # 快 2 倍。
-                        _natb.kernel("bt_gemv", "bt_gemv_bf16_vec"),
+                        _natb.kernel("bt_gemv", "bt_gemv_bf16"),
                         ((_r + 7) // 8, _g), (256,), "TTTiii")
                     _BTGEMV[_key] = _fn
                 _fn(_xb.view(-1), wo_a.reshape(-1).contiguous(), _yb.view(-1), _g, _r, _d)
