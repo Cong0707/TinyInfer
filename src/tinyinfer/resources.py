@@ -394,6 +394,18 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     PREFILL_TEMP = 0.60 * GB   # dequant/activation peak during prefill
     HEAD_CPU_COST_S = 0.053     # measured: 1.3GB bf16 GEMV on the host
     EMBED_CPU_COST_S = 0.001    # one 10KB row lookup
+    # **streamed 层的代价是磁盘，不是 PCIe。**
+    #
+    # 这是规划器里最容易搞错的一处，而且错了不会报错、只会静默地给出一个慢
+    # 十倍的配置。未驻留的层每走一次 decode 都要从盘上把它读进环形缓冲
+    # （slab 只有 3 个环，33 个 streamed 层轮转，每层都得重读），所以「多驻留
+    # 一层」省下的是 max_layer_b 字节的磁盘读，不是 H2D。
+    #
+    # 实测：本机 SAS 顺序读 3.8GB/s，pinned H2D 26.5GB/s，差 7 倍。
+    # 之前这一项按 H2D_BPS 算，于是「多驻留一层」的价值被低估 7 倍，
+    # 规划器宁可少驻留、多留槽位 —— 实测 8GB 卡上给出 resident=7/slots=24，
+    # 每步读盘 20.6GB；按真实模型应该是 resident=13/slots=15 左右，约 16GB。
+    DISK_BPS = 3.8e9
     # Measured on a live 8GB decode: 4.8GB = ring 2.16 + head 1.32 + 2x0.60 layers
     # + 0.12GB of workspace/KV. The workspace is small at decode; the big figure is
     # only needed transiently by a long prefill, and it is allocated then, not held.
@@ -483,15 +495,52 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     if r_stream >= n_layers:
         embed_gpu, head_gpu, buffers = True, True, 0
     else:
+        # ---- 驻留层数 x 槽位数：显式最小化「每步读盘量」 --------------------
+        #
+        # 原来的成本模型是 saved = 多驻留的层数 * layer_b / H2D_BPS，两个量都
+        # 用错了：streamed 层每步是从**盘**读的（3.8GB/s，不是 26.5GB/s 的 PCIe），
+        # 而且真要搬的是 max_layer_b（最坏层 468MB）而不是平均的 layer_b（164MB）。
+        # 两处叠加把「多驻留一层」的价值低估了约 20 倍，于是 8GB 卡上规划器选择
+        # resident=7 / slots=24，每步读盘 20.6GB —— 而同样的显存，resident=13 /
+        # slots=15 只要 16.4GB。
+        #
+        # 现在的判据没有间接量：直接数字节。
+        #   每步读盘 = 未驻留层数 * max_layer_b + 缺失专家数 * expert_b
+        # 逐档试 resident，槽位数由剩余显存推出，取最小值。搜索空间只有
+        # n_layers * 3，不值得再维护一套解析成本模型。
+        _topk_est = int(float(model.get("topk", 0) or 0))
+        need_slots_est = _topk_est * n_layers
         best = None
-        for eg, hg in ((True, True), (False, True), (False, False)):
-            r = min(n_layers, layers_that_fit(eg, hg, BUF_COUNT, ws0))
-            saved = max(0, r - min(r_stream, n_layers)) * layer_b / H2D_BPS
-            price = (0.0 if eg else EMBED_CPU_COST_S) + (0.0 if hg else HEAD_CPU_COST_S)
-            cost = price - saved
-            if best is None or cost < best[0]:
-                best = (cost, eg, hg, r)
-        _, embed_gpu, head_gpu, _r = best
+        _sol_resident = None
+        # **只搜 head 留在卡上的组合。** _head_logits 没有 host-GEMV 路径（它在
+        # device 上切 head），所以 head_gpu=False 的计划会在后面被强制改回 True，
+        # 而这里按 hg=False 省下来的显存根本不存在 —— 那样的「最优解」装不下，
+        # 后面的 MIN_SLOTS 循环会把 resident 一路减回去（实测减到 7，和没有优化
+        # 一样）。宁可少一个候选，也不能给出一组实际放不下的数。
+        for eg, hg in ((True, True), (False, True)):
+            for _r in range(n_layers, -1, -1):
+                _used = ((embed_b if eg else 0.0) + (head_b if hg else 0.0)
+                         + _r * layer_b * LAYER_SLACK + BUF_COUNT * max_layer_b
+                         + ws0 + runtime_b)
+                _spare = V - _used
+                if _spare < 0:
+                    continue
+                # has_experts / MIN_SLOTS 在下面才定义，这里用等价的条件先判断一次
+                _has_exp = expert_b > 0.5 * MB
+                _s = (int(_spare * SLOT_FRACTION // max(1.0, expert_b))
+                      if _has_exp else 0)
+                # 槽位下限和后面 MIN_SLOTS 用同一套式子：低于它意味着一层都装不下，
+                # 边走边换比多读一层还慢。
+                if _has_exp and _s < max(1, min(12, 2 * _topk_est)):
+                    continue
+                _io = ((n_layers - _r) * max_layer_b
+                       + max(0, need_slots_est - _s) * expert_b)
+                if best is None or _io < best[0]:
+                    best = (_io, eg, hg, _r, _s)
+        if best is not None:
+            _, embed_gpu, head_gpu, _sol_resident, _sol_slots = best
+        else:
+            embed_gpu, head_gpu, _sol_slots = True, True, 0
         buffers = BUF_COUNT
     # forced head placement (diagnostics/tuning: keeps 1.3GB of VRAM for resident layers
     # at the price of a host GEMV per token)
@@ -505,7 +554,13 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # forced residency: overrides the solver so a caller can trade the streaming ring for
     # resident layers (the prefill path has to free them again, see Engine._forward_impl)
     _force_resident = __import__("os").environ.get("TI_RESIDENT")
-    resident = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0))
+    # 穷举同时解了「驻留多少层」和「留多少槽位」，它的 resident 就是这一对的最优解；
+    # 这里不能再用 layers_that_fit 重算 —— 那个函数只回答「不含槽位时能塞多少层」，
+    # 重算等于把搜索的结果丢掉，回到「层塞满、槽位剩几个」的错误方向。
+    if _sol_resident is not None:
+        resident = int(_sol_resident)
+    else:
+        resident = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0))
     # A model that fits entirely on the card has nothing to trade: pushing the embedding
     # off it would add a PCIe round trip per token and save memory that is not needed.
     # The cost model above assumes a streamed model, where one more resident layer is
@@ -594,6 +649,10 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     else:
         slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
         slots = max(slots, 2) if has_gpu else 0
+        # 穷举阶段已经解过同一道题（它同时考虑了驻留层和槽位的兑换关系），
+        # 这里以它的结果为准 —— 重新从 spare 推一遍会丢掉那次搜索做的取舍。
+        if _sol_slots and has_gpu:
+            slots = int(_sol_slots)
 
     # ---- expert coverage beats a device-resident table ---------------------------
     # A token can route to topk*n_layers distinct experts. Once the slot pool covers
