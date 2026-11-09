@@ -132,6 +132,29 @@ class Plan:
     # False when even the streaming skeleton (ring + workspace + tables) does not fit
     # the VRAM budget: the engine refuses to start instead of OOMing mid-prefill.
     fits: bool = True
+    # ---- 主机侧的统一账面 --------------------------------------------------
+    #
+    # 下面四个字段存在的原因，是这几个数以前散在 engine.py / budget.py / loading.py
+    # 里各算各的，而且都写死了跟「这台机器」有关的常数（6GB 余量、240MB/层、
+    # 1.15 系数、16 线程）。换一台机器那些数就不对，而且看代码看不出来它们
+    # 互相约束。统一在这里算好，engine 只读字段。
+    #
+    # 规划器输出的是「计划」，不是「保证」：真实可用内存可能在 plan 之后变化，
+    # 所以 engine 拿到这些数仍然要按实际 free 收缩（claim 失败就缩），
+    # 但**收缩的起点是这里给的数**，不是别处另算一个。
+    #
+    # pinned 层 pre-slab 的预留字节：给所有 streamed 层各留一份源。
+    slab_reserve_bytes: int = 0
+    # 宿主池的目标字节数（专家缓存 + slab + 构建期临时都在里面）。
+    host_pool_bytes: int = 0
+    # 专家缓存里允许 pin（而不是普通 pageable）的字节数。
+    # 默认 = cache_bytes：pageable 的专家要过一遍 staging memcpy 才能上显存，
+    # 而 pinned 是直接 async DMA。留一半资源做 pageable 没有收益。
+    pin_budget_bytes: int = 0
+    # 专家读取的并发深度。这是 SSD 队列深度（QD 16 就饱和），不是 CPU 数，
+    # 所以它跟机器大小无关 —— 但仍然放在这里，因为它是规划的一部分：
+    # 并发深度决定「一笔 decode 的 miss 需要多久」。
+    read_threads: int = 16
     # layer -> CUDA index, and per-card expert slot counts. Single-GPU boxes get
     # {layer: 0} and {0: slots} and the engine behaves exactly as before.
     # 每层放在哪张卡。**没有消费者**：多卡时层放置由 engine 自己的
@@ -366,7 +389,7 @@ def _spread_cards(cards: list[Card], n_layers: int, total_resident: int,
 
 
 def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = None,
-         speculation: bool = False) -> Plan:
+         speculation: bool = False, calibrate: dict | None = None) -> Plan:
     """Solve the placement problem from bytes and bandwidths, never from tiers.
 
     Every number below is a measured price of the hardware (H2D bandwidth, the cost of
@@ -376,6 +399,9 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     """
     hw = hw or detect()
     model = model or {}
+    # calibrate：启动期实测的标定结果（calibrate.calibrate 的返回）。
+    # 规划器本身猜不出「这块盘的随机读在几个并发下最快」这类量，只能靠实测；
+    # 传进来就用实测值，没传才退回推断。
     layer_b = float(model.get("layer_bytes", 0.19 * GB))
     max_layer_b = float(model.get("max_layer_bytes", 0.72 * GB))
     embed_b = float(model.get("embed_bytes", 1.32 * GB))
@@ -743,6 +769,64 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         f" embed={'gpu' if embed_gpu else 'cpu'} head={'gpu' if head_gpu else 'cpu'}"
         f" layer={layer_b/MB:.0f}MB expert={expert_b/MB:.1f}MB{reason_extra}"
     )
+    # ---- 主机侧账面：这里算完，别处直接用 ------------------------------
+    #
+    # slab 源：给每个 streamed 层留一份 pinned 源。每层按 max(layer_bytes,
+    # max_layer_bytes/2) 估 —— 实测值就是这个量级（header 的 layer_bytes 是
+    # tensor 字节均值，不含对齐和额外 buffer；max/2 才接近实际 span）。
+    # 1.15 是构建期临时量（一层在 host 上读出来、拷进 slab、再释放旧的）。
+    # 每层 slab 源的实际字节：header 的 layer_bytes 是各 tensor 字节均值，不含
+    # 4096 对齐和额外 buffer；实测 span 是它的 1.4 倍左右，而 max_layer_bytes 的
+    # 一半正好落在实测值附近（本机 172MB*(1.4) vs 468MB/2=234MB vs 实测 237MB）。
+    # 取两者较大：既不会因为某层特别胖而少留，也不会因为 header 均值偏小而少留。
+    _slab_per_layer = max(layer_b * 1.4, max_layer_b * 0.5)
+    _n_streamed = max(0, n_layers - resident)
+    # 每个 streamed 层一份源，再加「一层正在构建」的临时窗口（读进来 -> 拷进源
+    # -> 释放旧的，同一时刻只有一层在途）。这个窗口就是 _slab_per_layer 本身，
+    # 所以不需要再额外塞一个跟机器无关的常数。
+    slab_reserve = int((_n_streamed + 1) * _slab_per_layer) if _n_streamed else 0
+    # 宿主池：物理可用量减掉进程自身的常驻部分。**上限只取物理可用**，
+    # 绝不把 pagefile 算进来（那是硬盘冒充内存，会让 pinned 页落到 swap）。
+    _ram_avail = float(getattr(hw, "ram_avail_gb", 0) or 0) * GB
+    _ram_total = float(getattr(hw, "ram_gb", 0) or 0) * GB
+    if _ram_avail > 0:
+        # 留 15% 给加载期临时、python/torch 自身和非池化的小对象
+        host_pool = int(max(0.0, _ram_avail - _ram_avail * 0.15))
+    elif _ram_total > 0:
+        host_pool = int(max(0.0, _ram_total * 0.5))
+    else:
+        host_pool = 0
+    # 池子必须装得下「slab + 缓存」，否则一开始就注定要打架
+    _need = int(cache_b) + int(slab_reserve)
+    if host_pool and _need > host_pool:
+        # 缓存让路：slab 是常驻的（省的是每步的层重读），缓存是机会性的
+        cache_b = max(192 * MB, min(int(cache_b), host_pool - int(slab_reserve) - 192 * MB))
+    # pin 预算 = 缓存的全部。pageable 的专家要多走一次 staging memcpy 才能上
+    # 显存，没有任何理由只 pin 一半（以前写死 0.5，实测 240 个专家每步有一半
+    # 走 pageable，单步多花 1 秒）。
+    pin_budget = int(cache_b)
+    # 读并发：SSD 队列深度，与机器大小无关
+    # 并发深度：环境变量 > 实测标定 > 推断。
+    #
+    # 这个数没有「通用正确值」：SSD 的队列深度饱和点取决于盘、驱动和文件在盘上
+    # 的物理分布。本机实测 {4:2.8, 8:3.0, 16:3.3, 32:3.1}GB/s，最优在 16；
+    # 另一个时刻同一台机器又测出 8 最优 —— 所以它是「这块盘此刻的最优」，
+    # 不是常数。calibrate 每次启动实测一遍并缓存。
+    _rt = __import__("os").environ.get("TI_READ_THREADS")
+    read_threads = 0
+    if _rt:
+        try:
+            read_threads = max(1, min(64, int(_rt)))
+        except (TypeError, ValueError):
+            read_threads = 0
+    if not read_threads and isinstance(calibrate, dict):
+        _v = calibrate.get("read_threads")
+        if isinstance(_v, int) and _v > 0:
+            read_threads = max(1, min(64, _v))
+    if not read_threads:
+        # 没有实测值时的保守推断：SSD 队列深度经验区间 8..32，取中值。
+        read_threads = 16
+
     return Plan(
         layer_card=layer_card,
         card_slots=card_slots,
@@ -756,4 +840,8 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         stream_layers=n_layers - resident,
         reason=reason,
         fits=fits,
+        slab_reserve_bytes=int(slab_reserve),
+        host_pool_bytes=int(host_pool),
+        pin_budget_bytes=int(pin_budget),
+        read_threads=int(read_threads),
     )

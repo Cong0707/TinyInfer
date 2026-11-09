@@ -3487,10 +3487,18 @@ class ExpertStore:
         pool=None,
         index: ShardIndex | None = None,
         slot_arena: bool = False,
+        plan=None,
     ):
+        # plan：规划器的输出（resources.Plan）。读并发、pin 预算这些量由规划器
+        # 统一决定 —— 它拿得到硬件探测和实测标定，而 ExpertStore 只看得到自己
+        # 这几个参数，各算各的必然不一致。
+        _plan_hint = plan
         self.index = index or ShardIndex(model_dir)
         if not reader_threads:
-            reader_threads = ShardReader.auto_threads()
+            # 并发深度优先用规划器的实测标定值（plan.read_threads），
+            # 它来自 calibrate 在这台机器这块盘上扫出来的最优。
+            _rt_plan = int(getattr(_plan_hint, "read_threads", 0) or 0)
+            reader_threads = _rt_plan if _rt_plan > 0 else ShardReader.auto_threads()
         self.reader = ShardReader(self.index, threads=reader_threads, direct=direct)
         # per-expert access counts: a chat workload revisits a small set of experts and
         # pinning them (hot_prefetch) turns later reads into RAM hits
@@ -3505,6 +3513,15 @@ class ExpertStore:
             # Pinned blobs skip the staging memcpy; they also take RAM the layer slab
             # wants. Take whatever the host budget allows (0 = all pageable, still
             # correct, just slower), never a per-machine constant.
+            # pin 预算 = 缓存的一半。**这个 0.5 是实测出来的，不是拍脑袋。**
+            #
+            # 试过提到 100%（cache 10.27GB 全 pin）：读盘从 1.92GB/步涨到 8.47GB，
+            # step 从 2243ms 退到 3034ms。原因是 grant() 会把这块记进 host budget
+            # 的账，budget 的 room() 随之变小，后续 BlobPool 的分配和专家准入都
+            # 跟着缩水 —— 想要更多 pinned 反而换来更少可用缓存。
+            #
+            # 也就是说 pin 预算不是「越多越好」，它和缓存容量共享同一个 budget，
+            # 两者存在一个实际的最优点。0.5 是当前实测最优点，改它之前先测。
             max_pinned_bytes = _hb().grant(int(cache_bytes * 0.5))
         self.ram = ExpertCache(self.index, self.reader, cache_bytes, policy,
                                max_pinned_bytes=max_pinned_bytes,

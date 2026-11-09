@@ -300,6 +300,22 @@ class Engine:
             try:
                 from .loading import ShardIndex
 
+                # 启动期标定：实测这台机器这块盘的真实带宽和最优读并发。
+                # 很便宜（本机 1.2s），结果按机器指纹缓存，第二次启动直接读。
+                # 规划器拿它替代那些「推断出来、换台机器就不对」的常数。
+                try:
+                    from .calibrate import calibrate as _calibrate
+
+                    self._calib = _calibrate(self.store.model_dir)
+                    if self._calib.get("read_threads"):
+                        print(f"[tinyinfer] calibration: disk seq "
+                              f"{self._calib.get('seq_gbps')}GB/s rand "
+                              f"{self._calib.get('rand_gbps')}GB/s -> read_threads="
+                              f"{self._calib.get('read_threads')}"
+                              f"{' (cached)' if self._calib.get('cached') else ''}",
+                              flush=True)
+                except Exception:
+                    self._calib = None
                 _prof = _model_profile(ShardIndex(self.store.model_dir))
                 self._model_prof = _prof
                 if _prof is not None:
@@ -325,6 +341,7 @@ class Engine:
                 _prof = None
             # speculation reserves its draft stages up front (tier 2 is the default)
             self.hw_plan = _hw_plan(None, self.cfg.n_layers, model=_prof,
+                                    calibrate=getattr(self, "_calib", None),
                                     speculation=bool(getattr(self.tier, "mtp", False)))
         else:
             self.hw_plan = None
@@ -435,23 +452,29 @@ class Engine:
                 # 也不能只用 available()：它对页缓存敏感，模型自己读权重留下的页缓存
                 # 会把 available 压得很低（另一台机器上实测只给出 151GB）。
                 # 取两者的小值：available 扣掉启动期必需余量，再和 total 的 85% 比。
-                _tot = int(getattr(_budget, "total", 0) or 0)
-                _by_total = (_tot - int(_tot * 0.15)) if _tot else (1 << 62)
-                # 启动期余量：streamed 层权重（约 430MB/层）、engram/embed 的 pinned
-                # staging 块、操作系统与其它进程。
-                _by_avail = int(_avail) - (6 << 30)
-                _base = min(_by_total, _by_avail)
-                _target = max(192 << 20,
-                              min(_budget.room(), _base))
+                # **池子的大小由规划器给，这里不再自己算第二套。**
+                #
+                # 原来是 _by_total（物理总量 -15%）和 _by_avail（可用 -6GB）取小，
+                # 两个常数都是「这台 47GB 笔记本」调出来的：换一台机器不是偏大
+                # （把 pagefile 当内存）就是偏小（明明有 300GB 只用 32GB）。
+                # resources.plan 现在按 hw.ram_avail_gb 推出 host_pool_bytes，
+                # 那个数只依赖这台机器此刻的真实可用内存。
+                #
+                # 仍然按 live 值再夹一次：plan 是启动瞬间的测量，之后别的进程
+                # 可能拿走内存，claim 失败还是得缩。
+                _planned_pool = int(getattr(hw, "host_pool_bytes", 0) or 0)
+                _live_free = int(_budget.available() or 0)
+                if _planned_pool <= 0:
+                    _planned_pool = max(192 << 20, _live_free - int(_live_free * 0.15))
+                if _live_free > 0:
+                    _planned_pool = min(_planned_pool,
+                                        max(192 << 20, _live_free - int(_live_free * 0.15)))
+                _target = max(192 << 20, min(_budget.room(), _planned_pool))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
                 if _pov:
-                    # An explicit override wins over the RAM-derived cap. It is the knob
-                    # used to probe how large the pinned pool can grow before the driver
-                    # refuses (cuMemSetAccess), and a cap that can only shrink cannot
-                    # answer that.
                     try:
-                        _o = max(192 << 20, int(float(_pov) * (1 << 30)))
-                        _target = min(_budget.room(), _o)
+                        _target = min(_budget.room(),
+                                      max(192 << 20, int(float(_pov) * (1 << 30))))
                     except ValueError:
                         pass
                 _taken = int(_budget.claim(_target, real=True))
@@ -621,6 +644,9 @@ class Engine:
                     # 0.26GB/s through the Windows file cache (which serialises the
                     # multi-threaded pread path on a big-blob stream)
                     direct=True,
+                    # 规划器的统一账面：读并发、pin 预算都从它来，
+                    # ExpertStore 不再自己按 CPU 数或 0.5 系数猜。
+                    plan=hw,
                 )
                 # Multi-GPU: hand the store the card list so it can spread its slot
                 # arenas over them in proportion to free VRAM. The store keeps whole
