@@ -617,13 +617,30 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         # only thing standing between decode and a disk read per expert.
         pass
     if need_slots and has_gpu and slots < need_slots and (embed_gpu or head_gpu):
+        # **判据是「槽位显著变多」，不是「槽位能覆盖整步」。**
+        #
+        # 原来只有 _slots2 >= need_slots（240 个）才切换。240 在 8GB 卡上
+        # 根本达不到（embed 挪走也只到 91），所以这条分支从来没生效过 ——
+        # 规划器永远给 embed 留在显存、槽位只有 24 个的结果。
+        #
+        # 代价对得上：embed 留在显存省的是每 token 一次 10KB 行查找（约 1ms），
+        # 而多出来的 67 个槽位（24 -> 91）能省掉每 token 67 个专家的搬运
+        # （约 1.2GB，盘上 0.3s）。1ms 换 300ms，任何比例下都该换。
+        #
+        # 阈值取 1.25 倍：切换本身没有代价（embed 走主机查表），但要有明显收益
+        # 才值得改变计划，避免在边界上来回横跳。
+        _best = None
         for _eg, _hg in ((False, False), (False, True), (True, False)):
             _r2 = min(n_layers, layers_that_fit(_eg, _hg, buffers, ws0))
             _slots2 = int(max(0.0, V - _used_with(_r2, _eg, _hg)) * SLOT_FRACTION
                           // max(1.0, expert_b))
+            if _best is None or _slots2 > _best[0]:
+                _best = (_slots2, _eg, _hg, _r2)
             if _slots2 >= need_slots:
-                embed_gpu, head_gpu, resident, slots = _eg, _hg, _r2, _slots2
+                _best = (_slots2, _eg, _hg, _r2)
                 break
+        if _best is not None and _best[0] >= max(slots * 1.25, slots + 8):
+            slots, embed_gpu, head_gpu, resident = _best[0], _best[1], _best[2], _best[3]
     # ---- 定点迭代：槽位自己也要占显存 -------------------------------------
     # 上面的 resident 和 slots 是分别算的，两者加起来会超。实测 40 层模型
     # （层权重 8GB 卡上 164MB/层）：plan 给 resident=11、slots=14，初始化后

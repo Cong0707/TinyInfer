@@ -43,6 +43,76 @@ class Engine:
         """
         return cls(open_adapter(source), **kwargs)
 
+    def close(self) -> None:
+        """释放这个引擎占住的一切，之后可以再建一个。
+
+        **原来没有这个方法，这是服务的实际泄漏点。** 引擎会 claim 一块几十 GB 的
+        主机池（cudaHostAlloc / VirtualAlloc）、占满显存槽位、持有 engine lock；
+        这些资源在进程退出前都不会自己消失。于是「换模型」「重载配置」这类操作
+        每做一次就多留一份池子 —— 表面上看是内存只涨不跌，实际是旧引擎的东西
+        没人收。
+
+        释放顺序是按「谁依赖谁」倒着来，不是随便排的：
+          1. CUDA graph：它持有捕获期的中间 buffer，先拆掉才不会在释放权重时
+             被它的引用挡住；
+          2. 显存槽位池：释放 device 侧的大块，把显存还给驱动；
+          3. 主机池：cudaFreeHost / VirtualFree，这是真正的大头；
+          4. engine lock：最后放，保证上面几步期间没有第二个引擎进来。
+
+        任何一步失败都不中断后面的步骤 —— 关不干净比关得慢更糟，但一步失败就
+        全放弃会让剩下的资源彻底留在那里。
+        """
+        import contextlib
+
+        # 1) CUDA graph
+        with contextlib.suppress(Exception):
+            g = getattr(self, "_graph", None)
+            if isinstance(g, dict):
+                for _k, _v in list(g.items()):
+                    if hasattr(_v, "reset"):
+                        with contextlib.suppress(Exception):
+                            _v.reset()
+            self._graph = None
+
+        # 2) 显存槽位池（device 侧）
+        with contextlib.suppress(Exception):
+            _store = getattr(self, "expert_store", None)
+            _slots = getattr(_store, "slots", None)
+            if _slots is not None:
+                for _attr in ("_buffers", "_arena", "_staging"):
+                    with contextlib.suppress(Exception):
+                        setattr(_slots, _attr, None)
+                with contextlib.suppress(Exception):
+                    _slots._n = 0
+
+        # 3) 主机池：这是几十 GB 的那一块
+        with contextlib.suppress(Exception):
+            self.host_pool = None
+        with contextlib.suppress(Exception):
+            from .budget import budget as _budget_fn
+
+            _b = _budget_fn()
+            _freed = int(_b.close() or 0)
+            if _freed:
+                print(f"[tinyinfer] released {_freed / (1 << 30):.1f}GB host pool",
+                      flush=True)
+
+        # 4) 显存缓存 + engine lock
+        with contextlib.suppress(Exception):
+            import torch as _torch
+
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        with contextlib.suppress(Exception):
+            self._engine_lock.release()
+            self._engine_lock = None
+
+    def __enter__(self) -> "Engine":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     def __init__(
         self,
         adapter: ModelAdapter | str,

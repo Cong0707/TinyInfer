@@ -20,15 +20,23 @@ import threading
 GB = 1 << 30
 
 
-def available_commit() -> int:
-    """Bytes the OS can still commit, i.e. what VirtualAlloc/cudaHostAlloc may charge.
+def physical_available() -> int:
+    """**真实可用的物理内存字节数。**
 
-    On Windows this is ullAvailPageFile (physical + pagefile minus what is already
-    committed), and it is the real ceiling for pinned host memory -- not
-    ullAvailPhys. An engine that sizes its expert cache from free *physical* RAM can
-    ask for more pinned memory than the commit limit allows, which fails deep inside
-    the driver as "cuMemSetAccess ... out of memory" with plenty of RAM showing free.
-    Returns 0 when the platform cannot report it (callers then skip the clamp).
+    这个函数只有一个职责：回答「现在还能真的装进内存多少字节」。它返回的数
+    必须能直接兑现成物理页，不能含任何靠硬盘兜底的成分。
+
+    口径：
+      - Windows: GlobalMemoryStatusEx 的 **ullAvailPhys**。
+        **不能用 ullAvailPageFile**：那是「物理 + 页文件」的可用 commit 额度，
+        把它当内存用等于让硬盘冒充内存 —— 申请下来的一部分页会落在
+        pagefile 里，访问时 swap-in 比读盘还慢，而大块 pinned 申请还会把整机
+        commit 拖干净（实测把一个 47GB 的机器压到 VirtualAlloc 失败，
+        连 DSH 自己的执行进程都起不来）。
+      - Linux: /proc/meminfo 的 **MemAvailable**（内核估算的可回收 + 空闲，
+        已经扣掉了不可回收的页缓存，是可以安全分配的量）。
+
+    平台拿不到就返回 0，调用方据此跳过夹取（而不是当成「无限」）。
     """
     try:
         if os.name == "nt":
@@ -44,7 +52,7 @@ def available_commit() -> int:
             st = _MEMSTATUS()
             st.dwLength = ctypes.sizeof(_MEMSTATUS)
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
-                return int(st.ullAvailPageFile)
+                return int(st.ullAvailPhys)
         else:
             with open("/proc/meminfo", "r", encoding="utf-8") as f:
                 for line in f:
@@ -53,6 +61,11 @@ def available_commit() -> int:
     except Exception:
         pass
     return 0
+
+
+# 旧名字保留一段时间以免外部脚本炸，但语义已经改成物理可用量。
+# 它以前返回 ullAvailPageFile，那是错的。
+available_commit = physical_available
 
 
 def _physical_ram() -> int:
@@ -462,6 +475,15 @@ class HostBudget:
         self.granted = 0
 
     def available(self) -> int:
+        """此刻真实可用的物理内存。
+
+        优先用 physical_available()：它的口径是固定的（Windows ullAvailPhys /
+        Linux MemAvailable），不随 psutil 版本和平台浮动。psutil 只作为兜底，
+        因为它在 Windows 上取的本来就是 ullAvailPhys，结果一致。
+        """
+        _real = physical_available()
+        if _real:
+            return int(_real)
         try:
             import psutil
 
@@ -706,6 +728,66 @@ class HostBudget:
             self._claim_pinned = False
             return n
         return 0
+
+    def close(self) -> int:
+        """释放本预算占住的所有大块内存，返回释放的字节数。
+
+        **这是原来缺失的那一环。** `_commit` 把 cudaHostAlloc / VirtualAlloc 拿到
+        的块都塞进 self._held 里只为「别让 GC 过早回收」，但从来没有对应的释放
+        路径 —— 进程活着内存就一直在。对一个会重载模型的服务来说，每换一次模型
+        就多一份池子，这是实打实的泄漏。
+
+        释放顺序和分配相反（后进先出）：pinned 块用 cudaFreeHost，VirtualAlloc
+        块用 VirtualFree(MEM_RELEASE)。任何一个失败都不影响后面的，最后一律清空
+        列表并把记账归零 —— 只有记账和真实现状一致，下一次 claim 才不会算出
+        一个「看起来还有空间」的假账。
+        """
+        import ctypes
+
+        freed = 0
+        with self._lock:
+            held = getattr(self, "_held", None) or []
+            _pinned = None
+            try:
+                _pinned = _cudart()
+            except Exception:
+                _pinned = None
+            # 三种记账格式并存，按形状分别释放：
+            #   ("pinned", cudart, ptr, nbytes, view)      cudaHostAlloc
+            #   (k32, ptr, nbytes, buf)                     VirtualAlloc
+            #   ("mmap", buf, nbytes)                       POSIX mmap
+            for item in reversed(held):
+                if not item:
+                    continue
+                _n = 0
+                _ok = False
+                try:
+                    _head = item[0]
+                    if isinstance(_head, str) and _head == "pinned":
+                        _lib = item[1] if item[1] is not None else _pinned
+                        _ptr, _n = item[2], int(item[3])
+                        if _lib is not None:
+                            _ok = (_lib.cudaFreeHost(ctypes.c_void_p(_ptr)) == 0)
+                    elif isinstance(_head, str) and _head == "mmap":
+                        _n = int(item[2])
+                        item[1].close()
+                        _ok = True
+                    else:
+                        # (k32, ptr, nbytes, buf)
+                        _k32, _ptr, _n = _head, item[1], int(item[2])
+                        _k32.VirtualFree(ctypes.c_void_p(_ptr), 0, 0x8000)
+                        _ok = True
+                except Exception:
+                    _ok = False
+                if _ok:
+                    freed += _n
+            held.clear()
+            self.granted = 0
+            self._claimed = False
+            self._claim_buf = None
+            self._claim_bytes = 0
+            self._claim_pinned = False
+        return freed
 
     def room(self) -> int:
         """Bytes we may still hand out from our share of physical RAM.
