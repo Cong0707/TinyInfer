@@ -191,30 +191,25 @@ def tune_read_threads(model_dir: str | Path, index=None, *, candidates=(4, 8, 16
 
 
 def load(model_dir: str | Path) -> dict | None:
-    """读缓存的标定结果。"""
+    """读缓存的标定结果。
+
+    存储在 tuning.json 的 models[模型].calib 下 —— 和训练器结果、运行时参数同处
+    一个文件、同一个机器指纹保护，不再各自维护一份 json。
+    """
     try:
-        p = _cache_path()
-        if not p.is_file():
-            return None
-        data = json.loads(p.read_text(encoding="utf-8"))
-        key = f"{_machine_key()}|{Path(str(model_dir)).name}"
-        return data.get(key)
+        from . import tuning
+
+        v = tuning.get_calib(str(model_dir))
+        return v or None
     except Exception:
         return None
 
 
 def save(model_dir: str | Path, result: dict) -> None:
     try:
-        p = _cache_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        data = {}
-        if p.is_file():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        data[f"{_machine_key()}|{Path(str(model_dir)).name}"] = result
-        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        from . import tuning
+
+        tuning.put_calib(str(model_dir), result)
     except Exception:
         pass
 
