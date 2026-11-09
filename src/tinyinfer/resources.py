@@ -545,10 +545,17 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         if not embed_gpu:
             embed_gpu = True
             resident = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0))
-    if _force_resident:
+    if _force_resident is not None:
+        # **TI_RESIDENT 是「就用这个数」，不是「至少这个数」。**
+        #
+        # 原来写的是 max(resident, ...)，只能往上加。但真正需要它的时候往往是
+        # 往下减：resident 层占的是显存（每层 layer_b*1.7），而显存是槽位的
+        # 唯一来源。少一层 resident 能多出十几个槽位，而 resident 层省下的只是
+        # 一次 H2D（实测 1ms，已被异步掩盖），槽位省下的是每个专家 2.4ms 的
+        # 装载 —— 10 倍以上的差价。要测这个方向，就得允许显式降低。
         try:
-            resident = max(resident, min(int(_force_resident), n_layers))
-        except ValueError:
+            resident = max(0, min(int(_force_resident), n_layers))
+        except (TypeError, ValueError):
             pass
     if resident >= n_layers:
         buffers = 0

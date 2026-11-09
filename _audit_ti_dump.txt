@@ -1,0 +1,1095 @@
+[bench.py:190] TI_MOE_PROF
+  188|         entries = len(getattr(ram, "_entries", {}) or {})
+  189| 
+  190|     if os.environ.get("TI_MOE_PROF") == "1":
+  191|         agg: dict[str, float] = {}
+[budget.py:524] TI_RAM_FRACTION
+  522|         if _av:
+  523|             self.limit = min(self.limit, int(_av))
+  524|         if os.environ.get("TI_RAM_FRACTION"):
+  525|             self.limit = int(self.total * float(os.environ["TI_RAM_FRACTION"]))
+[budget.py:525] TI_RAM_FRACTION
+  523|             self.limit = min(self.limit, int(_av))
+  524|         if os.environ.get("TI_RAM_FRACTION"):
+  525|             self.limit = int(self.total * float(os.environ["TI_RAM_FRACTION"]))
+  526|         self.granted = 0
+[budget.py:556] TI_CLAIM_REAL
+  554|         `real=True` also allocates and touches the pages so the OS commits them; that is
+  555|         the strongest guarantee but it doubles the footprint while the caches are still
+  556|         lazily filled, so it is opt-in (TI_CLAIM_REAL=1) until the caches allocate from
+  557|         the claimed pool.
+[budget.py:744] TI_HOST_POOL_GB
+  742|             raise MemoryError(
+  743|                 f"cannot reserve {n / (1 << 30):.1f}GB host pool: {exc}. "
+  744|                 f"Lower TI_HOST_POOL_GB / TI_RAM_FRACTION, or free memory."
+  745|             ) from exc
+[budget.py:750] TI_CLAIM_TOUCH
+  748|         # 而此刻 GPU 已经在空转。池子是个马上要被写满的缓存：专家读进来就写在
+  749|         # 上面，页迟早会被 fault 进来，所以默认交给内核按需填充（mmap 本来就是
+  750|         # lazy）。要"启动即锁定"用 TI_CLAIM_TOUCH=1。
+  751|         if __import__("os").environ.get("TI_CLAIM_TOUCH", "0") == "1":
+[budget.py:751] TI_CLAIM_TOUCH
+  749|         # 上面，页迟早会被 fault 进来，所以默认交给内核按需填充（mmap 本来就是
+  750|         # lazy）。要"启动即锁定"用 TI_CLAIM_TOUCH=1。
+  751|         if __import__("os").environ.get("TI_CLAIM_TOUCH", "0") == "1":
+  752|             try:
+[budget.py:765] TI_CLAIM_MLOCK_GB
+  763|             # 而且默认的 RLIMIT_MEMLOCK 通常只有几十 MB 到几 GB，280GB 必然失败，
+  764|             # 只是失败之前已经白干了。池子里的页在被写时会自然 fault 进来，锁不锁
+  765|             # 对正确性没有影响；真要锁用 TI_CLAIM_MLOCK_GB 指定一个合理上限。
+  766|             _mlock_gb = __import__("os").environ.get("TI_CLAIM_MLOCK_GB")
+[budget.py:766] TI_CLAIM_MLOCK_GB
+  764|             # 只是失败之前已经白干了。池子里的页在被写时会自然 fault 进来，锁不锁
+  765|             # 对正确性没有影响；真要锁用 TI_CLAIM_MLOCK_GB 指定一个合理上限。
+  766|             _mlock_gb = __import__("os").environ.get("TI_CLAIM_MLOCK_GB")
+  767|             if _mlock_gb:
+[budget.py:895] TI_RAM_RESERVE_GB
+  893|         import os
+  894| 
+  895|         _BUDGET = HostBudget(os.environ.get("TI_RAM_RESERVE_GB"))
+  896|     return _BUDGET
+[calibrate.py:31] TI_CALIB_DIR
+  29| 
+  30| def _cache_path() -> Path:
+  31|     base = os.environ.get("TI_CALIB_DIR")
+  32|     if base:
+[deepseek\compressed_attention.py:166] TI_DERIVED_MB
+  164|         import os
+  165| 
+  166|         cap = int(float(os.environ.get("TI_DERIVED_MB", "0")) * (1 << 20))
+  167|         if cap <= 0:
+[deepseek\compressed_attention.py:407] TI_ATTN_PROF
+  405|         # start_pos. None keeps the single-sequence path exactly as it was.
+  406|         import os as _os
+  407|         _pt = {} if _os.environ.get("TI_ATTN_PROF") else None
+  408|         _t0 = __import__("time").perf_counter() if _pt is not None else 0.0
+[deepseek\compressed_attention.py:422] TI_LINDBG
+  420|             if hasattr(w, "forward"):
+  421|                 return w.forward(x_)
+  422|             if __import__("os").environ.get("TI_LINDBG") == "1":
+  423|                 print(f"[lin] F.linear {tuple(w.shape)} {w.dtype}", flush=True)
+[deepseek\compressed_attention.py:732] TI_KV_TRACE
+  730|                 self._kv_cap_reported = False
+  731|                 import os as _os
+  732|                 if _os.environ.get("TI_KV_TRACE") == "1":
+  733|                     print(f"[kv] L{getattr(self, 'layer_id', '?')} grow to {cap} groups "
+[deepseek\compressed_attention.py:836] TI_DEBUG_ATTN
+  834|                     torch.full_like(compress_idxs, -1))
+  835| 
+  836|         if __import__("os").environ.get("TI_DEBUG_ATTN") and \
+  837|                 getattr(self, "layer_id", -1) == 20:
+[deepseek\compressed_attention.py:876] TI_DEBUG_ATTN
+  874|             kv_all, idxs_all = kv_w, win_idxs
+  875| 
+  876|         if __import__("os").environ.get("TI_DEBUG_ATTN") == "1":
+  877|             print(f"[attn{self.layer_id}] s={s} kv_all={tuple(kv_all.shape)} "
+[deepseek\compressed_attention.py:914] TI_GPUDBG
+  912|         # batched gemm，实测 3.65 ms/token（每层一个 91us 的 kernel，占 GPU 时间 15%）。
+  913|         # bt_gemv 把它铺成一个 grid：一个 warp 一行，g 在 blockIdx.y。
+  914|         if __import__("os").environ.get("TI_GPUDBG") == "1":
+  915|             print(f"[btgemv] cuda={o.is_cuda} shp={tuple(o.shape)} "
+[deepseek\compressed_attention.py:934] TI_GPUDBG
+  932|                 o = _yb.view(1, 1, _g, _r)
+  933|             except Exception as _exc:
+  934|                 if __import__("os").environ.get("TI_GPUDBG") == "1":
+  935|                     import traceback as _tb
+[deepseek\compressor.py:256] TI_DEBUG_IDX
+  254|             self.rt.index_k = self._k_cache
+  255|         import os as _os
+  256|         if _os.environ.get("TI_DEBUG_IDX"):
+  257|             print(f"[idx] start={start_pos} s={s} owns_k={self.owns_k} latent={None if latent is None else tuple(latent.shape)} "
+[deepseek\compressor.py:300] TI_NO_MASK_CACHE
+  298|         # 挂在 self 上（每层一个）语义正确，且省掉了跨层的 key 比较。
+  299|         key = (start_pos, s, t)
+  300|         cached = (None if __import__("os").environ.get("TI_NO_MASK_CACHE")
+  301|                   else getattr(self, "_mask_cache", None))
+[deepseek\gemv_fp4_marlin.py:131] TI_MARLIN_DEBUG
+  129|     except Exception as _exc:
+  130|         import os as _o
+  131|         if _o.environ.get("TI_MARLIN_DEBUG") != "0":
+  132|             print(f"[marlin] native repack unavailable: {_exc!r}", flush=True)
+[deepseek\gemv_fp4_marlin.py:202] TI_MARLIN_CACHE
+  200| # which is 6.0 MB per expert at this model's shape. Measured on an 8GB card:
+  201| #
+  202| #     TI_MARLIN_CACHE=1    prefill(8 tokens)  1.9 s
+  203| #     TI_MARLIN_CACHE=64   prefill(8 tokens)  4.8 s
+[deepseek\gemv_fp4_marlin.py:203] TI_MARLIN_CACHE
+  201| #
+  202| #     TI_MARLIN_CACHE=1    prefill(8 tokens)  1.9 s
+  203| #     TI_MARLIN_CACHE=64   prefill(8 tokens)  4.8 s
+  204| #     TI_MARLIN_CACHE=512  prefill(8 tokens) 11.3 s
+[deepseek\gemv_fp4_marlin.py:204] TI_MARLIN_CACHE
+  202| #     TI_MARLIN_CACHE=1    prefill(8 tokens)  1.9 s
+  203| #     TI_MARLIN_CACHE=64   prefill(8 tokens)  4.8 s
+  204| #     TI_MARLIN_CACHE=512  prefill(8 tokens) 11.3 s
+  205| #
+[deepseek\gemv_fp4_marlin.py:299] TI_MARLIN_DEBUG
+  297|         # 而表现只是「慢一点」，没有任何提示。这里必须能看到真正的原因。
+  298|         import os as _o
+  299|         if _o.environ.get("TI_MARLIN_DEBUG") != "0":
+  300|             print(f"[marlin] native launcher unavailable: {_exc!r}", flush=True)
+[deepseek\gemv_fp4_marlin.py:315] TI_MARLIN_PYD
+  313|         a = a.contiguous()
+  314|     import os as _os
+  315|     got = None if _os.environ.get("TI_MARLIN_PYD") == "1" else _native_launcher()
+  316|     if got is not None:
+[deepseek\hc.py:235] TI_SINKHORN
+  233|     # Hand-written kernel first: the eager form is ~160 launches of a 4-element kernel per
+  234|     # call, twice per layer, 40 layers deep. Verified bit-identical to the eager result.
+  235|     if mixes.is_cuda and __import__("os").environ.get("TI_SINKHORN") != "eager":
+  236|         try:
+[deepseek\hc.py:241] TI_SINKHORN_DEBUG
+  239|             # 不回退。eager 形式每次调用约 160 个 4 元素 kernel 的 launch，
+  240|             # 每层 2 次、40 层 = 每 token 上万 launch；而这个 except 只在
+  241|             # TI_SINKHORN_DEBUG 下才可见。失败就该直接报错。
+  242|             raise RuntimeError(f"sinkhorn native kernel failed: {_exc!r}") from _exc
+[deepseek\hc.py:294] TI_FUSE
+  292|     One kernel instead of two when it is available, bit-identical to the pair it replaces
+  293|     (the fused kernel rounds the collapsed row to bf16 at exactly the point hc_pre's
+  294|     output tensor would have materialised). Set TI_FUSE=0 to force the two-step path.
+  295|     """
+[deepseek\hc.py:300] TI_FUSE
+  298| 
+  299|     # 无条件走融合：hc_pre_rms_norm.cu 本来就把「按 pre_mix 收起超连接轴」和
+  300|     # rms_norm 写在一个 kernel 里，但这里原来要求 TI_FUSE=1 才进 —— 默认情况每层
+  301|     # 都退回「hc_pre 一个 kernel + rms_norm 一个 kernel」，40 层就是多 40 次 launch。
+[deepseek\hc.py:315] TI_FUSE_SYNC
+  313|                 from ..kernels import native
+  314| 
+  315|                 if _os.environ.get("TI_FUSE_SYNC") == "1":
+  316|                     # temporary probe: streamed layers publish their weights on the copy
+[deepseek\hc.py:466] TI_HC_MIXES_KERNEL
+  464|         # Enabling it changed the greedy answer from "涓浗鐨勯閮芥槸鍖椾含" to "涓浗鐨勯閮藉寳浜?,
+  465|         # so it stays off -- tier 2 is defined as full precision and the answer must not
+  466|         # move. TI_HC_MIXES_KERNEL=1 re-enables it for benchmarking only.
+  467|         # 无条件走 kernel：原来这里是 TI_HC_MIXES_KERNEL == "1" 才进，也就是默认
+[deepseek\hc.py:467] TI_HC_MIXES_KERNEL
+  465|         # so it stays off -- tier 2 is defined as full precision and the answer must not
+  466|         # move. TI_HC_MIXES_KERNEL=1 re-enables it for benchmarking only.
+  467|         # 无条件走 kernel：原来这里是 TI_HC_MIXES_KERNEL == "1" 才进，也就是默认
+  468|         # 情况下每层都退回到下面那条 torch 链（square/mean/add/rsqrt + F.linear +
+[deepseek\hc.py:510] TI_HC_KERNEL_SOFT
+  508|                 # 差了两层，实测多花一整轮才定位。
+  509|                 import os as _os_hc
+  510|                 if _os_hc.environ.get("TI_HC_KERNEL_SOFT") == "1":
+  511|                     pass
+[deepseek\hc.py:515] TI_HC_KERNEL_SOFT
+  513|                     raise RuntimeError(
+  514|                         f"hc_mixes native kernel failed ({_hc_exc!r}); set "
+  515|                         f"TI_HC_KERNEL_SOFT=1 to fall back to the torch chain") from _hc_exc
+  516|         xf = x.flatten(2).float()
+[deepseek\hc.py:618] TI_HC_T
+  616|         import os as _os
+  617|         import os as _os
+  618|         if _os.environ.get("TI_HC_T") == "1":
+  619|             import time as _t
+[deepseek\model.py:13] TI_FUSE
+  11| # Fused hc_pre + rms_norm: one kernel instead of two, 160 launches per decode token.
+  12| # Verified bit-identical across all 40 layers (first-difference probe over the whole
+  13| # stack), so it is the default; TI_FUSE=0 forces the original two-step pair for A/B.
+  14| #
+[deepseek\model.py:21] TI_FUSE
+  19| import os as _os_fuse
+  20| 
+  21| _FUSE_HC_PRE = _os_fuse.environ.get("TI_FUSE") != "0"
+  22| from .moe import MoE
+[deepseek\model.py:106] TI_BF16_CACHE
+  104|         self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk,
+  105|                        cache_shared_bf16=cache_shared_bf16,
+  106|                        max_bf16_experts=(0 if quant and not __import__("os").environ.get("TI_BF16_CACHE")
+  107|                                           else 8),
+[deepseek\model.py:309] TI_SLAB
+  307|         from ..cpu_kernels import slab
+  308| 
+  309|         st = None if _os.environ.get("TI_SLAB") is None else slab()
+  310|         if st is not None:
+[deepseek\model.py:359] TI_WALL_PROF
+  357|                 pre_mix = pre_mix.to(_tdev, non_blocking=True)
+  358|         import os as _os
+  359|         _wt = _os.environ.get("TI_WALL_PROF") == "1"
+  360|         if _wt:
+[deepseek\model.py:480] TI_GPUDBG
+  478|             h, pre_mix = block.forward(h, start_pos, pre_mix)
+  479|             # 每层用完把引用计数还回去（不 evict）：refs 归零后 LRU 下一层自然覆盖。
+  480|             if __import__("os").environ.get("TI_GPUDBG") == "1" and block.ffn.layer_id <= 1:
+  481|                 print(f"[rel0] L{block.ffn.layer_id} ids={len(getattr(block.ffn, '_last_ids', None) or [])}", flush=True)
+[deepseek\moe.py:27] TI_EP_DBG
+  25| # useful while EP is being finished but must cost nothing on a normal run (a getenv per
+  26| # forward would be a syscall per layer).
+  27| _EP_DBG = __import__("os").environ.get("TI_EP_DBG") == "1"
+  28| 
+[deepseek\moe.py:229] TI_MULTIROW_GEMV
+  227|             # kernel is explicitly requested; a chunk routes 1-2 rows per expert anyway.
+  228|             if (aqq.dim() == 2 and aqq.size(0) > 1
+  229|                     and __import__("os").environ.get("TI_MULTIROW_GEMV") == "1"):
+  230|                 return gemv_fp4_m8(aqq, assc, w, s)
+[deepseek\moe.py:388] TI_ASYNC_EXPERTS
+  386|         if st is None or getattr(st, "slots", None) is None:
+  387|             return None
+  388|         if __import__("os").environ.get("TI_ASYNC_EXPERTS", "1") == "0":
+  389|             return None
+[deepseek\moe.py:492] TI_GPUDBG
+  490|             except Exception as exc:
+  491|                 import traceback as _tb
+  492|                 if __import__("os").environ.get("TI_GPUDBG") == "1":
+  493|                     print(f"[load] L{layer} read failed: {exc!r}", flush=True)
+[deepseek\moe.py:521] TI_GPUDBG
+  519|         任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
+  520|         """
+  521|         if (__import__("os").environ.get("TI_GPUDBG") == "1"
+  522|                 and torch.cuda.is_current_stream_capturing()):
+[deepseek\moe.py:540] TI_MOE_BATCH
+  538|         #
+  539|         # 所以默认策略是：槽位够就**整批跑**（正确且更快），不够才分批。
+  540|         _env_bs = __import__("os").environ.get("TI_MOE_BATCH")
+  541|         if _env_bs:
+[deepseek\moe.py:604] TI_SLOT_DEBUG
+  602|                 # 吞掉之后下游只会看到一句 line 375。
+  603|                 import os as _os
+  604|                 if _os.environ.get("TI_SLOT_DEBUG") == "1" or not getattr(self, "_arena_warned", False):
+  605|                     self._arena_warned = True
+[deepseek\moe.py:644] TI_GPUDBG
+  642|                 for _e in indices.view(-1).tolist():
+  643|                     _rc[int(_e)] = _rc.get(int(_e), 0) + 1
+  644|             if __import__("os").environ.get("TI_GPUDBG") == "1":
+  645|                 print(f"[idx] L{self.layer_id} max={int(indices.max())} "
+[deepseek\moe.py:786] TI_MOE_CHK
+  784|             # 权重地址偏 4e16（compute-sanitizer 实测），多行 prefill 必崩。
+  785|             self._launch_keep = (sids, weights)
+  786|             if __import__("os").environ.get("TI_MOE_CHK") == "1":
+  787|                 print(f"[moechk] L{self.layer_id} rows={_rows} n_exp={n_exp} "
+[deepseek\moe.py:814] TI_GPUDBG
+  812|             return y.view(*x.shape[:-1], x.shape[-1]).to(x.dtype)
+  813|         except Exception as _exc:
+  814|             if __import__("os").environ.get("TI_GPUDBG") == "1":
+  815|                 import traceback as _tb
+[deepseek\moe.py:983] TI_MOE_PROF
+  981|     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
+  982|         import os as _os0
+  983|         _prof = _os0.environ.get("TI_MOE_PROF") == "1"
+  984|         import time as _tp
+[engine.py:33] TI_TIER
+  31|     @classmethod
+  32|     def from_hf(cls, source: str | Path, **kwargs) -> "Engine":
+  33|         # TI_TIER lets a caller pick the optimisation level without touching code
+  34|         import os as _os
+[engine.py:36] TI_TIER
+  34|         import os as _os
+  35| 
+  36|         if "tier" not in kwargs and _os.environ.get("TI_TIER"):
+  37|             kwargs["tier"] = OptLevel(int(_os.environ["TI_TIER"]))
+[engine.py:37] TI_TIER
+  35| 
+  36|         if "tier" not in kwargs and _os.environ.get("TI_TIER"):
+  37|             kwargs["tier"] = OptLevel(int(_os.environ["TI_TIER"]))
+  38|         """Load directly from a HF repo id / hub snapshot / flat checkpoint dir.
+[engine.py:224] TI_DETERMINISTIC
+  222|             tier = _tier_plan(OptLevel[tier.upper()])
+  223|         self.tier = plan(tier) if isinstance(tier, OptLevel) else tier
+  224|         if __import__("os").environ.get("TI_DETERMINISTIC") == "1":
+  225|             torch.use_deterministic_algorithms(True, warn_only=True)
+[engine.py:227] TI_TORCH_ONLY
+  225|             torch.use_deterministic_algorithms(True, warn_only=True)
+  226|             torch.backends.cudnn.deterministic = True
+  227|         if __import__("os").environ.get("TI_TORCH_ONLY") == "1":
+  228|             # diagnostic: pure-torch numerics, no tilelang/fp4 kernels
+[engine.py:232] TI_TOPK
+  230|             self.tier.use_fp4_gemm = False
+  231|             self.tier.use_fp8_gemm = False
+  232|         _topk = int(__import__("os").environ.get("TI_TOPK", "0"))
+  233|         if _topk > 0:
+[engine.py:375] TI_SLOTS
+  373|                 hw = self.hw_plan
+  374|                 _slots = int(__import__("os").environ.get(
+  375|                     "TI_SLOTS", hw.expert_slots if hw is not None else 96))
+  376|                 # A card with expert slots serves its decode experts through Marlin, whose
+[engine.py:404] TI_CACHE_GB
+  402|                 # resident) * layer_b and is requested *after* this, so a fraction that is
+  403|                 # too large starves it (measured: 9.3s/token with a 15.3GB cache on this
+  404|                 # box). TI_CACHE_GB overrides for A/B.
+  405|                 # THE host pool: claim our whole share of physical RAM ONCE, as pinned
+[engine.py:438] TI_HOST_POOL_GB
+  436|                 # 每个 token 的专家读全靠这 28GB 兜。改成按可用内存取：
+  437|                 # 留 5GB 给进程自身，再留 25% 不动（给页缓存和内核），其余全给池。
+  438|                 # TI_HOST_POOL_GB 仍然可以硬指定。
+  439|                 # 用 total 而不是 available：available 已经把页缓存扣掉了，而读模型
+[engine.py:476] TI_HOST_POOL_GB
+  474|                     _planned_pool = min(_planned_pool, _live_free)
+  475|                 _target = max(192 << 20, min(_budget.room(), _planned_pool))
+  476|                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
+  477|                 if _pov:
+[engine.py:567] TI_FLAT
+  565|                               - (hw.gpu_layers if hw is not None else 0)) * _per_layer
+  566|                 _slab_reserve = 0
+  567|                 _flat_flag = __import__("os").environ.get("TI_FLAT")
+  568|                 if self.host_pool is not None and not (_flat_flag is not None
+[engine.py:571] TI_FLAT
+  569|                                                        and _flat_flag != "1"):
+  570|                     # only reserve slab room when flat streaming may use it; with
+  571|                     # TI_FLAT=0 the slab never runs and the bytes belong to the cache
+  572|                     # The slab itself is exactly sum(streamed layer bytes) (5.3GB here);
+[engine.py:596] TI_CACHE_GB
+  594|                 _cache_pool = None
+  595|                 _cache_bytes = max(192 << 20, int(_plan_cache))
+  596|                 _ov = __import__("os").environ.get("TI_CACHE_GB")
+  597|                 _ov_bytes = None
+[engine.py:609] TI_CACHE_GB
+  607|                     # the override may not exceed what the pool can actually guarantee:
+  608|                     # capacity larger than the backing slab makes every take() fail and the
+  609|                     # read path silently falls back (measured: TI_CACHE_GB=14 with a 6GB
+  610|                     # slab -> 555 fallbacks, decode 1.1s -> 1.9s)
+[engine.py:625] TI_CACHE_CAP_GB
+  623|                     # a read when the same expert is reused. Measured: 16GB cache leaves
+  624|                     # the slab 8 of 30 layers and decode sits at 519ms/step with 88% hit;
+  625|                     # 12GB lets the slab cover every streamed layer. TI_CACHE_CAP_GB
+  626|                     # exposes the split.
+[engine.py:643] TI_CACHE_CAP_GB
+  641|                     # 改成按宿主预算自适应：不给显式覆盖时，上限 = 预算里除 slab 之外
+  642|                     # 能拿到的全部（_pool_avail 已经扣掉了 slab_reserve），再留 25% 余量
+  643|                     # 给尚未加载的层权重。TI_CACHE_CAP_GB 仍然可以硬指定。
+  644|                     _cap_env = __import__("os").environ.get("TI_CACHE_CAP_GB")
+[engine.py:644] TI_CACHE_CAP_GB
+  642|                     # 能拿到的全部（_pool_avail 已经扣掉了 slab_reserve），再留 25% 余量
+  643|                     # 给尚未加载的层权重。TI_CACHE_CAP_GB 仍然可以硬指定。
+  644|                     _cap_env = __import__("os").environ.get("TI_CACHE_CAP_GB")
+  645|                     if _cap_env is None:
+[engine.py:673] TI_READERS
+  671|                     # 并行读深度：跟随 CPU 数（pread 在 C 侧释放 GIL，线程数真的
+  672|                     # 决定并行度），不再写死 16 的上限。
+  673|                     reader_threads=int(__import__("os").environ.get("TI_READERS", "0")) or 0,
+  674|                     cache_bytes=_cache_bytes,
+[engine.py:681] TI_CACHE_POLICY
+  679|                     # are tuned for a workload with a stable hot set to promote; this
+  680|                     # model's routing is flat enough that they mostly cost capacity.
+  681|                     policy=__import__("os").environ.get("TI_CACHE_POLICY", "lru"),
+  682|                     vram_slots=_slots if device != "cpu" else 0,
+[engine.py:697] TI_DIRECT
+  695|                     # 别的机器上（L20/Linux）测到过 6.3GB/s vs 页缓存 0.26GB/s，
+  696|                     # 但那是 ext4 上的 pread 而不是 Windows 的 NO_BUFFERING，
+  697|                     # 而且文件布局不同。用 TI_DIRECT 实测本机再决定。
+  698|                     # **默认关（走页缓存）。实测本机：**
+[engine.py:700] TI_DIRECT
+  698|                     # **默认关（走页缓存）。实测本机：**
+  699|                     #
+  700|                     #   TI_DIRECT=1  step=2647ms  read=2.59GB/步
+  701|                     #   TI_DIRECT=0  step=2508ms  read=0.36GB/步
+[engine.py:701] TI_DIRECT
+  699|                     #
+  700|                     #   TI_DIRECT=1  step=2647ms  read=2.59GB/步
+  701|                     #   TI_DIRECT=0  step=2508ms  read=0.36GB/步
+  702|                     #
+[engine.py:714] TI_DIRECT
+  712|                     #
+  713|                     # 别的机器/别的文件布局可能反过来（Linux ext4 上 pread 测到过
+  714|                     # 6.3GB/s）。所以留 TI_DIRECT=1 这个开关，换机器时实测再定。
+  715|                     direct=(__import__("os").environ.get("TI_DIRECT", "0") == "1"),
+[engine.py:715] TI_DIRECT
+  713|                     # 别的机器/别的文件布局可能反过来（Linux ext4 上 pread 测到过
+  714|                     # 6.3GB/s）。所以留 TI_DIRECT=1 这个开关，换机器时实测再定。
+  715|                     direct=(__import__("os").environ.get("TI_DIRECT", "0") == "1"),
+  716|                     # 规划器的统一账面：读并发、pin 预算都从它来，
+[engine.py:740] TI_NO_SLOTS
+  738|         # The VRAM slot pool is faster but not bit-reproducible yet (a slot can be
+  739|         # re-targeted while the GEMV that reads it is still queued; docs/README.md
+  740|         # section 10). TI_NO_SLOTS=1 trades about 40% of decode for deterministic logits.
+  741|         # **冷启动 = 进程一起来就让磁盘开工，并且请求不被它挡住。**
+[engine.py:750] TI_WARM
+  748|         #
+  749|         # 两者共享磁盘：请求是最高优先级，预热填请求之间的空隙（`_busy` 让路）。
+  750|         # 所以默认开启（TI_WARM=0 可关），而不是等第一个请求才动手 ——
+  751|         # 那会把启动后的空闲期白白浪费掉。
+[engine.py:752] TI_WARM
+  750|         # 所以默认开启（TI_WARM=0 可关），而不是等第一个请求才动手 ——
+  751|         # 那会把启动后的空闲期白白浪费掉。
+  752|         _warm_env = __import__("os").environ.get("TI_WARM", "1")
+  753|         if (self.expert_store is not None
+[engine.py:780] TI_TOP_K
+  778|                     print(f"[tinyinfer] expert slots cover {_pct:.0f}% of one decode "
+  779|                           f"step ({_have}/{_need_step}); every step re-fetches experts. "
+  780|                           f"TI_TOP_K=N can trade quality for IO here", flush=True)
+  781|                 elif _have:
+[engine.py:786] TI_NO_SLOTS
+  784|             except Exception as _we:
+  785|                 print(f"[tinyinfer] warm-up skipped ({_we!r})", flush=True)
+  786|         if __import__("os").environ.get("TI_NO_SLOTS") == "1":
+  787|             for _st in (getattr(self, "expert_store", None),):
+[engine.py:796] TI_PREFILL_CHUNK
+  794|         self.allow_missing_layers = allow_missing_layers
+  795|         self.prefill_chunk = 2048  # overridden by the hardware plan on cuda
+  796|         # TI_PREFILL_CHUNK=1 forces the exactly reference-matching prefill path (each
+  797|         # token its own block); the planner's chunk is ~0.5% harder but 1.6x faster
+[engine.py:799] TI_PREFILL_CHUNK
+  797|         # token its own block); the planner's chunk is ~0.5% harder but 1.6x faster
+  798|         # (docs/README.md 13).
+  799|         _pc = __import__("os").environ.get("TI_PREFILL_CHUNK")
+  800|         if _pc:
+[engine.py:821] TI_GPU_LAYERS
+  819|             # overrides for experiments: residency 0 makes every layer stream through
+  820|             # the flat pair, which is more H2D but frees the VRAM the pair needs
+  821|             self.gpu_layers = max(0, int(_os.environ.get("TI_GPU_LAYERS", hw.gpu_layers)))
+  822|             # the plan already accounted for the head when it sized the resident set;
+[engine.py:827] TI_CHUNK
+  825|             # against device activations
+  826|             self.head_gpu = not hw.head_on_cpu
+  827|             self.prefill_chunk = int(_os.environ.get("TI_CHUNK", hw.prefill_chunk))
+  828|             # placement: while most layers stream, small activations round-trip every
+[engine.py:835] TI_HC_GPU
+  833|             # the whole layer (measured: 4 x 150ms x 38 layers = 24s of a 29s forward).
+  834|             self.small_ops_on_cpu = (small_op_on_cpu(self.gpu_layers, self.max_layers)
+  835|                                      and __import__("os").environ.get("TI_HC_GPU") != "1")
+  836|         if self.device != "cpu" and self.tier.level < OptLevel.AGGRESSIVE:
+[engine.py:895] TI_PREFETCH
+  893|         # the prediction misses often enough that the prefetch and the fetch read the
+  894|         # same blob twice (measured 5.3GB/step against 3.5GB of unique data)
+  895|         # tier.prefetch is the policy, TI_PREFETCH is the override: the field used to be
+  896|         # dead, so a tier that asked for prefetching only got it if the env var happened
+[engine.py:898] TI_PREFETCH
+  896|         # dead, so a tier that asked for prefetching only got it if the env var happened
+  897|         # to be set. Now the tier decides unless the operator forces it.
+  898|         _pf_env = __import__("os").environ.get("TI_PREFETCH")
+  899|         if _pf_env is None:
+[engine.py:934] TI_EMBED_GPU
+  932|         # card that cannot hold every layer it is pure waste: keeping it in host RAM
+  933|         # frees enough for two resident layers plus the expert staging pool.
+  934|         # TI_EMBED_GPU=1 forces the old behaviour (table in VRAM); it is the escape hatch
+  935|         # when a new heuristic regresses a machine that used to run.
+[engine.py:961] TI_EMBED_GPU
+  959|         # 不出来（!handles_.at(i) INTERNAL ASSERT）。
+  960|         # 现在按规划结果走：规划说 head 在 GPU、embed 不在，就照做。
+  961|         # TI_EMBED_GPU=1 可强制放回显存（捕获图时需要）。
+  962|         _plan_embed_gpu = bool(getattr(self.hw_plan, "embed_on_cpu", False) is False
+[engine.py:965] TI_EMBED_GPU
+  963|                                and self.hw_plan is not None)
+  964|         self.embed_on_cpu = (not _plan_embed_gpu)
+  965|         if __import__("os").environ.get("TI_EMBED_GPU") == "1":
+  966|             self.embed_on_cpu = False
+[engine.py:1030] TI_MTP
+  1028|         # MTP 的 draft 需要 [2, T, 512] 的拼接，而当前 serve 路径在 T 变化时给出了
+  1029|         # [1, T, 512]，服务端直接 500。默认关掉，等 shape 修好再开。
+  1030|         if __import__("os").environ.get("TI_MTP", "0") == "1":
+  1031|             # force the draft stages on even when the plan says they do not fit: used to
+[engine.py:1039] TI_MTP
+  1037|         # MTP 的 draft 需要 [2, T, 512]，而当前 serve 路径在 T 变化时给出 [1, T, 512]，
+  1038|         # 服务端直接 500。默认不加载（它也是启动阶段的一串逐 tensor 读盘）；
+  1039|         # shape 修好后用 TI_MTP=1 打开。
+  1040|         if _mtp_ok and device != "cpu" and __import__("os").environ.get("TI_MTP", "0") == "1":
+[engine.py:1040] TI_MTP
+  1038|         # 服务端直接 500。默认不加载（它也是启动阶段的一串逐 tensor 读盘）；
+  1039|         # shape 修好后用 TI_MTP=1 打开。
+  1040|         if _mtp_ok and device != "cpu" and __import__("os").environ.get("TI_MTP", "0") == "1":
+  1041|             try:
+[engine.py:1148] TI_WARMUP
+  1146|                 # unrelated question). Compilation is paid by the first request instead;
+  1147|                 # that is a JIT cost, not an allocation the pool could own.
+  1148|                 if __import__("os").environ.get("TI_WARMUP", "0") == "1":
+  1149|                     try:
+[engine.py:1171] TI_AUTO_SLOTS
+  1169|             # **模型全部就位之后，把槽位扩到显存允许的上限（默认开）。**
+  1170|             #
+  1171|             # 这里以前是 TI_AUTO_SLOTS=1 才启、并且调 _sl.reinit()。注释里写明了
+  1172|             # 为什么关着：reinit 先释放旧 arena 再按实测 free 重建，free 里还有
+[engine.py:1187] TI_AUTO_SLOTS
+  1185|             # 的 free 不覆盖 forward 的真实峰值（activation、cuBLAS workspace、
+  1186|             # 分配器碎片）。要开必须先测出真实峰值再回来定 reserve，否则就是
+  1187|             # 用一个没验证过的余量换一次启动失败。用 TI_AUTO_SLOTS=1 显式打开。
+  1188|             if __import__("os").environ.get("TI_AUTO_SLOTS") == "1":
+[engine.py:1188] TI_AUTO_SLOTS
+  1186|             # 分配器碎片）。要开必须先测出真实峰值再回来定 reserve，否则就是
+  1187|             # 用一个没验证过的余量换一次启动失败。用 TI_AUTO_SLOTS=1 显式打开。
+  1188|             if __import__("os").environ.get("TI_AUTO_SLOTS") == "1":
+  1189|                 _sl = getattr(getattr(self, "expert_store", None), "slots", None)
+[engine.py:1330] TI_EP
+  1328|         # layer computes all six experts and the result is correct, it just costs the
+  1329|         # duplicate weights. Turn it on only once a per-rank driver exists.
+  1330|         if __import__("os").environ.get("TI_EP") != "1":
+  1331|             self._ep_route = None
+[engine.py:1343] TI_EP
+  1341|             self._ep_route = route
+  1342|             print(f"[tinyinfer] {route.summary()}", flush=True)
+  1343|             print("[tinyinfer] WARNING: TI_EP=1 forces expert parallelism, but the per-rank "
+  1344|                   "driver is not implemented -- each layer will compute only its own "
+[engine.py:1501] TI_ASYNC_FETCH
+  1499|                 # the same MoE layer produce different values for different sequence
+  1500|                 # lengths (T=8 vs T=11 differed 4% on identical inputs), which showed up
+  1501|                 # as garbage tokens in the answer. Opt in with TI_ASYNC_FETCH=1.
+  1502|                 # tier.official_gemv: True forces the fused four-launch decode path,
+[engine.py:1507] TI_ASYNC_FETCH
+  1505|                 ffn._official_gemv = getattr(self.tier, "official_gemv", None)
+  1506|                 ffn._async_fetch = (bool(getattr(self.tier, "async_expert_fetch", False))
+  1507|                                     and __import__("os").environ.get("TI_ASYNC_FETCH") == "1")
+  1508|                 ffn._batched_scatter = bool(getattr(self.tier, "batched_scatter", False))
+[engine.py:1715] TI_ALL_PINNED
+  1713|                 # 默认不设 _all_pinned：pin 只覆盖 prefill 期的 top-34，采样解码仍会
+  1714|                 # 路由到没 pin 的专家，那时表里是 -1，直通 kernel 就是非法地址，
+  1715|                 # miss 分支要继续兜底。TI_ALL_PINNED=1 强制走全命中路径，用来量
+  1716|                 # 「没有每层 D2H」时到底能跑多快。
+[engine.py:1717] TI_ALL_PINNED
+  1715|                 # miss 分支要继续兜底。TI_ALL_PINNED=1 强制走全命中路径，用来量
+  1716|                 # 「没有每层 D2H」时到底能跑多快。
+  1717|                 if __import__("os").environ.get("TI_ALL_PINNED") == "1":
+  1718|                     for _b in self._blocks.values():
+[engine.py:2046] TI_FLAT
+  2044|             import os as _os
+  2045| 
+  2046|             flag = _os.environ.get("TI_FLAT")
+  2047|             if flag is not None and flag != "1":
+[engine.py:2137] TI_FLAT_DBG
+  2135|                     # 4096-byte allocation alignment leaves padding; bound it so a
+  2136|                     # pathological layout falls back to the packed copy instead
+  2137|                     if __import__("os").environ.get("TI_FLAT_DBG"):
+  2138|                         print(f"[zc] L{i} base={_pool_base} n={len(actual)} span={span} "
+[engine.py:2145] TI_ZC
+  2143|                     # (measured: base 8.67e9 vs data_ptr 5.3e12), so the span arithmetic
+  2144|                     # cannot be trusted until the loader lays weights out for it directly.
+  2145|                     # See docs/模型结构.md; TI_ZC=1 turns the experiment on.
+  2146|                     if (no_overlap and span <= total_b + 65536 * len(actual)
+[engine.py:2147] TI_ZC
+  2145|                     # See docs/模型结构.md; TI_ZC=1 turns the experiment on.
+  2146|                     if (no_overlap and span <= total_b + 65536 * len(actual)
+  2147|                             and __import__("os").environ.get("TI_ZC") == "1"):
+  2148|                         lay[i] = (actual, span)
+[engine.py:2179] TI_RING
+  2177|         # depth 2 = 1.04-1.27s/token = 0.867. Deeper is not free -- each extra ring slot
+  2178|         # costs 463MB of the 6.9GB card -- so 3 is the measured optimum, not a maximum.
+  2179|         _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "3"))))
+  2180|         bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(_ring_n)]
+[engine.py:2190] TI_FLAT_PIN_GB
+  2188|         # Per-tensor fallback only: pin as much as the budget has left, one tensor at
+  2189|         # a time, and let the ones that do not fit stay pageable.
+  2190|         pin_budget = int(float(__import__("os").environ.get("TI_FLAT_PIN_GB", "0")) * (1 << 30))
+  2191|         if pin_budget <= 0:
+[engine.py:2215] TI_SLAB_FRAC
+  2213|         # their weights pre-staged, while a larger cache means fewer 18.8MB expert reads
+  2214|         # per token. Measured steady-state decode (0.66 -> 0.75 hit rate takes the step
+  2215|         # from 574ms to 519ms), so the cache is worth more than the slab. TI_SLAB_FRAC
+  2216|         # lets the split be measured instead of argued.
+[engine.py:2217] TI_SLAB_FRAC
+  2215|         # from 574ms to 519ms), so the cache is worth more than the slab. TI_SLAB_FRAC
+  2216|         # lets the split be measured instead of argued.
+  2217|         _slab_frac = float(__import__("os").environ.get("TI_SLAB_FRAC", "0.28"))
+  2218|         _slab_cap = int(_hb.total * _slab_frac)
+[engine.py:2221] TI_FLAT_DBG
+  2219|         if slab_total > _slab_cap:
+  2220|             slab_total = _slab_cap
+  2221|         if __import__("os").environ.get("TI_FLAT_DBG"):
+  2222|             _f = sizes[streamed[0]] if streamed else 0
+[engine.py:2250] TI_FLAT_DBG
+  2248|             # both the source and the slab live inside the claimed pool; nothing here
+  2249|             # touches private host memory.
+  2250|             if __import__("os").environ.get("TI_FLAT_DBG"):
+  2251|                 print(f"[flatdbg] pool total={_pool.total / 2**30:.2f}GB used="
+[engine.py:2396] TI_DEBUG_FLAT
+  2394|         offs, total = lay[layer]
+  2395|         buf = bufs[buf_idx]
+  2396|         if __import__("os").environ.get("TI_DEBUG_FLAT"):
+  2397|             print(f"[flat] layer {layer} buf {buf_idx} slab={host is not None and layer in host}",
+[engine.py:2620] TI_HEAD_KERNEL
+  2618|         if (getattr(self, "tier", None) is not None
+  2619|                 and self.tier.level < OptLevel.EXTREME
+  2620|                 and __import__("os").environ.get("TI_HEAD_KERNEL") != "0"):
+  2621|             # the fault this kernel used to hit was a host-resident head (a CPU pointer
+[engine.py:2634] TI_HEAD_DEBUG
+  2632|                     return _o.float().view(*h.shape[:-1], head.shape[0])
+  2633|             except Exception as _exc:
+  2634|                 if __import__("os").environ.get("TI_HEAD_DEBUG"):
+  2635|                     print(f"[head] kernel path unavailable: {_exc!r}", flush=True)
+[engine.py:2659] TI_V5
+  2657|             # 8GB card: even two signature groups of flat buffers push VRAM past the
+  2658|             # physical limit (measured 9330MB peak -> WDDM paging), so keep it off.
+  2659|             self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
+  2660|             self._v5_stream = None
+[engine.py:2672] TI_LAYER_TIME
+  2670|                 n = min(n, self.available_layers())
+  2671|             layer_seq = list(range(n))
+  2672|         _tt0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+  2673|         if __import__("os").environ.get("TI_MEM_DBG"):
+[engine.py:2673] TI_MEM_DBG
+  2671|             layer_seq = list(range(n))
+  2672|         _tt0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+  2673|         if __import__("os").environ.get("TI_MEM_DBG"):
+  2674|             _mf, _mt = torch.cuda.mem_get_info()
+[engine.py:2678] TI_GPUDBG
+  2676|                   f"{torch.cuda.memory_allocated() / 2**20:.0f}MB reserved="
+  2677|                   f"{torch.cuda.memory_reserved() / 2**20:.0f}MB", flush=True)
+  2678|         if __import__("os").environ.get("TI_GPUDBG") == "1":
+  2679|             print(f"[trace] embed start capt={torch.cuda.is_current_stream_capturing()}", flush=True)
+[engine.py:2681] TI_GPUDBG
+  2679|             print(f"[trace] embed start capt={torch.cuda.is_current_stream_capturing()}", flush=True)
+  2680|         h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
+  2681|         if __import__("os").environ.get("TI_GPUDBG") == "1":
+  2682|             print("[trace] embed done", flush=True)
+[engine.py:2686] TI_GPUDBG
+  2684|         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
+  2685|         pre_mix[:, :, 0] = 1.0
+  2686|         if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
+  2687|             print("[capt] pre_mix done", flush=True)
+[engine.py:2740] TI_NO_FLAT_PREFETCH
+  2738|                     _ring = max(1, _ring)
+  2739|                     self._flat_wait(i, k % _ring)
+  2740|                     if __import__("os").environ.get("TI_NO_FLAT_PREFETCH") != "1":
+  2741|                         for d in range(1, _ring):
+[engine.py:2775] TI_V5
+  2773|                                     self._v5_pending[nxt] = self._stream_prefetch(nxt, self._v5_stream)
+  2774|                     except Exception:
+  2775|                         self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
+  2776|                         b.to(self.device)
+[engine.py:2785] TI_LAYER_TIME
+  2783|             # at all, and the plain attribute access crashed every Qwen run here.
+  2784|             if getattr(b, "engram", None) is not None and hash_ids is not None:
+  2785|                 _e0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+  2786|                 h = b.engram.forward(h, hash_ids[b.engram.hash_index])
+[engine.py:2792] TI_LAYER_TIME
+  2790|             # its target layers, hc-collapsed by a plain mean -- not the attn_norm output
+  2791|             # and not the attention input. Captured before forward() overwrites h.
+  2792|             _lt0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+  2793|             if __import__("os").environ.get("TI_MEM_TRACE"):
+[engine.py:2793] TI_MEM_TRACE
+  2791|             # and not the attention input. Captured before forward() overwrites h.
+  2792|             _lt0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+  2793|             if __import__("os").environ.get("TI_MEM_TRACE"):
+  2794|                 print(f"[mem] layer {i:2d} before alloc={torch.cuda.memory_allocated()/2**20:.0f}MB "
+[engine.py:2804] TI_GPUDBG
+  2802|                 continue
+  2803|             try:
+  2804|                 if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
+  2805|                     print(f"[capt] layer {i}", flush=True)
+[engine.py:2807] TI_GRAPH_CHUNK
+  2805|                     print(f"[capt] layer {i}", flush=True)
+  2806|                 if torch.cuda.is_current_stream_capturing():
+  2807|                     # **用 _graph_hi 收口，不是 TI_GRAPH_CHUNK。**
+  2808|                     # 这里以前是 `i >= TI_GRAPH_CHUNK`：分块捕获时外层把
+[engine.py:2808] TI_GRAPH_CHUNK
+  2806|                 if torch.cuda.is_current_stream_capturing():
+  2807|                     # **用 _graph_hi 收口，不是 TI_GRAPH_CHUNK。**
+  2808|                     # 这里以前是 `i >= TI_GRAPH_CHUNK`：分块捕获时外层把
+  2809|                     # _graph_lo 设成 0/4/8/.../36，但 break 条件仍然拿 i（绝对层号）
+[engine.py:2885] TI_DEBUG_NAN
+  2883|                     except Exception:
+  2884|                         pass
+  2885|             if __import__("os").environ.get("TI_DEBUG_NAN"):
+  2886|                 _fin = bool(torch.isfinite(h).all())
+[engine.py:2887] TI_DEBUG_NAN
+  2885|             if __import__("os").environ.get("TI_DEBUG_NAN"):
+  2886|                 _fin = bool(torch.isfinite(h).all())
+  2887|                 if (not _fin) or __import__("os").environ.get("TI_DEBUG_NAN") == "all":
+  2888|                     print(f"[dbg] layer {i:2d} finite={_fin} absmax={float(h.abs().max()):.2f}",
+[engine.py:2962] TI_V5
+  2960|     def _prefill_layer_major_impl(self, ids, T: int, step: int):
+  2961|         if not hasattr(self, "_v5_enabled"):
+  2962|             self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
+  2963|         # layer sequence identical to _forward_chunk
+[engine.py:2982] TI_GPUDBG
+  2980|             pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
+  2981|             pre_mix[:, :, 0] = 1.0
+  2982|         if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
+  2983|             print("[capt] pre_mix done", flush=True)
+[engine.py:3506] TI_GRAPH_CHUNK
+  3504|                 except Exception:
+  3505|                     _keep_rt = None
+  3506|                 # 分块捕获：每 TI_GRAPH_CHUNK 层一张图，所有图共享同一个 graph pool。
+  3507|                 # 块与块之间的 h/pre_mix 都在 pool 内、地址固定，replay 时依次执行。
+[engine.py:3518] TI_GRAPH_CHUNK
+  3516|                 # buffer，块内只写它们）。在那之前，一块图跑完全部 40 层是唯一
+  3517|                 # 正确的做法：捕获一次，replay 一次。
+  3518|                 _env_chunk = int(__import__("os").environ.get("TI_GRAPH_CHUNK", "0") or 0)
+  3519|                 if _env_chunk <= 0 or _env_chunk >= self.max_layers:
+[engine.py:3892] TI_SPEC_DEBUG
+  3890|             return []
+  3891|         import os as _os
+  3892|         if _os.environ.get("TI_SPEC_DEBUG"):
+  3893|             top = dlogits[0, 0].topk(3)
+[engine.py:3970] TI_SPEC_DEBUG
+  3968|                         break
+  3969|                 import os as _os
+  3970|                 if _os.environ.get("TI_SPEC_DEBUG"):
+  3971|                     _p0 = int(preds[0].argmax())
+[engine.py:4031] TI_TIME
+  4029|                     break
+  4030|                 logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=len(ids) + step)
+  4031|                 if __import__("os").environ.get("TI_TIME"):
+  4032|                     _t1 = _t.perf_counter()
+[gemm.py:214] TI_FP8_DEBUG
+  212|             return y.view(1, n)
+  213|         except Exception as _exc:
+  214|             if __import__("os").environ.get("TI_FP8_DEBUG") == "1":
+  215|                 import traceback as _tb
+[gemm.py:252] TI_FP8_GEMV
+  250|             # N=2304/K=5120 and it faults there too, asynchronously inside hc_post).
+  251|             # Forcing a 16-byte-aligned copy of x did not fix it. Off until that kernel's
+  252|             # alignment assumptions are understood: TI_FP8_GEMV=1 enables it.
+  253|             # (A tilelang fused_fp8_gemv was wired behind TI_FP8_GEMV here; it is gone
+[gemm.py:253] TI_FP8_GEMV
+  251|             # Forcing a 16-byte-aligned copy of x did not fix it. Off until that kernel's
+  252|             # alignment assumptions are understood: TI_FP8_GEMV=1 enables it.
+  253|             # (A tilelang fused_fp8_gemv was wired behind TI_FP8_GEMV here; it is gone
+  254|             # with the rest of tilelang.)
+[gemm.py:276] TI_MMA_GEMM
+  274|     # The crossover sits between 1 and 64, so anything a prefill chunk produces is a win.
+  275|     if (x.is_cuda and x.dim() == 2 and x.size(0) >= 64 and block == 32
+  276|             and __import__("os").environ.get("TI_MMA_GEMM") == "1"):
+  277|         try:
+[gemm.py:288] TI_FP8_PQ
+  286|     # ([989,43,4571,5958] -> [223,19,17,20]). Those rows now fall through to the row
+  287|     # loop below, which is the same kernel as M=1 -- fewer launches would be nicer, but
+  288|     # identical arithmetic matters more. TI_FP8_PQ=1 restores the old path.
+  289|     # gemv_fp8.fused_fp8_gemv_pq（TileLang）随该模块一起删除。
+[gemm.py:300] TI_PREFILL_TL
+  298|         # once and a wrong KV cache poisons every token after it.
+  299|         #
+  300|         # TI_PREFILL_TL=1 routes it back through tilelang's block-M GEMM for comparison.
+  301|         if __import__("os").environ.get("TI_PREFILL_TL") != "1":
+[gemm.py:301] TI_PREFILL_TL
+  299|         #
+  300|         # TI_PREFILL_TL=1 routes it back through tilelang's block-M GEMM for comparison.
+  301|         if __import__("os").environ.get("TI_PREFILL_TL") != "1":
+  302|             xf = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+[gemm.py:372] TI_SLOTS
+  370|     # quantisation x fp4 weight), and it is what the fused MoE path already runs on cards
+  371|     # with no expert slots. Putting Marlin's w4a16 in front of it made the same weights
+  372|     # produce different tokens on different hardware: measured with TI_SLOTS=6 on this box,
+  373|     # out went from [223,19,17,20] to [14,342,4571,1017].
+[gemm.py:380] TI_FP4_MARLIN
+  378|     # scales read directly, fp4 table in shared memory, activation staged in shared
+  379|     # memory), so the 3% it still gives up to Marlin does not pay for a different answer
+  380|     # across hardware. Marlin stays as a fallback, and TI_FP4_MARLIN=1 puts it back in
+  381|     # front.
+[gemm.py:383] TI_FP4_MARLIN
+  381|     # front.
+  382|     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
+  383|         if __import__('os').environ.get('TI_FP4_MARLIN', '0') == '1':
+  384|             try:
+[gemm.py:400] TI_MMA_GEMM
+  398|     # an expert gets ~14 rows, well under the M where mma beats a GEMV (see the crossover
+  399|     # measurements above fp8_linear). The fp8 projections are where a large M appears and
+  400|     # where TI_MMA_GEMM matters.
+  401|     #
+[hf_graph.py:167] TI_GRAPH_TRACE
+  165| 
+  166|                 g = torch.cuda.CUDAGraph()
+  167|                 if __import__("os").environ.get("TI_GRAPH_TRACE") == "1":
+  168|                     import traceback as _tb
+[kcheck\attention.py:31] TI_MODEL
+  29|         report.add(Case('attention', 'skipped (no CUDA device)', True))
+  30|         return
+  31|     model = os.environ.get('TI_MODEL')
+  32|     if not model or not os.path.isdir(model):
+[kcheck\attention.py:33] TI_MODEL
+  31|     model = os.environ.get('TI_MODEL')
+  32|     if not model or not os.path.isdir(model):
+  33|         report.add(Case('attention', 'skipped (set TI_MODEL)', True))
+  34|         return
+[kcheck\attention.py:92] TI_MODEL
+  90|         report.add(Case('compressed_attention', 'skipped (no CUDA device)', True))
+  91|         return
+  92|     model = os.environ.get('TI_MODEL')
+  93|     if not model or not os.path.isdir(model):
+[kcheck\attention.py:94] TI_MODEL
+  92|     model = os.environ.get('TI_MODEL')
+  93|     if not model or not os.path.isdir(model):
+  94|         report.add(Case('compressed_attention', 'skipped (set TI_MODEL)', True))
+  95|         return
+[kcheck\hc.py:33] TI_FUSE
+  31| 
+  32|     import os
+  33|     prev = os.environ.get('TI_FUSE')
+  34|     try:
+[kcheck\hc.py:36] TI_FUSE
+  34|     try:
+  35|         for fuse, label in (('1', 'fused'), ('0', 'two-step')):
+  36|             os.environ['TI_FUSE'] = fuse
+  37|             hc._FUSED_PRE_NORM = None
+[kcheck\hc.py:42] TI_FUSE
+  40|     finally:
+  41|         if prev is None:
+  42|             os.environ.pop('TI_FUSE', None)
+  43|         else:
+[kcheck\hc.py:44] TI_FUSE
+  42|             os.environ.pop('TI_FUSE', None)
+  43|         else:
+  44|             os.environ['TI_FUSE'] = prev
+  45|         hc._FUSED_PRE_NORM = None
+[kcheck\hc.py:66] TI_HC_NOFUSE
+  64| 
+  65|     import os
+  66|     prev = os.environ.get('TI_HC_NOFUSE')
+  67|     try:
+[kcheck\hc.py:68] TI_HC_NOFUSE
+  66|     prev = os.environ.get('TI_HC_NOFUSE')
+  67|     try:
+  68|         for env, label in (({'TI_HC_NOFUSE': '1'}, 'native/torch'), ({}, 'default')):
+  69|             os.environ.pop('TI_HC_NOFUSE', None)
+[kcheck\hc.py:69] TI_HC_NOFUSE
+  67|     try:
+  68|         for env, label in (({'TI_HC_NOFUSE': '1'}, 'native/torch'), ({}, 'default')):
+  69|             os.environ.pop('TI_HC_NOFUSE', None)
+  70|             os.environ.update(env)
+[kcheck\hc.py:76] TI_HC_NOFUSE
+  74|     finally:
+  75|         if prev is None:
+  76|             os.environ.pop('TI_HC_NOFUSE', None)
+  77|         else:
+[kcheck\hc.py:78] TI_HC_NOFUSE
+  76|             os.environ.pop('TI_HC_NOFUSE', None)
+  77|         else:
+  78|             os.environ['TI_HC_NOFUSE'] = prev
+  79|         hc._FUSED_POST_OK = None
+[kcheck\more.py:64] TI_FP4_ROWS
+  62|         asc = (torch.rand(k // 32, device='cuda') * 0.2 + 0.01).to(torch.float32)
+  63|         out = torch.empty(n, dtype=torch.bfloat16, device='cuda')
+  64|         # grid/block must match TI_FP4_ROWS in gemv_fp4_w4a8.cu (4 rows per block)
+  65|         native.launch(native.kernel('gemv_fp4_w4a8', 'gemv_fp4_w4a8'),
+[kcheck\mtp.py:30] TI_MODEL
+  28|         report.add(Case('mtp', 'skipped (no CUDA device)', True))
+  29|         return
+  30|     model = os.environ.get('TI_MODEL')
+  31|     if not model or not os.path.isdir(model):
+[kcheck\mtp.py:32] TI_MODEL
+  30|     model = os.environ.get('TI_MODEL')
+  31|     if not model or not os.path.isdir(model):
+  32|         report.add(Case('mtp', 'skipped (set TI_MODEL)', True))
+  33|         return
+[kcheck\mtp.py:35] TI_MTP
+  33|         return
+  34| 
+  35|     prev = os.environ.get('TI_MTP')
+  36|     os.environ['TI_MTP'] = '1'
+[kcheck\mtp.py:36] TI_MTP
+  34| 
+  35|     prev = os.environ.get('TI_MTP')
+  36|     os.environ['TI_MTP'] = '1'
+  37|     try:
+[kcheck\mtp.py:66] TI_MTP
+  64|     finally:
+  65|         if prev is None:
+  66|             os.environ.pop('TI_MTP', None)
+  67|         else:
+[kcheck\mtp.py:68] TI_MTP
+  66|             os.environ.pop('TI_MTP', None)
+  67|         else:
+  68|             os.environ['TI_MTP'] = prev
+  69| 
+[kcheck\planner.py:22] TI_MODEL
+  20|     from ..resources import model_profile
+  21| 
+  22|     path = os.environ.get('TI_MODEL')
+  23|     if not path:
+[kcheck\planner.py:39] TI_MODEL
+  37|     prof = _profile()
+  38|     if prof is None:
+  39|         report.add(Case('planner', 'skipped (set TI_MODEL to a checkpoint dir)', True))
+  40|         return
+[kernels\native.py:256] TI_STREAM_CHECK
+  254| # 每次 launch 回查 torch.cuda.current_stream() 的开销在 launch 热路径上很显著；
+  255| # 引擎内部不切换 stream，默认直接用缓存。外部调用者若自己切流，置
+  256| # TI_STREAM_CHECK=1 打开逐次校验。
+  257| _STREAM_CHECK = __import__("os").environ.get("TI_STREAM_CHECK") == "1"
+[kernels\native.py:257] TI_STREAM_CHECK
+  255| # 引擎内部不切换 stream，默认直接用缓存。外部调用者若自己切流，置
+  256| # TI_STREAM_CHECK=1 打开逐次校验。
+  257| _STREAM_CHECK = __import__("os").environ.get("TI_STREAM_CHECK") == "1"
+  258| 
+[kernels\native.py:327] TI_STREAM_CHECK
+  325|             # 流外 —— 图里只剩下 torch 的算子，手写 kernel 一个都没进图，replay 出来的
+  326|             # 是半张图，数值自然是错的（实测 L20：3 层起全 NaN）。
+  327|             # 打开 TI_STREAM_CHECK=1 后同一批测试立刻 graph=True、数值吻合，确认根因。
+  328|             #
+[loading.py:1069] TI_READ_THREADS
+  1067|         # 数只是增加排队和上下文切换。
+  1068|         #
+  1069|         # 默认 16，可用 TI_READ_THREADS 覆盖（那是给多盘 RAID 的机器）。
+  1070|         _env = _os.environ.get("TI_READ_THREADS")
+[loading.py:1070] TI_READ_THREADS
+  1068|         #
+  1069|         # 默认 16，可用 TI_READ_THREADS 覆盖（那是给多盘 RAID 的机器）。
+  1070|         _env = _os.environ.get("TI_READ_THREADS")
+  1071|         if _env:
+[loading.py:1785] TI_READ_THREADS
+  1783|         # 而报告的磁盘带宽反而从 2.34GB/s 降到 1.22GB/s —— 高并发时大量时间
+  1784|         # 花在排队上，有效吞吐更低。
+  1785|         _env_threads = int(__import__("os").environ.get("TI_READ_THREADS", "0") or 0)
+  1786|         target = _env_threads or int(getattr(self.reader, "threads", 0) or 16)
+[loading.py:2064] TI_CACHE_TRACE
+  2062|         key = (layer, expert)
+  2063|         with self._lock:
+  2064|             if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and len(self._entries) < 3:
+  2065|                 print(f"[admit] {key} present={key in self._entries} len={len(data)} "
+[loading.py:2220] TI_SLOTS
+  2218|             raise RuntimeError(
+  2219|                 "VRAM slot pool has 0 slots; the planner must reserve at least one "
+  2220|                 "(TI_SLOTS overrides)")
+  2221|         import torch
+[loading.py:2365] TI_SLOT_DEBUG
+  2363|             # 不清零、不降级。slots=0 会让每个 routed expert 每 token 都从主机内存
+  2364|             # 走一次 H2D（240 次/token），decode 从「显存直读」退成「主机中转」，
+  2365|             # 而整个降级只有 TI_SLOT_DEBUG=1 才可见。分配失败就报错。
+  2366|             raise RuntimeError(
+[loading.py:2369] TI_SLOT_DEBUG
+  2367|                 f"VRAM expert slot arena allocation failed "
+  2368|                 f"(slots={self.slots}, blob={self.blob_bytes}B): {_exc!r}") from _exc
+  2369|         if __import__("os").environ.get("TI_SLOT_DEBUG") == "1":
+  2370|             print(f"[slots] self.slots={self.slots} buffers={len(self._buffers)} "
+[loading.py:3825] TI_PIN_CACHE_GB
+  3823| 
+  3824|     def _pin_cap(self) -> int:
+  3825|         """Pinned bytes admitted to the RAM cache (TI_PIN_CACHE_GB overrides).
+  3826| 
+[loading.py:3835] TI_PIN_CACHE_GB
+  3833|         cap = getattr(self, "_pin_cap_bytes", None)
+  3834|         if cap is None:
+  3835|             env = __import__("os").environ.get("TI_PIN_CACHE_GB")
+  3836|             cap = int(float(env) * (1 << 30)) if env else 0
+[loading.py:3920] TI_CACHE_TRACE
+  3918|                 self.stats["ram_hit"] += len(misses) - len(_need_disk)
+  3919|             misses = _need_disk
+  3920|             if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
+  3921|                 print(f"[fetch] layer0 experts={experts} misses={misses}", flush=True)
+[loading.py:3926] TI_CACHE_TRACE
+  3924|                 # instead of issuing a second read of the same blob on this thread
+  3925|                 misses = [e for (_, e) in self._settle_pending([(layer, e) for e in misses])]
+  3926|                 if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
+  3927|                     print(f"[fetch] layer0 settled misses={misses}", flush=True)
+[loading.py:3931] TI_IOCP
+  3929|                 blobs = [self.index.expert_blob(layer, e) for e in misses]
+  3930|                 datas = None
+  3931|                 if __import__("os").environ.get("TI_IOCP") == "1":
+  3932|                     try:
+[loading.py:3981] TI_PP_DEBUG
+  3979|                         # Prefill borrows ~240 x 18.8MB per pass. A dedicated reserved
+  3980|                         # region gets the pinned 26GB/s without touching the cache's free
+  3981|                         # list. TI_PP_DEBUG re-reads the same blob through the bytearray
+  3982|                         # reader and compares bytes, to localize a mismatch between the
+[loading.py:4003] TI_CACHE_TRACE
+  4001|                             self.ram.admit(layer, b.key[1], d)
+  4002|                 except Exception as exc:
+  4003|                     if __import__("os").environ.get("TI_CACHE_TRACE") == "1":
+  4004|                         print(f"[fetch] admit path failed: {exc!r}", flush=True)
+[nn.py:458] TI_YARN_MSCALE
+  456|         # this engine aligns to. The plain HF reference table omits it, which is why
+  457|         # docs/README.md records the DeepInfer comparison as the reference one.
+  458|         _ms = float(os.environ.get("TI_YARN_MSCALE", "1.0"))
+  459|         if factor > 1 and _ms:
+[resources.py:446] TI_RING
+  444|     # 只留 10% 给 prefill wave / 运行时碎片。
+  445|     SLOT_FRACTION = 0.90
+  446|     # ring depth actually allocated by _flat_setup; TI_RING lets the two agree so the
+  447|     # planner does not reserve a buffer that is never allocated
+[resources.py:448] TI_RING
+  446|     # ring depth actually allocated by _flat_setup; TI_RING lets the two agree so the
+  447|     # planner does not reserve a buffer that is never allocated
+  448|     BUF_COUNT = max(2, min(4, int(__import__("os").environ.get("TI_RING", "3"))))
+  449| 
+[resources.py:529] TI_HEAD_CPU
+  527|     # forced head placement (diagnostics/tuning: keeps 1.3GB of VRAM for resident layers
+  528|     # at the price of a host GEMV per token)
+  529|     if __import__("os").environ.get("TI_HEAD_CPU") == "1":
+  530|         head_gpu = False
+[resources.py:534] TI_HEAD_CPU
+  532|         # _head_logits has no host-GEMV path (it slices the head on the device), so a
+  533|         # head_on_cpu plan only shows up later as a device mismatch. Keep the head
+  534|         # on-card unless the operator explicitly forces TI_HEAD_CPU.
+  535|         head_gpu = True
+[resources.py:538] TI_RESIDENT
+  536|     # forced residency: overrides the solver so a caller can trade the streaming ring for
+  537|     # resident layers (the prefill path has to free them again, see Engine._forward_impl)
+  538|     _force_resident = __import__("os").environ.get("TI_RESIDENT")
+  539|     resident = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0))
+[resources.py:573] TI_MAX_RESIDENT
+  571|     # can page, which makes identical runs differ (docs/README.md 19). Lower residency
+  572|     # trades speed for a better chance of reproducibility.
+  573|     _cap = __import__("os").environ.get("TI_MAX_RESIDENT")
+  574|     if _cap:
+[resources.py:618] TI_RESIDENT
+  616|     if not _force_resident:
+  617|         # the solver only keeps slot room when it chose the residency itself; a caller
+  618|         # that asked for a specific count (TI_RESIDENT) wants those layers, not slots
+  619|         while resident > 0 and int(spare * SLOT_FRACTION // max(1.0, expert_b)) < MIN_SLOTS:
+[resources.py:829] TI_READ_THREADS
+  827|     # 另一个时刻同一台机器又测出 8 最优 —— 所以它是「这块盘此刻的最优」，
+  828|     # 不是常数。calibrate 每次启动实测一遍并缓存。
+  829|     _rt = __import__("os").environ.get("TI_READ_THREADS")
+  830|     read_threads = 0
+[sched.py:246] TI_MAX_BATCH
+  244|         # （tests/test_batched_forward.py 锁住 batch=2 的前向），所以这里的
+  245|         # 上限只由 _fit() 按真实显存算出的数字决定，不再人为压到 1。
+  246|         # TI_MAX_BATCH 仍然可以覆盖（压测要能固定住）。
+  247|         _mb_env = __import__("os").environ.get("TI_MAX_BATCH")
+[sched.py:247] TI_MAX_BATCH
+  245|         # 上限只由 _fit() 按真实显存算出的数字决定，不再人为压到 1。
+  246|         # TI_MAX_BATCH 仍然可以覆盖（压测要能固定住）。
+  247|         _mb_env = __import__("os").environ.get("TI_MAX_BATCH")
+  248|         if _mb_env is not None:
+[server.py:80] TI_THINKING_MODE
+  78|     # "chat" (answer directly) or "thinking" (reason first); the checkpoint encodes the
+  79|     # two differently, so this must reach the prompt renderer (see tinyinfer.chat)
+  80|     mode = os.environ.get("TI_THINKING_MODE", "chat").strip().lower()
+  81|     return mode if mode in ("chat", "thinking") else "chat"
+[server.py:767] TI_GRAPH
+  765|         # （实测 10 次请求里 3 次 500：'NoneType' 和 [1,60,512] 广播失败）。
+  766|         # 引擎自己的 generate() 是同一条前向，但不经过图捕获和 prep 回放，
+  767|         # 实测稳定在 295ms/token。默认走它，需要时再用 TI_GRAPH=1 试图。
+  768|         _gmode = __import__("os").environ.get("TI_GRAPH", "batch")
+[server.py:768] TI_GRAPH
+  766|         # 引擎自己的 generate() 是同一条前向，但不经过图捕获和 prep 回放，
+  767|         # 实测稳定在 295ms/token。默认走它，需要时再用 TI_GRAPH=1 试图。
+  768|         _gmode = __import__("os").environ.get("TI_GRAPH", "batch")
+  769|         if _gmode == "plain":
+[server.py:776] TI_GRAPH
+  774|             # 整个 running 集合，是并发吞吐的来源。实测两个并发请求都能正确出
+  775|             # 结果（ServingEngine max_batch=2 直接跑通）。
+  776|             # TI_GRAPH=plain 退回逐请求串行，TI_GRAPH=1 试图捕获。
+  777|             yield from self._generate_batched(request)
+[server.py:981] TI_SERVER_PREFIX
+  979|         self._slot_kv: dict[int, dict[int, Any]] = {}
+  980|         # slot -> (token ids of the conversation so far, their count); lets a
+  981|         # request resume from the prefix instead of re-prefilling it (TI_SERVER_PREFIX=1)
+  982|         self._slot_prefix: dict = {}
+[server.py:1507] TI_SERVE_LOOP
+  1505|         # what the previous per-request lock did.
+  1506|         #
+  1507|         # The old path is kept reachable (TI_SERVE_LOOP=0) because it carries multi-turn
+  1508|         # prefix reuse and per-session KV snapshots that the batched loop does not yet
+[server.py:1512] TI_SERVE_LOOP
+  1510|         import os as _os_serve
+  1511| 
+  1512|         if _os_serve.environ.get("TI_SERVE_LOOP", "1") == "0":
+  1513|             with self._gen_lock:
+[server.py:1591] TI_MAX_BATCH
+  1589|             # 批宽跟着硬件走，不写死 8：和槽位数用同一个推导（真实的剩余显存
+  1590|             # + 上下文长度），所以 8GB 卡是 1、44GB 卡是 5 上下、141GB 卡是几十。
+  1591|             # 显式设了 TI_MAX_BATCH 就以它为准（压测要能固定住）。
+  1592|             import os as _os_w
+[server.py:1594] TI_MAX_BATCH
+  1592|             import os as _os_w
+  1593| 
+  1594|             _env = _os_w.environ.get("TI_MAX_BATCH")
+  1595|             if _env is not None:
+[server.py:1671] TI_SERVER_PREFIX
+  1669|                 # carries the whole conversation, so every turn after the first would
+  1670|                 # otherwise re-prefill the entire history (measured 9 -> 25 tokens of
+  1671|                 # prompt turning 10s into 26s). TI_SERVER_PREFIX=0 disables it.
+  1672|                 if __import__("os").environ.get("TI_SERVER_PREFIX") != "0":
+[server.py:1672] TI_SERVER_PREFIX
+  1670|                 # otherwise re-prefill the entire history (measured 9 -> 25 tokens of
+  1671|                 # prompt turning 10s into 26s). TI_SERVER_PREFIX=0 disables it.
+  1672|                 if __import__("os").environ.get("TI_SERVER_PREFIX") != "0":
+  1673|                     prev = self._slot_prefix.get(request.session_id or slot_id)
+[server.py:1746] TI_SERVER_PREFIX
+  1744|         finally:
+  1745|             self._stash_slot(slot_id, request.session_id)
+  1746|             if __import__("os").environ.get("TI_SERVER_PREFIX") != "0":
+  1747|                 # Record the *rendered* prompt, not prompt+generated: the next request
+[server.py:2491] TI_AUTO_SLOTS
+  2489|     # max_slots <= 0 表示「自己算」；显式传正整数就以调用方为准。
+  2490|     _slots = int(settings.max_slots)
+  2491|     if _slots <= 0 and __import__("os").environ.get("TI_AUTO_SLOTS", "1") != "0":
+  2492|         try:
+[tiers.py:114] TI_MOE_FP4
+  112|     # weights to fp4 on the fly (not a faithful run of the checkpoint) and measured a ~20%
+  113|     # per-layer error with a different answer on every run, so it demonstrably DEGRADES the
+  114|     # model. It is opt-in (TI_MOE_FP4=1) and must never be the default of any tier.
+  115|     return TierConfig(
+[tiers.py:131] TI_MOE_FP4
+  129|             "fp4_gemm_kernel": "DEGRADES output: coerces activations/weights to fp4 at "
+  130|                                "runtime, ~20% per-layer error, non-deterministic; opt-in "
+  131|                                "only (TI_MOE_FP4=1)",
+  132|         },

@@ -2713,6 +2713,8 @@ class VramSlotCache:
 
         只在本线程的 stream 上操作，不跨线程，所以不会和别的 CUDA 调用互等。
         """
+        import torch
+
         if not self._stage_bufs:
             self.table_flush(layer)
             return 0
@@ -2724,6 +2726,8 @@ class VramSlotCache:
             todo = [(idx, buf) for idx, buf in self._stage_bufs.items()
                     if self._key[idx] is not None
                     and (layer is None or self._key[idx][0] == layer)]
+        done = []
+        failed = []
         done = []
         failed = []
         for idx, buf in todo:
