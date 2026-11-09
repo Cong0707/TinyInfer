@@ -2931,7 +2931,11 @@ class VramSlotCache:
                 #
                 # 已经试过并全部否掉的（不要再试）：每次槽位 DMA 后全同步、
                 # copy 流等待计算流（16 层就 OOM，更糟）、每层用全部路由专家 make_ready、
-                # 每层 synchronize、全量 table_sync、每层独立 buffer。
+                # 每层 synchronize、全量 table_sync、每层独立 buffer、确定性驱逐策略
+                # （按槽位号选 victim）。
+                #
+                # 也验证过 flat_pos 的 [j:k for k,j in enumerate(flat_seq)] 假设：
+                # streamed 层实测 33 个、集合也是 33，唯一，不会丢键。这条可以排除。
                 #
                 # 要真解决只能改调度策略（按 (layer, expert) 排序固定驱逐顺序 +
                 # 严格串行），或者让槽位装得下一步的量（8GB 卡做不到）。这是一个
