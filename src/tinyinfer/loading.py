@@ -3535,6 +3535,12 @@ def _async_h2d(dst, src, nbytes: int, stream=None) -> bool:
     """
     import torch
 
+    # 诊断开关：强制不使用直接 DMA。
+    # 怀疑 cudaMemcpyAsync（经 ctypes 调用）的同步语义在这里不可靠 —— torch 的
+    # allocator 不知道这块 device 内存被外部写过。置 1 后退回 torch 的
+    # copy_(non_blocking=True)，它对该内存的依赖关系有完整认知。
+    if __import__("os").environ.get("TI_NO_ASYNC_H2D") == "1":
+        return False
     lib = getattr(_async_h2d, "lib", None)
     if lib is None:
         try:
