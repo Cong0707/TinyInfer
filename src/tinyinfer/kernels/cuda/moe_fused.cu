@@ -264,6 +264,10 @@ extern "C" __global__ void moe_fused_decode(
     // ================= 阶段一：gemv(gate/up) -> clamp/silu/权重 -> fp8 量化 =================
     // 对应 moe_gemv6(gate_up) + moe_act_q6 两次 launch，逐个专家进行。
     for (int e = 0; e < n_exp; ++e) {
+        // **槽位 -1 跳过。** 槽位不满时每个 token 都有大量专家不在显存，
+        // -1 * blob_bytes 是负偏移，会读到 arena 之前 —— CUDA_ERROR_ILLEGAL_ADDRESS。
+        // 这些专家的贡献由上层按缺失表补，这里跳过等价于「本步不参与」。
+        if (slot_ids[e] < 0) continue;
         // 槽位编号就是虚拟地址：arena + slot*blob_bytes + 层内固定偏移
         const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
         const unsigned char* w1 = arena + eb + w1_off;
@@ -324,6 +328,8 @@ extern "C" __global__ void moe_fused_decode(
     // 的 memset）。accumulate=1 时保持原有「读旧值再加」的语义。
     float acc = __bfloat162float(y[n]);            // moe_acc6 的 "acc = dst[i]"
         for (int e = 0; e < n_exp; ++e) {
+            // 同阶段一：槽位不在显存就跳过（否则负偏移读越界）
+            if (slot_ids[e] < 0) continue;
             const long long eb = (long long)slot_ids[e] * (long long)blob_bytes;
             const unsigned char* w2 = arena + eb + w2_off + (long long)n * (k_mid >> 1);
             const unsigned char* s2 = arena + eb + s2_off + (long long)n * (k_mid >> 5);

@@ -366,8 +366,21 @@ class Engine:
                 # Size the slab reserve from the planner's own per-layer number: the weights
                 # are not loaded yet, so this is the only honest figure available, and the
                 # old flat 28% of RAM reserved 13.2GB for a 6.5GB slab, starving the cache.
+                # **每层 streaming 字节用规划器的实测值，不能写死 178MB。**
+                #
+                # 178MB 是 safetensors header 里记的 fp8 载荷，而一层真正要搬进
+                # 环形缓冲的是一块连续 buffer，按最坏层开 463MB（本机实测）。
+                # 32 层差 9GB，slab 预留不够 → flat slab 建不起来 → 退回逐张量
+                # pinned 拷贝 → 那批临时内存 + 专家缓存一起把宿主池吃穿，
+                # 首次 forward 直接 OOM（表面症状是 slot arena 的 !handles_ 断言）。
+                _per_layer = 178e6
+                try:
+                    # 规划器从 safetensors header 推出的最坏层字节（已按实测比例放大）
+                    _per_layer = float((_prof or {}).get("max_layer_bytes", 0) or 0) or 178e6
+                except Exception:
+                    _per_layer = 178e6
                 _slab_need = (self.cfg.n_layers
-                              - (hw.gpu_layers if hw is not None else 0)) * 178e6
+                              - (hw.gpu_layers if hw is not None else 0)) * _per_layer
                 _slab_reserve = 0
                 _flat_flag = __import__("os").environ.get("TI_FLAT")
                 if self.host_pool is not None and not (_flat_flag is not None

@@ -129,6 +129,18 @@ extern "C" __global__ void moe_gemv6(
     if (n >= n_rows) return;
     const int e = blockIdx.y;
     const int which = blockIdx.z;
+    // **槽位 -1 必须在这里挡掉。** 槽位不满时每个 token 都有大量专家不在显存
+    // （本机 8 个槽位对 240 个需求），-1 * blob_bytes 是负偏移，读到的地址落在
+    // arena 之前 —— 直接 CUDA_ERROR_ILLEGAL_ADDRESS，整个 context 报废。
+    // moe_fused.cu 的三处早已挡了，这两个 gemv 还没。
+    // 输出写 0：这些专家的贡献由上层按缺失表补，写 0 等价于「本步不参与」，
+    // 留未初始化值会让 y 变成垃圾。
+    if (slot_ids[e] < 0) {
+        if (lane == 0) {
+            y[e * 2 * n_rows + which * n_rows + n] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
     // 槽位编号就是虚拟地址：权重在同一块 arena 里按 slot * blob_bytes 定位，
     // 再按本层的固定偏移取 w/s。GPU 侧全程不碰指针，CPU 也不必每层把指针
     // 数组 H2D 一次 —— slot_ids 是 12 个 int32，且专家组合固定时就是同一份字节。
@@ -162,6 +174,18 @@ extern "C" __global__ void moe_gemv6_bf16(
     if (n >= n_rows) return;
     const int e = blockIdx.y;
     const int which = blockIdx.z;
+    // **槽位 -1 必须在这里挡掉。** 槽位不满时每个 token 都有大量专家不在显存
+    // （本机 8 个槽位对 240 个需求），-1 * blob_bytes 是负偏移，读到的地址落在
+    // arena 之前 —— 直接 CUDA_ERROR_ILLEGAL_ADDRESS，整个 context 报废。
+    // moe_fused.cu 的三处早已挡了，这两个 gemv 还没。
+    // 输出写 0：这些专家的贡献由上层按缺失表补，写 0 等价于「本步不参与」，
+    // 留未初始化值会让 y 变成垃圾。
+    if (slot_ids[e] < 0) {
+        if (lane == 0) {
+            y[e * 2 * n_rows + which * n_rows + n] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
     // 同 moe_gemv6：槽位编号 × blob_bytes + 层内固定偏移。
     const long long _base = (long long)slot_ids[e] * blob_bytes;
     const unsigned char* w = arena + _base + (which ? w_off_alt : w_off)

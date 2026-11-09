@@ -55,11 +55,11 @@ constexpr int kThreads = 128;   // 本 kernel 的线程映射写死 128
 constexpr int kPerThread = kHeadDim / kThreads;  // 每线程 4 个连续维
 constexpr int kRopeStart = kHeadDim - kRopeDim;  // 448
 constexpr int kPairs = kPerThread / 2;           // 每线程 2 对
-static_assert(kHeadDim == kThreads * kPerThread, "512 维要正好分给 128 个线程");
-static_assert(kPerThread == 4, "8 个 lane 一个 32 元素组要求每 lane 4 维");
-static_assert(kGroup == 8 * kPerThread, "同上：一个量化组 = 8 lane x 4 维");
-static_assert(kRopeStart % kPerThread == 0, "rope 区必须按 4 维对齐，否则一对会跨线程");
-static_assert(kRopeDim == 2 * 32, "cos/sin 各 32 项");
+static_assert(kHeadDim == kThreads * kPerThread, "head_dim must split evenly across threads");
+static_assert(kPerThread == 4, "a 32-element group needs 4 dims per lane");
+static_assert(kGroup == 8 * kPerThread, "one quant group = 8 lanes x 4 dims");
+static_assert(kRopeStart % kPerThread == 0, "rope region must be 4-dim aligned");
+static_assert(kRopeDim == 2 * 32, "cos/sin are 32 entries each");
 
 // ---------------------------------------------------------------- 量化常量
 // 下面三个 device 函数从 act_quant.cu 原样照抄。它们不是等价变换：换成
