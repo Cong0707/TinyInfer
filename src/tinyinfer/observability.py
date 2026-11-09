@@ -31,6 +31,8 @@ import time
 from typing import Any
 
 
+NL = chr(10)
+
 def _safe(fn, default=None):
     """调一个可能不存在的统计方法；失败一律返回 default，不让观测拖垮服务。"""
     if not callable(fn):
@@ -146,3 +148,166 @@ def format_summary(obs: dict[str, Any]) -> str:
             f"  in_use={states.get('in_use', 0)} staged={states.get('staged', 0)}"
             f"  loads={s.get('loads')} evictions={s.get('evictions')}")
     return "\n".join(lines)
+
+
+# ---- 统一调试入口 -----------------------------------------------------------
+#
+# 以前排查一个问题要开好几个开关、跑好几次、把几次的输出拼起来看：
+#
+#   TI_MEM_TRACE=1   一次（看显存）
+#   TI_MOE_PROF=1    又一次（看 MoE 各段耗时）
+#   TI_CACHE_TRACE=1 又一次（看缓存命中）
+#   TI_TIME=1        又一次（看时间分布）
+#   TI_DEBUG_NAN=all 又一次（看是否 NaN）
+#
+# 问题不只是费时间：**每次运行的环境都不一样**（预热进度、页缓存温度、显存碎片），
+# 拼起来的"完整证据"其实来自几个不同的状态，互相之间不可比。有一次就是因为这个
+# 把「连续 4 次干净」当成了找到根因，复跑才发现是 6% 概率的巧合。
+#
+# 所以调试要一次拿全：`TI_DIAG=1` 打开，一次 forward 之后把下面这些一起 dump。
+# 判据固定、采样固定、输出固定，多次之间的差异就只来自被测对象本身。
+
+
+def diag_enabled() -> bool:
+    """唯一的调试开关。所有诊断数据都走它，不再有十来个独立开关。"""
+    import os
+
+    return os.environ.get("TI_DIAG") not in (None, "", "0")
+
+
+def collect_diag(engine, *, samples=None, forward_ms=None) -> dict[str, Any]:
+    """一次采集完整的调试证据。
+
+    与 collect_observability 的分工：那个给运维看（稳定、字段少、可以放心读）；
+    这个给排查看（要全、可以重、允许包含大块原始数据）。
+    """
+    import torch
+
+    out: dict[str, Any] = {
+        "ts": time.time(),
+        "hardware": None,
+        "plan": None,
+        "memory": None,
+        "transfer": None,
+        "cache": None,
+        "compute": None,
+        "correctness": None,
+        "timing": None,
+    }
+
+    try:
+        from . import tuning
+
+        out["hardware"] = {"key": tuning.hardware_key(),
+                           "params": tuning.params(getattr(engine, "_diag_model_dir", ""))}
+    except Exception:
+        pass
+
+    plan = getattr(engine, "hw_plan", None)
+    if plan is not None:
+        out["plan"] = {k: getattr(plan, k, None) for k in (
+            "expert_slots", "cache_bytes", "host_pool_bytes", "pin_ratio",
+            "read_threads", "gpu_layers", "stream_layers", "prefill_chunk",
+            "head_on_cpu", "embed_on_cpu", "fits", "reason")}
+
+    # 显存：已分配/保留/峰值/碎片。碎片高说明分配器在反复找块。
+    try:
+        if torch.cuda.is_available():
+            out["memory"] = {
+                "allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 3),
+                "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 3),
+                "max_allocated_gb": round(torch.cuda.max_memory_allocated() / 1e9, 3),
+                "free_gb": round(
+                    (torch.cuda.get_device_properties(0).total_memory
+                     - torch.cuda.memory_reserved()) / 1e9, 3),
+                "retries": int(getattr(
+                    torch.cuda.memory_stats().get("num_alloc_retries", 0), 0)),
+            }
+    except Exception:
+        pass
+
+    # 传输：异步 DMA 是否真的走了、退化了几次
+    try:
+        from .loading import _async_h2d_stats
+
+        out["transfer"] = _async_h2d_stats()
+    except Exception:
+        pass
+
+    # 缓存与命中（从 collect_observability 拿，口径唯一）
+    try:
+        obs = collect_observability(engine)
+        out["cache"] = {"slots": obs.get("slots"), "tiers": obs.get("tiers")}
+    except Exception:
+        pass
+
+    # 计算：MoE 各段累计耗时（原来只有 TI_MOE_PROF=1 才收）
+    try:
+        agg: dict[str, float] = {}
+        for lid in range(int(getattr(engine, "max_layers", 0) or 0)):
+            blk = _safe(lambda i=lid: engine._blocks.get(i))
+            ffn = getattr(blk, "ffn", None) if blk is not None else None
+            parts = getattr(ffn, "_parts", None)
+            if parts:
+                for k, v in parts.items():
+                    agg[k] = agg.get(k, 0.0) + float(v)
+        if agg:
+            out["compute"] = {k: round(v * 1e3, 1) for k, v in sorted(agg.items())}
+    except Exception:
+        pass
+
+    # 正确性：输出是否有限、同输入是否可重复（这条比速度重要）
+    if samples is not None:
+        out["correctness"] = samples
+
+    if forward_ms is not None:
+        out["timing"] = {"forward_ms": forward_ms}
+
+    return out
+
+
+def format_diag(diag: dict[str, Any]) -> str:
+    """把 collect_diag 的结果排成可读的报告。"""
+    lines = ["[diag] " + time.strftime("%H:%M:%S")]
+    hw = diag.get("hardware") or {}
+    if hw:
+        lines.append("  hardware : " + str(hw.get("key")))
+        p = hw.get("params") or {}
+        if p:
+            lines.append("  params   : " + ", ".join("%s=%s" % (k, v) for k, v in p.items()))
+    plan = diag.get("plan") or {}
+    if plan:
+        lines.append("  plan     : slots=%s cache=%sGB pool=%sGB pin=%s readers=%s layers=%s/%s" % (
+            plan.get("expert_slots"),
+            round((plan.get("cache_bytes") or 0) / 1e9, 2),
+            round((plan.get("host_pool_bytes") or 0) / 1e9, 2),
+            plan.get("pin_ratio"), plan.get("read_threads"),
+            plan.get("gpu_layers"),
+            (plan.get("gpu_layers") or 0) + (plan.get("stream_layers") or 0)))
+    mem = diag.get("memory") or {}
+    if mem:
+        lines.append("  memory   : alloc=%.2fG reserved=%.2fG peak=%.2fG free=%.2fG retries=%d" % (
+            mem.get("allocated_gb", 0), mem.get("reserved_gb", 0),
+            mem.get("max_allocated_gb", 0), mem.get("free_gb", 0),
+            mem.get("retries", 0)))
+    tr = diag.get("transfer") or {}
+    if tr:
+        lines.append("  transfer : async=%s fallback=%s rcfail=%s bytes=%.2fGB" % (
+            tr.get("ok_calls"), tr.get("fallback_path"), tr.get("rc_fail"),
+            (tr.get("ok_bytes") or 0) / 1e9))
+    tiers = (diag.get("cache") or {}).get("tiers") or {}
+    if tiers:
+        lines.append("  cache    : vram_hit=%.1f%% ram_hit=%.1f%% disk=%s" % (
+            100.0 * (tiers.get("vram_hit_rate") or 0),
+            100.0 * (tiers.get("ram_hit_rate") or 0), tiers.get("disk")))
+    comp = diag.get("compute") or {}
+    if comp:
+        lines.append("  compute  : " + "  ".join("%s=%.0fms" % (k, v)
+                                                for k, v in list(comp.items())[:8]))
+    corr = diag.get("correctness")
+    if corr:
+        lines.append("  correct  : " + str(corr))
+    tm = diag.get("timing") or {}
+    if tm:
+        lines.append("  timing   : %.0fms/step" % tm.get("forward_ms", 0))
+    return NL.join(lines)

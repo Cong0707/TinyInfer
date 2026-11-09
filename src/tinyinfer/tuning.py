@@ -72,7 +72,7 @@ def _home() -> Path:
 
 
 def config_path() -> Path:
-    return _home() / "settings.json"
+    return _home() / "tuning.json"
 
 
 def hardware_key() -> str:
@@ -201,6 +201,46 @@ def update(model_dir, values: dict, *, source: str = "runtime") -> None:
         save()
 
 
+
+# ---- 训练器 / 现场标定的存储（原本是两个独立文件）-------------------------
+#
+# 以前：tuned.json（训练器，按机器指纹分组）+ calibration.json（现场实测，
+#       按模型目录分组）。两者键名不同、位置不同、互相不知道对方存在。
+# 现在：都存进 tuning.json 的 models[模型] 下，各自保留原来的 dict 形状，
+#       调用方逻辑不变，只是换了存哪儿。
+
+def get_trainer(model_dir) -> dict:
+    return dict(get_model(model_dir).get("trainer") or {})
+
+
+def put_trainer(model_dir, chosen=None, measured=None) -> None:
+    global _dirty
+    with _lock:
+        ent = get_model(model_dir)
+        t = ent.setdefault("trainer", {})
+        if chosen is not None:
+            t["chosen"] = chosen
+        if measured is not None:
+            t["measured"] = measured
+        t["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _dirty = True
+    save()
+
+
+def get_calib(model_dir) -> dict:
+    return dict(get_model(model_dir).get("calib") or {})
+
+
+def put_calib(model_dir, values: dict) -> None:
+    global _dirty
+    with _lock:
+        ent = get_model(model_dir)
+        c = ent.setdefault("calib", {})
+        c.update(values or {})
+        c["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _dirty = True
+    save()
+
 def snapshot() -> dict:
     """当前配置的完整快照，给观测/排查用。"""
     return json.loads(json.dumps(load(), ensure_ascii=False))
@@ -240,3 +280,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

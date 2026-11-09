@@ -52,15 +52,46 @@ def machine_key() -> str:
 
 
 def load_tuned() -> dict:
+    """兼容旧接口：返回 shape 仍是 {"entries": {机器指纹: {chosen, measured}}}。
+
+    实际存储在 tuning.json 里（按模型分组），这里把当前机器的那一项投影出来。
+    这样所有调用方不用改逻辑，但存哪儿统一了。
+    """
     try:
-        return json.loads(TUNED_PATH.read_text(encoding="utf-8"))
+        from . import tuning
+
+        mk = machine_key()
+        ent = {}
+        for _m, mrec in (tuning.load().get("models") or {}).items():
+            t = (mrec or {}).get("trainer") or {}
+            if not t:
+                continue
+            ent.setdefault(mk, {})
+            if t.get("chosen"):
+                ent[mk]["chosen"] = t["chosen"]
+            if t.get("measured"):
+                ent[mk]["measured"] = t["measured"]
+        return {"version": 2, "entries": ent}
     except Exception:
-        return {"version": 1, "entries": {}}
+        return {"version": 2, "entries": {}}
 
 
 def save_tuned(data: dict) -> None:
-    TUNED_PATH.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + NL, encoding="utf-8")
+    """兼容旧接口：把 entries 写回 tuning.json 的对应模型项。"""
+    try:
+        from . import tuning
+
+        mk = machine_key()
+        ent = ((data.get("entries") or {}).get(mk)) or {}
+        if not ent:
+            return
+        # 写到"最近用过的模型"下；没有就写到 _default
+        models = (tuning.load().get("models") or {})
+        target = next(iter(models), "_default") or "_default"
+        tuning.put_trainer(target, chosen=ent.get("chosen"),
+                           measured=ent.get("measured"))
+    except Exception:
+        pass
 
 
 def lookup(model_dir=None) -> dict | None:
