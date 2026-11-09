@@ -25,6 +25,7 @@ def _code(model_dir, env_extra):
     L = []
     a = L.append
     a("import sys, os, json, time, statistics")
+    a("os.environ['TI_NO_AUTOTUNE'] = '1'")
     a("sys.path.insert(0, %r)" % _src())
     a("for _k, _v in %r.items(): os.environ[_k] = _v" % ({k: str(v) for k, v in env_extra.items()},))
     a("import torch")
