@@ -2104,10 +2104,24 @@ class Engine:
             import os as _os
 
             flag = _os.environ.get("TI_FLAT")
-            if flag is not None and flag != "1":
+            # **默认关闭。**
+            #
+            # slab 路径会把整层权重一次 DMA 进显存环（比逐 tensor 快，实测
+            # 2086ms vs 2893ms），但它目前会以约 50% 的概率产出 NaN。
+            #
+            # 定位到的事实（见 docs/未解决-不确定性.md）：
+            #   - TI_FLAT=0（关闭 slab）：4/4 全部 finite
+            #   - slab 开 + 直接 DMA 关：1/3 NaN
+            #   - slab 关 + 直接 DMA 开：4/4 全部 finite
+            # 所以问题在 slab 这条路径里，不在 DMA 的异步语义。已经排除了
+            # 环复用竞态（每层同步仍 NaN）和 slab 数据损坏（内容逐层检查干净）。
+            #
+            # 在查清之前，正确性优先：默认走逐 tensor 的整层搬运。要实验重新打开
+            # 用 TI_FLAT=1，但那份输出不可信。
+            if flag is None or flag != "1":
                 self._flat_state = "off"
                 return False
-            if flag is None and self.gpu_layers >= self.max_layers:
+            if self.gpu_layers >= self.max_layers:
                 # every layer is resident: there is nothing to stream
                 self._flat_state = "off"
                 return False
@@ -2530,6 +2544,9 @@ class Engine:
             # 5.8GB/s —— 正好是 pageable 的量级，不是 PCIe 的 26GB/s。
             # 整个 step 的 2200ms 里绝大部分就是它。
             _ok = False
+            # 诊断开关：TI_FLAT_SYNC=1 时把这一层的 DMA 做成同步，
+            # 用来区分「异步/环复用竞态」和「数据本身不对」。
+            _sync = __import__("os").environ.get("TI_FLAT_SYNC") == "1"
             try:
                 from .loading import _async_h2d as _ah2d
 
@@ -2539,6 +2556,8 @@ class Engine:
                 _ok = False
             if not _ok:
                 buf[:total].copy_(host[layer], non_blocking=True)
+            if _sync:
+                torch.cuda.synchronize()
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
             set_weight(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
         if getattr(b, "engram", None) is not None:
