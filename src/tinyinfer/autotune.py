@@ -1,176 +1,151 @@
-"""启动期自动调优：引擎在新机器上第一次运行就找到自己的最优配置。"""
+"""运行时自适应：PID 式闭环调优。
 
-import argparse, json, os, subprocess, sys, time
-from pathlib import Path
+离线训练（tinyinfer.tune）是扫一遍预设挑最好的，它的局限在于是**开环**的：
+选完参数就不管了。但引擎运行时的状态一直在变 —— 预热进度、页缓存温度、
+别的进程抢内存、路由分布漂移。同一组参数在冷启动和跑了一千步之后不是一回事。
 
-NL = chr(10)
-_MAX_CANDIDATES = 3
-_PROBE_TIMEOUT = 150
+所以需要一个闭环：**测量 -> 算误差 -> 调参数 -> 再测量**。这就是 PID。
 
+## 控制哪两个量
 
-def _src():
-    return str(Path(__file__).resolve().parents[1])
+被控量选「每步里 IO 占了多少时间」，因为它是引擎当前最贵的一项（本机实测
+单步 2.4s 里有 1~2s 在读盘），而且可以直接测：
 
+    io_ratio = 本步读盘耗时 / 本步总耗时
 
-def _key(model_dir):
-    try:
-        from .tune import machine_key
-        mk = machine_key()
-    except Exception:
-        mk = "unknown"
-    return mk + "|model=" + Path(str(model_dir)).name
+控制量选「预取提前几层」（prefetch_depth）。这个数原来是写死的 2 层：
+提前太少，层的专家还没读到 GPU 就已经要算了；提前太多，预取的专家把缓存
+挤掉正在用的。最优点随负载和盘速变，所以它应该被调，不该被写死。
 
+## 为什么用 PID 而不是简单的阈值
 
-def _code(model_dir, env_extra):
-    L = []
-    a = L.append
-    a("import sys, os, json, time, statistics")
-    a("os.environ['TI_NO_AUTOTUNE'] = '1'")
-    a("sys.path.insert(0, %r)" % _src())
-    a("for _k, _v in %r.items(): os.environ[_k] = _v" % ({k: str(v) for k, v in env_extra.items()},))
-    a("import torch")
-    a("from tinyinfer.engine import Engine")
-    a("out = {}")
-    a("e = None")
-    a("try:")
-    a("    e = Engine.from_hf(%r, device='cuda', allow_missing_layers=True)" % str(model_dir))
-    a("    ids = torch.tensor([[100,200,300,400,500]], dtype=torch.long, device='cuda')")
-    a("    s = []")
-    a("    ok = True")
-    a("    with torch.inference_mode():")
-    a("        e.forward(ids, 0); torch.cuda.synchronize()")
-    a("        for _ in range(3):")
-    a("            e.forward(torch.tensor([[7]], device='cuda'), 6); torch.cuda.synchronize()")
-    a("        for _ in range(3):")
-    a("            t0 = time.perf_counter()")
-    a("            e.forward(ids, 0); torch.cuda.synchronize()")
-    a("            s.append((time.perf_counter()-t0)*1e3)")
-    a("        x = e.forward(ids, 0); torch.cuda.synchronize()")
-    a("        y = e.forward(ids, 0); torch.cuda.synchronize()")
-    a("    if not bool(torch.isfinite(x).all()) or not bool(torch.isfinite(y).all()):")
-    a("        ok = False")
-    a("    else:")
-    a("        d = float((x.float()-y.float()).abs().max())")
-    a("        if d > 1e-2 * (float(x.float().abs().max()) + 1e-6): ok = False")
-    a("    s.sort()")
-    a("    out['step_ms'] = statistics.median(s) if s else 0.0")
-    a("    out['ok'] = ok")
-    a("except Exception as exc:")
-    a("    out['error'] = repr(exc)[:300]")
-    a("try:")
-    a("    out['slots'] = int(e.expert_store.slots.slots) if e is not None else -1")
-    a("except Exception:")
-    a("    out['slots'] = -1")
-    a("try:")
-    a("    if e is not None: e.close()")
-    a("except Exception:")
-    a("    pass")
-    a("print('AT' + json.dumps(out))")
-    return NL.join(L)
+纯阈值（"IO 超过 30% 就加一层"）会在边界上来回横跳，而且有惯性：调大之后
+要过几步才能看到效果，期间阈值又触发一次，最后振荡。PID 的积分项吸收这个
+延迟，微分项抑制过冲。参数不需要很准 —— 这里控制的是一个单调、低维、
+有明确边界的量，P 主导、I 消除稳态偏差就够。
+"""
+from __future__ import annotations
 
 
-def _probe(model_dir, env_extra, timeout_s):
-    env = os.environ.copy()
-    env.setdefault("PYTHONPATH", _src())
-    env.update({k: str(v) for k, v in env_extra.items()})
-    try:
-        p = subprocess.run([sys.executable, "-c", _code(model_dir, env_extra)],
-                           capture_output=True, text=True, timeout=timeout_s, env=env)
-    except subprocess.TimeoutExpired:
-        return {"error": "timeout"}
-    for line in (p.stdout or "").splitlines():
-        if line.startswith("AT"):
-            try:
-                return json.loads(line[2:])
-            except Exception:
-                pass
-    tail = (p.stderr or "").strip().splitlines()
-    return {"error": (tail[-1] if tail else "no output")[:200]}
+class PID:
+    """离散 PID，输出裁剪到 [lo, hi]。
+
+    anti-windup：积分项在输出饱和时不再累积，否则一旦被顶到边界，回程要
+    很多步才能退出来（这是 PID 最常见的实际故障）。
+    """
+
+    def __init__(self, kp: float, ki: float, kd: float,
+                 lo: float = 0.0, hi: float = 1.0, target: float = 0.0):
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.kd = float(kd)
+        self.lo = float(lo)
+        self.hi = float(hi)
+        self.target = float(target)
+        self.integral = 0.0
+        self.prev_err = None
+        self.last_out = None
+
+    def reset(self, target: float | None = None) -> None:
+        if target is not None:
+            self.target = float(target)
+        self.integral = 0.0
+        self.prev_err = None
+
+    def step(self, measured: float, dt: float = 1.0) -> float:
+        """喂一个测量值，返回下一步的控制量。
+
+        **误差方向是 measured - target（测量值高 = 输出高），不是反过来。**
+
+        这里控制的是「预取该多积极」，和被控量是正相关的：缺失越多（测量值越
+        高），越该加深预取。所以误差取 measured - target。
+
+        用相反的方向（target - measured）会得到一个负反馈回路：缺失越多 ->
+        输出越低 -> 预取越浅 -> 缺失更多。实测把 step 从 2508ms 推到 3800ms。
+        经典的 PID 是「维持目标」，而这里是「把它推向 0」，方向必须反。
+        """
+        dt = max(1e-6, float(dt))
+        err = float(measured) - self.target
+        deriv = 0.0 if self.prev_err is None else (err - self.prev_err) / dt
+        cand_integral = self.integral + err * dt
+        out = self.kp * err + self.ki * cand_integral + self.kd * deriv
+        # 输出饱和时不积累积分（anti-windup）
+        if self.lo < out < self.hi:
+            self.integral = cand_integral
+        out = min(self.hi, max(self.lo, out))
+        self.prev_err = err
+        self.last_out = out
+        return out
 
 
-def _candidates():
-    hi = 24
-    try:
-        from .resources import plan
-        hi = max(1, int(plan(model={}).expert_slots))
-    except Exception:
-        pass
-    lo = max(1, min(4, hi))
-    if hi <= lo:
-        return [hi]
-    n = min(_MAX_CANDIDATES, hi - lo + 1)
-    step = (hi - lo) / (n - 1)
-    return sorted({int(round(lo + i * step)) for i in range(n)})
+class PrefetchController:
+    """用 IO 占比控制预取深度。
 
+    目标：每步的 IO 时间占比压到 target_ratio 附近。太高说明预取不够（或者
+    盘真的慢），调大深度；太低说明预取过度、白占缓存。
 
-def discover(model_dir, *, budget_s=120.0, constraints=None, force=False, verbose=True):
-    constraints = dict(constraints or {})
-    model_dir = str(model_dir)
-    key = _key(model_dir)
-    if not force:
-        try:
-            from .tune import load_tuned
-            c = (((load_tuned().get("entries") or {}).get(key) or {}).get("chosen") or {}).get("autotuned")
-            if isinstance(c, dict) and c.get("params"):
-                return c
-        except Exception:
-            pass
-    t0 = time.perf_counter()
-    cands = [int(constraints["expert_slots"])] if "expert_slots" in constraints else _candidates()
-    if verbose:
-        print("[autotune] candidates=%s" % (cands,), flush=True)
-    measured, best = [], None
-    for s in cands:
-        left = budget_s - (time.perf_counter() - t0)
-        if left < 20:
-            break
-        r = _probe(model_dir, {"TI_SLOTS": str(s)}, min(_PROBE_TIMEOUT, left))
-        r["candidate_slots"] = s
-        measured.append(r)
-        if verbose:
-            msg = r.get("error") or ("step=%.0fms ok=%s" % (r.get("step_ms", 0), r.get("ok")))
-            print("[autotune] slots=%-3d %s" % (s, msg), flush=True)
-        if r.get("ok") and r.get("step_ms"):
-            if best is None or r["step_ms"] < best["step_ms"]:
-                best = r
-    el = time.perf_counter() - t0
-    if best is None:
-        return {"params": {}, "measured": measured, "error": "none passed determinism", "elapsed_s": round(el, 1)}
-    res = {"params": {"expert_slots": int(best["candidate_slots"])}, "step_ms": round(float(best["step_ms"]), 1),
-           "measured": measured, "elapsed_s": round(el, 1), "constraints": constraints,
-           "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
-    if verbose:
-        print("[autotune] best slots=%d step=%.0fms (%.0fs)" % (best["candidate_slots"], best["step_ms"], el), flush=True)
-    try:
-        from .tune import load_tuned, save_tuned
-        d = load_tuned()
-        e = d.setdefault("entries", {}).setdefault(key, {})
-        e.setdefault("chosen", {})["autotuned"] = res
-        e["ts"] = res["ts"]
-        save_tuned(d)
-    except Exception:
-        pass
-    return res
+    输出是连续的（0..1），映射到整数深度时用四舍五入并加死区，避免在相邻
+    两个深度之间每步横跳。
+    """
 
+    def __init__(self, target_ratio: float = 0.0, depth_lo: int = 0, depth_hi: int = 6,
+                 kp: float = 6.0, ki: float = 1.5, kd: float = 0.5):
+        # target=0：队列长度越接近 0 越好，不是「维持在 30%」。
+        # 之前 target 用 0.30（从 IO 占比那套继承来的），配上正确的误差方向
+        # 之后会让 PID 稳定在一个「永远保持 30% 缺失」的荒谬平衡点。
+        self.depth_lo = int(depth_lo)
+        self.depth_hi = int(depth_hi)
+        self.pid = PID(kp, ki, kd, lo=0.0, hi=1.0, target=float(target_ratio))
+        self.depth = max(self.depth_lo, min(self.depth_hi, 2))
+        self.samples = 0
+        self.history: list[tuple[float, int]] = []
 
-def main(argv=None):
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--budget", type=float, default=120.0)
-    ap.add_argument("--constraint", action="append", default=[])
-    ap.add_argument("--force", action="store_true")
-    a = ap.parse_args(argv)
-    cons = {}
-    for kv in a.constraint:
-        if "=" in kv:
-            k, v = kv.split("=", 1)
-            try:
-                cons[k] = int(v)
-            except ValueError:
-                cons[k] = v
-    print(json.dumps(discover(a.model, budget_s=a.budget, constraints=cons, force=a.force), ensure_ascii=False)[:1500])
-    return 0
+    def observe(self, io_ms: float, step_ms: float, *, min_step_ms: float = 5.0,
+                queue_depth: float | None = None) -> int:
+        """喂一步的测量，返回更新后的预取深度。
 
+        **两个测量源，优先用队列长度。**
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+        一开始只用 IO 时间占比，但实测 IO 压到 100~170ms（占单步 7%）之后它
+        就饱和了 —— PID 把预取深度推到上限 4 也没法再降，而单步还有 2.2 秒是
+        别的东西。那个反馈量已经死了。
+
+        更直接的量是「这一步有多少个专家不在槽位里」，也就是 GPU 侧扫出来的
+        缺失队列长度。它才是 CPU 要填的工作量：队列越长，说明预取跟不上、
+        或者槽位不够，此时加深预取有意义；队列接近 0 说明够了，可以放浅。
+
+        两者都传时以队列长度为准（它离真实工作量更近）；只有 io_ms 时退回
+        原来的比例控制，保持兼容。
+        """
+        if step_ms < min_step_ms:
+            return self.depth
+        if queue_depth is not None:
+            # 队列长度归一化到 [0,1]：以「一步要装的专家数」为满量程。
+            # 240 = 40 层 x topk 6，是这张卡上一步最多可能缺的个数。
+            ratio = max(0.0, min(1.0, float(queue_depth) / 240.0))
+        else:
+            ratio = max(0.0, min(1.0, float(io_ms) / float(step_ms)))
+        out = self.pid.step(ratio)
+        # 连续输出 -> 整数深度。0.5 附近加死区，避免横跳。
+        want = self.depth_lo + out * (self.depth_hi - self.depth_lo)
+        new_depth = int(round(want))
+        if abs(new_depth - self.depth) <= 0 and abs(want - (self.depth + 0.5)) > 0.35:
+            # 离当前深度不够远，保持不动（死区）
+            new_depth = self.depth
+        self.depth = max(self.depth_lo, min(self.depth_hi, new_depth))
+        self.samples += 1
+        if len(self.history) < 256:
+            self.history.append((ratio, self.depth))
+        return self.depth
+
+    def summary(self) -> dict:
+        if not self.history:
+            return {"samples": 0}
+        ratios = [r for r, _ in self.history]
+        return {
+            "samples": self.samples,
+            "io_ratio_mean": round(sum(ratios) / len(ratios), 3),
+            "io_ratio_last": round(ratios[-1], 3),
+            "depth": self.depth,
+            "target": self.pid.target,
+        }

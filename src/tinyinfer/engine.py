@@ -41,22 +41,6 @@ class Engine:
         Local-only by default; pass local_files_only=False to plan.resolve_hf_snapshot
         (via open_adapter) once network downloads are acceptable.
         """
-        # 启动期自调优：第一次加载时自己测出这台机器的最优配置，之后走缓存。
-        #
-        # 这是「引擎负责调优」的落点：调用方不需要知道槽位数该是多少 —— 它由
-        # 硬件和模型决定，由引擎自己测。换一台机器会测那个机器自己的值。
-        #
-        # 子进程里设 TI_NO_AUTOTUNE=1 防止递归（autotune 内部要建引擎来测）。
-        if _os.environ.get("TI_NO_AUTOTUNE") != "1":
-            try:
-                from .autotune import discover as _discover
-
-                _r = _discover(str(source))
-                _s = (_r.get("params") or {}).get("expert_slots")
-                if _s:
-                    _os.environ["TI_SLOTS"] = str(int(_s))
-            except Exception:
-                pass
         return cls(open_adapter(source), **kwargs)
 
     def close(self) -> None:
