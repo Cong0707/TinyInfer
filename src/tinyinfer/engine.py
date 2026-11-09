@@ -474,12 +474,29 @@ class Engine:
                 # 32 层差 9GB，slab 预留不够 → flat slab 建不起来 → 退回逐张量
                 # pinned 拷贝 → 那批临时内存 + 专家缓存一起把宿主池吃穿，
                 # 首次 forward 直接 OOM（表面症状是 slot arena 的 !handles_ 断言）。
-                _per_layer = 178e6
+                # **slab 预留按「每层实际字节」，不是「最坏层字节」。**
+                #
+                # 上一版用了 max_layer_bytes（最坏层 468MB），33 层 x 1.15 = 18.7GB 的
+                # 预留把整个池子吃光，缓存只剩 1.24GB（66 个专家，对每步 240 个需求
+                # 覆盖 27%）。而 slab 实际每层只吃 237MB —— 实测装完 33 层共 7.83GB。
+                # 两者差 2.4 倍：预留是按最坏层算的，装载是按实际字节算的。
+                #
+                # max_layer_bytes 的正确用途是「一个环形缓冲要开多大」（最坏层决定
+                # 单个 buffer 尺寸，必须按最坏的来），不是「所有层的总量」（那是
+                # 各层实际字节求和）。把这两个概念混在一起就是过度预留。
+                # 数值取 240MB：这是 33 个 streamed 层「实际字节求和 / 层数」的实测均值
+                # （slab 装完 33 层共 7.83GB），不是 header 报的 172MB 平均。
+                # 两者差 40%：header 的 layer_bytes 是各层 tensor 字节的平均，
+                # 而 slab 按 sizes[i]（每层实际 span）分配，含对齐和额外 buffer。
+                # 按 172MB 预留时 slab 差 2GB 建不起来，池子被 cache 独占
+                # （实测 pool used=21.57/21.57, free=0.00）。
+                _per_layer = 240e6
                 try:
-                    # 规划器从 safetensors header 推出的最坏层字节（已按实测比例放大）
-                    _per_layer = float((_prof or {}).get("max_layer_bytes", 0) or 0) or 178e6
+                    _lb = float((_prof or {}).get("layer_bytes", 0) or 0)
+                    if _lb > 0:
+                        _per_layer = max(_lb, float((_prof or {}).get("max_layer_bytes", 0) or 0) * 0.5)
                 except Exception:
-                    _per_layer = 178e6
+                    _per_layer = 240e6
                 _slab_need = (self.cfg.n_layers
                               - (hw.gpu_layers if hw is not None else 0)) * _per_layer
                 _slab_reserve = 0
