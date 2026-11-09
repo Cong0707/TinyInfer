@@ -471,7 +471,23 @@ class Engine:
                 if _planned_pool <= 0:
                     _planned_pool = _live_free
                 if _live_free > 0:
-                    _planned_pool = min(_planned_pool, _live_free)
+                    # **必须留一份给运行时，否则 PyTorch allocator 会坏掉。**
+                    #
+                    # 「吃满可用内存」这个方向试过：池子拿到全部 free 之后，
+                    # forward 里那些**运行期才发生**的分配就没有空间了——KV 增长、
+                    # attention 临时张量、dequant_fp8_block 展开的 fp32 中间量。
+                    # 症状不是干净的 OOM，而是 c10 的
+                    # "!handles_.at(i) INTERNAL ASSERT FAILED"（分配器状态断言），
+                    # 崩在 h.unsqueeze / dequant 这些随机位置，而且一旦出现，
+                    # 后面所有分配都会失败。
+                    #
+                    # 0.8 是「运行时需要多少」的估计：本机可用 35GB 时池子 28GB、
+                    # 运行时分到 7GB，覆盖 KV + activation + dequant 中间量有余。
+                    # 它和「这台机器有多少内存」无关（那个才是要删的机器常数），
+                    # 描述的是「池子与运行时的比例」。
+                    _planned_pool = min(_planned_pool,
+                                        int(_live_free * 0.8))
+                    _planned_pool = max(192 << 20, _planned_pool)
                 _target = max(192 << 20, min(_budget.room(), _planned_pool))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
                 if _pov:
