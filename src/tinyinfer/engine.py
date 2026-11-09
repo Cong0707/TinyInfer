@@ -490,8 +490,30 @@ class Engine:
                     # 18GB 左右稳定。pinned 内存每一块都要在 device 地址空间里
                     # 建立映射，这个资源和显存容量是两回事，耗尽的症状不是
                     # 干净的 OOM 而是分配器断言。留 40% 给运行时和映射开销。
+                    # 比例由训练器给（tuned.json 的 pool_ratio），没有就用 0.6。
+                    #
+                    # 0.6 是本机试出来的安全点：0.8（约 28GB）会撞 CUDA 的
+                    # device 映射资源耗尽（cuMemSetAccess OOM + !handles_ 断言），
+                    # 0.6（约 21GB）稳定。但这个"安全点"取决于卡型、驱动版本、
+                    # 显存大小和 pinned 的块数 —— 是训练器该扫的量，不是该写死的
+                    # 常数。tinyinfer.tune --layout 会把它一起扫进 tuned.json。
+                    # 优先级：TI_POOL_RATIO（训练器扫参时用）> tuned.json > 0.6
+                    _pr = 0.6
+                    try:
+                        _env_pr = __import__("os").environ.get("TI_POOL_RATIO")
+                        if _env_pr:
+                            _pr = max(0.1, min(0.95, float(_env_pr)))
+                    except (TypeError, ValueError):
+                        _pr = 0.6
+                    try:
+                        _cal = getattr(self, "_calib", None) or {}
+                        _cand = _cal.get("pool_ratio")
+                        if isinstance(_cand, (int, float)) and 0.1 <= float(_cand) <= 0.95:
+                            _pr = float(_cand)
+                    except Exception:
+                        _pr = 0.6
                     _planned_pool = min(_planned_pool,
-                                        int(_live_free * 0.6))
+                                        int(_live_free * _pr))
                     _planned_pool = max(192 << 20, _planned_pool)
                 _target = max(192 << 20, min(_budget.room(), _planned_pool))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")

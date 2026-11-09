@@ -20,7 +20,7 @@
     "gpu=NVIDIA_GeForce_RTX_5060_Laptop_GPU|vram=7G|ram=47G|os=win32": {
       "key": "gpu=NVIDIA_GeForce_RTX_5060_Laptop_GPU|vram=7G|ram=47G|os=win32",
       "model": "DeepSeek-V4.1-Flash-1017",
-      "ts": "2026-11-09T13:02:00",
+      "ts": "2026-11-09T14:47:31",
       "measured": {
         "baseline": {
           "step_ms": 2437.9,
@@ -42,11 +42,39 @@
           "step_ms": 2497.6,
           "read_gb": 2.024
         },
-        "best_step_ms": 2437.9
+        "best_step_ms": 2437.9,
+        "pool_ratio": {
+          "pool=0.40": {
+            "step_ms": 2496.6,
+            "slots": 24,
+            "resident": 7,
+            "loads": 7425
+          },
+          "pool=0.50": {
+            "step_ms": 4420.0,
+            "slots": 24,
+            "resident": 7,
+            "loads": 8274
+          },
+          "pool=0.60": {
+            "step_ms": 3001.8,
+            "slots": 24,
+            "resident": 7,
+            "loads": 8325
+          },
+          "pool=0.70": {
+            "step_ms": 2870.2,
+            "slots": 24,
+            "resident": 7,
+            "loads": 8312
+          }
+        }
       },
       "chosen": {
         "pin_ratio": 0.5,
-        "read_threads": 16
+        "read_threads": 16,
+        "pool_ratio": 0.4,
+        "pool_step_ms": 2496.6
       }
     }
   }

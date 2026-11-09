@@ -230,6 +230,48 @@ def _run_one(model_dir, env_extra, warmup=24, measure=8):
     return {"error": (tail[-1] if tail else "no output")[:160]}
 
 
+def tune_pool_ratio(model_dir, *, candidates=(0.4, 0.5, 0.6, 0.7), dry_run=False):
+    """扫宿主池占可用内存的比例，选每步耗时最小的。
+
+    **这个比例有硬边界，而且是硬边界、不是偏好。** 池子是 pinned 内存，每一块
+    都要在 device 地址空间建立映射；映射资源耗尽时不是干净的 CUDA OOM，而是
+    c10 的 !handles_ INTERNAL ASSERT，崩在随机的运行期临时分配上（实测 0.8 会崩、
+    0.6 稳定，但具体拐点取决于卡型和驱动版本）。
+
+    所以它是「这台机器能承受多少 pinned」，只能试出来。扫到失败就跳过该档，
+    最后记录能跑通且最快的那个。
+    """
+    results = {}
+    best = None
+    for r in candidates:
+        env = {"TI_POOL_RATIO": str(r)}
+        res = _run_one(model_dir, env)
+        tag = "pool=%.2f" % r
+        results[tag] = res
+        if "error" in res:
+            print("[tune] %-12s FAILED %s" % (tag, res["error"][:80]), flush=True)
+            continue
+        print("[tune] %-12s step=%.0fms slots=%d resident=%d" % (
+            tag, res["step_ms"], res["slots"], res["resident"]), flush=True)
+        if best is None or res["step_ms"] < best[1]["step_ms"]:
+            best = (tag, res, env)
+    if best is None:
+        print("[tune] pool scan produced nothing", flush=True)
+        return results
+    print("[tune] best pool: %s step=%.0fms" % (best[0], best[1]["step_ms"]), flush=True)
+    if not dry_run:
+        data = load_tuned()
+        ent = data.setdefault("entries", {}).setdefault(machine_key(), {})
+        ent.setdefault("measured", {})["pool_ratio"] = results
+        ch = ent.setdefault("chosen", {})
+        ch["pool_ratio"] = float(best[0].split("=")[1])
+        ch["pool_step_ms"] = best[1]["step_ms"]
+        ent["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        save_tuned(data)
+        print("[tune] wrote " + str(TUNED_PATH), flush=True)
+    return results
+
+
 def tune_layout(model_dir, *, resident_candidates=(0, 1, 3, 5, None),
                 slots_candidates=(None,), dry_run: bool = False):
     """扫「驻留几层 x 留几个槽位」，选每步耗时最小的组合。
@@ -287,6 +329,8 @@ def main(argv=None) -> None:
     ap.add_argument("--model", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--pool", action="store_true",
+                    help="扫宿主池比例（pinned 上限因机器而异，只能试出来）")
     ap.add_argument("--layout", action="store_true",
                     help="扫 resident x slots 的组合，选每步耗时最小的")
     args = ap.parse_args(argv)
@@ -303,6 +347,9 @@ def main(argv=None) -> None:
         return
     if not args.model:
         ap.error("--model is required unless --list/--layout")
+    if args.pool:
+        tune_pool_ratio(args.model, dry_run=args.dry_run)
+        return
     if args.layout:
         tune_layout(args.model, dry_run=args.dry_run)
         return
