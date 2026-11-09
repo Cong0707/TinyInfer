@@ -2558,6 +2558,19 @@ class Engine:
                 buf[:total].copy_(host[layer], non_blocking=True)
             if _sync:
                 torch.cuda.synchronize()
+            # 诊断：TI_FLAT_VERIFY=1 时把刚搬进来的内容和源逐字节比一次。
+            # 这是判断「slab 数据流对不对」最直接的办法 —— 比只看最终 logits 精确。
+            if __import__("os").environ.get("TI_FLAT_VERIFY") == "1":
+                _n = getattr(self, "_flat_verify_n", 0)
+                if _n < 40:
+                    self._flat_verify_n = _n + 1
+                    torch.cuda.synchronize()
+                    _a = host[layer][:total].cpu().view(torch.uint8)
+                    _b = buf[:total].cpu().view(torch.uint8)
+                    _bad = int((_a != _b).sum())
+                    if _bad:
+                        print("[flatverify] L%d bad=%d/%d" % (layer, _bad, total),
+                              flush=True)
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
             set_weight(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
         if getattr(b, "engram", None) is not None:
