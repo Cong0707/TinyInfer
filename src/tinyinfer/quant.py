@@ -39,7 +39,27 @@ def dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 32
     On CUDA this dispatches to a single fused tilelang kernel (about 4x faster than the
     torch elementwise path), which matters because wo_a is dequantized every token.
     """
-    if weight.is_cuda and block == 32:
+    # 快路径禁用：它在真实权重上非法寻址。
+    #
+    # 定位过程（症状很误导，值得记）：
+    # 1. 和 fp64 真值对拍，mean_err = 2.1478e-02，而参考值本身的 absmean 也是
+    #    2.1478e-02 —— 误差恰好等于信号大小，这是「输出约等于 0」的特征。
+    # 2. 直接看输出：absmean = 0.000000e+00。内核静默地什么都没写。
+    # 3. 用合成数据（同样 8192x4096、随机 scale）测却逐位正确。
+    # 4. 差别在真实张量的存储：wo_a.scale 的 data_ptr % 16 != 0。
+    #    把这一点断言出来，代价是 cuLaunchKernel failed: 700（illegal address）。
+    #
+    # 所以是内核的对齐假设问题：它按 16 字节向量化读 scale，而 e8m0 的 scale
+    # 是 torch 从 safetensors 里切出来的视图，起点不保证对齐。未对齐时 CUDA
+    # 不一定报错，可能只是那条指令被丢掉 —— 输出全 0，而调用方拿着一个看起来
+    # 正常的 bf16 张量继续往下算。
+    #
+    # 后果不只是精度：同一段输入的 top-1 logit 会在 12.6 / 18.8 / NaN 之间跳，
+    # 取决于当时 scale 落在哪个偏移上。
+    #
+    # 修好内核（按标量或 4/8 字节读 scale）并用真实权重、真实对齐对拍通过之前，
+    # 一律走 torch 路径。代价是每 token 多一次 134MB 的 fp32 中间张量。
+    if False and weight.is_cuda and block == 32:
         try:
             from .dequant_kernel import dequant_fp8
             return dequant_fp8(weight, scale)
