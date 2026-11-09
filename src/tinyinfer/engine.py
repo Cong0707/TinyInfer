@@ -343,11 +343,13 @@ class Engine:
             #
             # 「启动时根据经验公式生成默认参数写成配置」——这里是那一步的落点。
             # 配置里已有的参数优先于公式；没有的才让公式算。
+            _mdir = getattr(self.adapter, 'model_dir', None) or (
+                self.store.model_dir if hasattr(self.store, 'model_dir') else 'unknown')
             _cfg = None
             try:
-                from . import config as _cfgmod
+                from . import settings as _cfgmod
 
-                _cfg = _cfgmod.params(source_path)
+                _cfg = _cfgmod.params(_mdir)
             except Exception:
                 _cfg = None
             _cal = dict(getattr(self, "_calib", None) or {})
@@ -365,10 +367,10 @@ class Engine:
             # 把公式算出来的值写回配置（source=formula），下次启动就有据可依；
             # 已有实测值时不要用公式覆盖它。
             try:
-                from . import config as _cfgmod
+                from . import settings as _cfgmod
 
-                if _cfgmod.get_model(source_path).get("source") != "measured":
-                    _cfgmod.update(source_path, {
+                if _cfgmod.get_model(_mdir).get("source") != "measured":
+                    _cfgmod.update(_mdir, {
                         "expert_slots": int(self.hw_plan.expert_slots),
                         "pin_ratio": float(self.hw_plan.pin_ratio),
                         "read_threads": int(self.hw_plan.read_threads),
