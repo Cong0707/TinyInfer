@@ -1,6 +1,6 @@
 {
   "ok": false,
-  "seconds": 60.9,
+  "seconds": 77.1,
   "layers": [
     {
       "name": "accuracy",
@@ -8,33 +8,190 @@
       "passed": 85,
       "failed": 0,
       "failures": [],
-      "seconds": 16.3
+      "seconds": 19.3
     },
     {
       "name": "engine",
-      "ok": false,
-      "error": "RuntimeError('!handles_.at(i) INTERNAL ASSERT FAILED at \"C:\\\\\\\\actions-runner\\\\\\\\_work\\\\\\\\pytorch\\\\\\\\pytorch\\\\\\\\c10\\\\\\\\cuda\\\\\\\\CUDACachingAllocator.cpp\":487, please report a bug to PyTorch. ')",
-      "steps": 2,
-      "median_ms": 6527.7,
-      "build_s": 3.54
+      "ok": true,
+      "error": null,
+      "steps": 4,
+      "median_ms": 4684.2,
+      "build_s": 4.48
     },
     {
       "name": "utilization",
-      "ok": true,
-      "checks": [],
-      "plan": {},
-      "vram": {},
-      "dma": {}
+      "ok": false,
+      "checks": [
+        {
+          "desc": "槽位数：规划 23 / 实际 23",
+          "ok": true
+        },
+        {
+          "desc": "显存：用 8.52/8.52 GB (100%)，余 0.00 GB",
+          "ok": false
+        },
+        {
+          "desc": "异步 DMA：1476 次成功 / 0 次退化",
+          "ok": true
+        },
+        {
+          "desc": "缓存命中：vram 0.0% / ram 12.9% / disk 2815",
+          "ok": true
+        }
+      ],
+      "plan": {
+        "expert_slots": 23,
+        "cache_bytes": 14750981440,
+        "host_pool_bytes": 30883930112,
+        "pin_ratio": 0.5,
+        "read_threads": 8,
+        "gpu_layers": 7,
+        "stream_layers": 33,
+        "prefill_chunk": 8
+      },
+      "vram": {
+        "used_gb": 8.52,
+        "free_gb": 0.0,
+        "total_gb": 8.52,
+        "reserved_gb": 16.39
+      },
+      "dma": {
+        "ok_calls": 1476,
+        "ok_bytes": 27749744640,
+        "rc_fail": 0
+      }
     }
   ],
   "probe": {
-    "error": "RuntimeError('!handles_.at(i) INTERNAL ASSERT FAILED at \"C:\\\\\\\\actions-runner\\\\\\\\_work\\\\\\\\pytorch\\\\\\\\pytorch\\\\\\\\c10\\\\\\\\cuda\\\\\\\\CUDACachingAllocator.cpp\":487, please report a bug to PyTorch. ')",
+    "error": null,
     "steps_ms": [
-      8355.0,
-      4700.4
+      7477.8,
+      4438.1,
+      4507.2,
+      4861.2
     ],
-    "obs": null,
-    "plan": null,
-    "build_s": 3.54
+    "obs": {
+      "ts": 1794251771.3484466,
+      "engine": {
+        "device": "cuda",
+        "tier": 2,
+        "layers_total": 40,
+        "layers_resident": 7,
+        "layers_streamed": 33,
+        "expert_slots_planned": 23,
+        "prefill_chunk": 8,
+        "host_cache_gb": 14.75,
+        "head_on_cpu": false,
+        "embed_on_cpu": true,
+        "cuda_graph": false
+      },
+      "slots": {
+        "slots": 23,
+        "blob_bytes": 18800640,
+        "states": {
+          "free": 0,
+          "reserved": 0,
+          "copying": 0,
+          "staged": 23,
+          "in_use": 0
+        },
+        "occupied": 23,
+        "fill_ratio": 1.0,
+        "layers_present": 4,
+        "busiest_layers": [
+          [
+            37,
+            6
+          ],
+          [
+            38,
+            6
+          ],
+          [
+            39,
+            6
+          ],
+          [
+            36,
+            5
+          ]
+        ],
+        "loads": 1749,
+        "evictions": 1726,
+        "urgent_evictions": 24,
+        "pinned": 0,
+        "urgent": 6,
+        "dirty": 0
+      },
+      "tiers": {
+        "vram_hit": 0,
+        "ram_hit": 416,
+        "disk": 2815,
+        "placed": 1476,
+        "miss": 3231,
+        "warm": 1440,
+        "queue_last": 6,
+        "queue_peak": 30,
+        "total": 3231,
+        "vram_hit_rate": 0.0,
+        "ram_hit_rate": 0.12875270813989476
+      },
+      "store": {
+        "ram": {
+          "hits": 1153,
+          "misses": 787,
+          "hit_rate": 0.5943298969072165,
+          "disk_reads": 787,
+          "disk_gb": 14.79610368,
+          "evictions": 3502,
+          "load_seconds": 7.511105098645203,
+          "fallbacks": 644,
+          "entries": 86,
+          "pinned": 0,
+          "capacity": 86,
+          "policy": "lru",
+          "blob_bytes": 18800640.0
+        },
+        "reader": {
+          "bytes_read": 67719905280.0,
+          "read_calls": 7204.0,
+          "read_seconds": 104.83626229898073,
+          "gbps": 0.6459587913089726
+        },
+        "stream_reads": 0,
+        "stream_gb": 0.0,
+        "vram": {
+          "slots": 23,
+          "blob_bytes": 18800640,
+          "loads": 1749,
+          "evictions": 1726,
+          "staged": 23,
+          "copying": 0,
+          "gb": 0.43241472
+        }
+      }
+    },
+    "plan": {
+      "expert_slots": 23,
+      "cache_bytes": 14750981440,
+      "host_pool_bytes": 30883930112,
+      "pin_ratio": 0.5,
+      "read_threads": 8,
+      "gpu_layers": 7,
+      "stream_layers": 33,
+      "prefill_chunk": 8
+    },
+    "build_s": 4.48,
+    "dma": {
+      "ok_calls": 1476,
+      "ok_bytes": 27749744640,
+      "rc_fail": 0
+    },
+    "vram": {
+      "used_gb": 8.52,
+      "free_gb": 0.0,
+      "total_gb": 8.52,
+      "reserved_gb": 16.39
+    }
   }
 }

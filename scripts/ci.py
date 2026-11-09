@@ -141,9 +141,19 @@ try:
         out["dma"] = None
     try:
         p = torch.cuda.get_device_properties(0)
-        out["vram"] = {"used_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
-                       "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
-                       "total_gb": round(p.total_memory / 1e9, 2)}
+        # **用 mem_get_info，不要用 memory_allocated。**
+        #
+        # memory_allocated 会把同一个 storage 的多个 view 重复累加（实测同一份
+        # 权重被 38 层引用时报出 10.7GB，实际只有 0.54GB；整体分配量报 16.5GB
+        # 而物理只有 8.5GB —— 却明明跑通了）。它是「申请过多少」，不是「占用多少」。
+        #
+        # mem_get_info 问的是驱动：还剩多少、总共多少。这才是判断「吃满没有」
+        # 的依据。
+        free_b, total_b = torch.cuda.mem_get_info()
+        out["vram"] = {"used_gb": round((total_b - free_b) / 1e9, 2),
+                       "free_gb": round(free_b / 1e9, 2),
+                       "total_gb": round(total_b / 1e9, 2),
+                       "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2)}
     except Exception:
         out["vram"] = None
     try:
@@ -209,10 +219,19 @@ def layer_utilization(args, probe):
     # 显存：占满多少。留太多说明没吃满（浪费），但这是报告项不是失败项 ——
     # 不同模型/卡的合理区间不同，硬判会误报。
     if vram:
-        usable = max(0.01, vram["total_gb"])
-        frac = vram["reserved_gb"] / usable
-        checks.append(("显存占用：%.2f/%.2f GB (%.0f%%)" % (
-            vram["reserved_gb"], vram["total_gb"], frac * 100), True))
+        usable = max(0.01, vram.get("total_gb") or 0.01)
+        used = vram.get("used_gb") or 0.0
+        frac = used / usable
+        # 判据：吃满但不溢出。低于 60% 说明规划保守到浪费，高于 99% 说明没有余量
+        # （运行时临时分配会失败）。这是「资源利用率」那一层该管的。
+        # 判据分两半：
+        #   - 利用率不能太低（<60% 说明规划保守到浪费）
+        #   - **余量不能为 0**（运行时还要分配 activation、临时张量；free=0 就是
+        #     下一次分配必失败的信号，实测就是在这个状态撞 !handles_）
+        _free = vram.get("free_gb") or 0.0
+        checks.append(("显存：用 %.2f/%.2f GB (%.0f%%)，余 %.2f GB" % (
+            used, usable, frac * 100, _free),
+                       0.60 <= frac <= 0.97 and _free >= 0.15))
 
     # H2D 是否真走异步 DMA。零调用说明设备侧全在走退化路径。
     if dma:
