@@ -3402,6 +3402,18 @@ class VramSlotCache:
                 self._refs[idx] -= 1
             if self._refs[idx] == 0 and self._state[idx] == self.IN_USE:
                 self._state[idx] = self.STAGED
+            # **刷新冷度时间戳。** 不刷的话「最冷」退化成「轮转指针」：
+            # _claim_slot_locked 用 _last_used 选 victim，而这个时间戳原来只在
+            # commit() 里写一次，之后无论命中多少次、释放多少次都不再更新。
+            # 于是刚用完的专家（下一步最可能要用的那个）时间戳最旧，被优先淘汰 ——
+            # 实测 loads=789 evictions=765、vram_hit=0.0%，几乎全部装载立刻被
+            # 驱逐，正是这个原因。
+            if idx >= len(self._last_used):
+                # _last_used 是延迟初始化的（__init__ 里只是空列表，_ensure() 才
+                # 铺开成 [0.0]*slots）。这里必须同样补齐，否则 idx < 0 长度时
+                # 那行赋值被静默跳过，「最冷」永远停留在初始状态。
+                self._last_used = list(self._last_used) + [0.0] * (idx + 1 - len(self._last_used))
+            self._last_used[idx] = time.perf_counter()
             self._cond.notify_all()
 
     def drop(self, layer: int, expert: int) -> bool:

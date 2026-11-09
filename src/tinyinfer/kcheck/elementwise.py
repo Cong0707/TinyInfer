@@ -90,8 +90,14 @@ def _head_gemv(report):
         out = torch.empty(n_rows, dtype=torch.float32, device='cuda')
         warps = n_rows
         blocks = max(1, (warps * 32 + 255) // 256)
+        # **必须传共享内存大小。** 内核第 17 行是 `extern __shared__ float hs[]`，
+        # 第 20 行按 k_dim 往里写（k=5120 时 20KB）。native.launch 的 shared 默认 0，
+        # 不传就是往 0 字节的动态共享内存里写 —— 越界写，报 CUDA illegal memory
+        # access。这个用例自从内核改成「h 进 shared」（7dbcb03）之后就一直是坏的，
+        # 只是没人跑 check_kernels.py。
+        shared = int(k) * 4
         native.launch(native.kernel('head_gemv', 'head_gemv'), (blocks,), (256,),
-                      [h, w, out, n_rows, k])
+                      [h, w, out, n_rows, k], shared=shared)
         want = (w.float() @ h)
         check_close(report, f'head_gemv [{n_rows} rows, k={k}]', out, want, rtol=3e-2)
 
