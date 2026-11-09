@@ -2918,8 +2918,12 @@ class VramSlotCache:
                 #
                 #   max_layers=2   24 槽 / 12 个需求    5 次逐位一致
                 #   max_layers=8   ~24 槽 / 48 个需求   5 次逐位一致
-                #   max_layers=16  ~24 槽 / 96 个需求   开始出现 NaN
+                #   max_layers=16  ~24 槽 / 96 个需求   4 次全不同，loads 96->384、evict 72->360
                 #   max_layers=40  24 槽 / 240 个需求   每次不一致 + 大量 NaN
+                #
+                # **关键：nlay=16 在 TI_FLAT=0（关 slab、走逐 tensor）下同样不确定。**
+                # 这一条证伪了「flat slab 搬运是根因」这个前提 —— 两条搬运路径共用
+                # 同一个专家槽位池，池子装不下时两条都不确定。
                 #
                 # 40 层的实测统计：loads=789 evictions=765（97% 的装载立刻被驱逐）、
                 # vram_hit=0.0%。每层都在覆盖式驱逐，而「哪次装到哪个槽位」由时序
