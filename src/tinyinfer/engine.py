@@ -2502,7 +2502,18 @@ class Engine:
         lay, bufs, host = self._flat_state
         b = self.block(layer)
         offs, total = lay[layer]
-        buf = bufs[buf_idx]
+        # 诊断：TI_FLAT_PERLAYER=1 时给每层分配独立 buffer，不复用环形缓冲。
+        # 用来区分「多个层共享同一块 device storage」是不是 NaN 的来源。
+        if __import__("os").environ.get("TI_FLAT_PERLAYER") == "1":
+            if getattr(self, "_perlayer_bufs", None) is None:
+                self._perlayer_bufs = {}
+            _key = (layer, buf_idx)
+            buf = self._perlayer_bufs.get(_key)
+            if buf is None or buf.numel() < lay[layer][1]:
+                buf = torch.empty(lay[layer][1], dtype=torch.uint8, device=self.device)
+                self._perlayer_bufs[_key] = buf
+        else:
+            buf = bufs[buf_idx]
         if __import__("os").environ.get("TI_DEBUG_FLAT"):
             print(f"[flat] layer {layer} buf {buf_idx} slab={host is not None and layer in host}",
                   flush=True)
