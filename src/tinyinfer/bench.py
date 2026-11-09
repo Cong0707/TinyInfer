@@ -159,6 +159,34 @@ def main() -> None:
 
     nxt = int(logits[0, -1].argmax())
     pos = len(ids)
+    # **先预热到稳定，再开始计时。**
+    #
+    # 不预热的话测的是「后台预热线程跑到哪了」：同一份配置连续三次运行会得到
+    # 2083 / 4060 / 3671ms，看起来像性能退化。判据用「连续 3 步的读盘量变化
+    # < 10%」——比固定步数可靠，因为不同配置需要的预热步数不一样（本机 20~40 步）。
+    #
+    # 预热步本身不计入统计，但它们推进了 pos，所以后面从新的 pos 继续。
+    _rd = getattr(getattr(eng, "expert_store", None), "reader", None)
+    _warm = 0
+    if _rd is not None and hasattr(_rd, "bytes_read"):
+        _prev = None
+        _stable = 0
+        for _ in range(80):
+            _b0 = _rd.bytes_read
+            with torch.inference_mode():
+                _o = eng.forward(torch.tensor([[nxt]], device="cuda"), start_pos=pos)
+            torch.cuda.synchronize()
+            _warm += 1
+            _gb = (_rd.bytes_read - _b0) / 1e9
+            if _prev is not None and _prev > 0 and abs(_gb - _prev) < _prev * 0.10:
+                _stable += 1
+                if _stable >= 3:
+                    break
+            else:
+                _stable = 0
+            _prev = _gb
+            nxt = int(_o[0, -1].argmax())
+            pos += 1
     steps = []
     for _ in range(args.new_tokens):
         t0 = time.perf_counter()
