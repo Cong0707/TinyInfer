@@ -643,7 +643,35 @@ class Engine:
                     # direct=NO_BUFFERING reads: measured 6.3GB/s at 6 threads vs
                     # 0.26GB/s through the Windows file cache (which serialises the
                     # multi-threaded pread path on a big-blob stream)
-                    direct=True,
+                    # direct=NO_BUFFERING：**必须实测再定，不能照抄别的机器。**
+                    #
+                    # 这条路要求文件的偏移和长度都是 4KiB 对齐。实测本 checkpoint
+                    # 的 40 个专家 segment 里，**偏移 100% 不对齐**（长度都对齐）。
+                    # _WindowsDirect 的处理是「读一个对齐的超集再拷出需要的字节」，
+                    # 也就是每读一个 17MB 的段要多拷 17MB —— 对 240 次/步的装载
+                    # 来说这是纯浪费。
+                    #
+                    # 别的机器上（L20/Linux）测到过 6.3GB/s vs 页缓存 0.26GB/s，
+                    # 但那是 ext4 上的 pread 而不是 Windows 的 NO_BUFFERING，
+                    # 而且文件布局不同。用 TI_DIRECT 实测本机再决定。
+                    # **默认关（走页缓存）。实测本机：**
+                    #
+                    #   TI_DIRECT=1  step=2647ms  read=2.59GB/步
+                    #   TI_DIRECT=0  step=2508ms  read=0.36GB/步
+                    #
+                    # 关掉之后每步只读 0.36GB 而不是 2.59GB —— 86% 的专家请求命中
+                    # Windows 页缓存。这正好是「内存作为显存的缓存」那一层的实际
+                    # 工作方式：一步只要 4.5GB，47GB 的机器装得下，热点专家会
+                    # 自然留在页缓存里。有 475GB 的权重文件不等于页缓存没用，
+                    # 因为每步真正碰的只是其中很小一部分。
+                    #
+                    # 而 NO_BUFFERING 在这份 checkpoint 上还是**净损失**：40 个专家
+                    # segment 的 file_offset 100% 不是 4KiB 对齐（长度都对齐），
+                    # _WindowsDirect 要读对齐超集再拷出，每个 17MB 的段多拷 17MB。
+                    #
+                    # 别的机器/别的文件布局可能反过来（Linux ext4 上 pread 测到过
+                    # 6.3GB/s）。所以留 TI_DIRECT=1 这个开关，换机器时实测再定。
+                    direct=(__import__("os").environ.get("TI_DIRECT", "0") == "1"),
                     # 规划器的统一账面：读并发、pin 预算都从它来，
                     # ExpertStore 不再自己按 CPU 数或 0.5 系数猜。
                     plan=hw,
