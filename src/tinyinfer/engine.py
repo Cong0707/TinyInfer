@@ -498,20 +498,20 @@ class Engine:
                     # 显存大小和 pinned 的块数 —— 是训练器该扫的量，不是该写死的
                     # 常数。tinyinfer.tune --layout 会把它一起扫进 tuned.json。
                     # 优先级：TI_POOL_RATIO（训练器扫参时用）> tuned.json > 0.6
-                    _pr = 0.6
+                    _pr = 0.4
                     try:
                         _env_pr = __import__("os").environ.get("TI_POOL_RATIO")
                         if _env_pr:
                             _pr = max(0.1, min(0.95, float(_env_pr)))
                     except (TypeError, ValueError):
-                        _pr = 0.6
+                        _pr = 0.4
                     try:
                         _cal = getattr(self, "_calib", None) or {}
                         _cand = _cal.get("pool_ratio")
                         if isinstance(_cand, (int, float)) and 0.1 <= float(_cand) <= 0.95:
                             _pr = float(_cand)
                     except Exception:
-                        _pr = 0.6
+                        _pr = 0.4
                     _planned_pool = min(_planned_pool,
                                         int(_live_free * _pr))
                     _planned_pool = max(192 << 20, _planned_pool)
