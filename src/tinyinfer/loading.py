@@ -2526,7 +2526,26 @@ class VramSlotCache:
             if _cs is not None:
                 ev = torch.cuda.Event()
                 with torch.cuda.stream(_cs):
-                    buf.copy_(cpu, non_blocking=True)
+                    # **这里也要走 _async_h2d，不能用 buf.copy_。**
+                    #
+                    # 这条路是「槽位刚被别人交还、可能还有 kernel 在读」时走的，
+                    # 在 24 个槽位对 240 个需求的池子里它是**绝大多数**（实测
+                    # 每步 240 次装载全部命中这里）。而原来的 buf.copy_(cpu) 有
+                    # 个致命问题：cpu 是 torch.frombuffer(pool memoryview) 来的，
+                    # torch 不认它是 pinned（实测 is_pinned()==False），于是
+                    # copy_ 自己先做一次 pageable memcpy 到内部 staging 再发 DMA ——
+                    # 观测到的「7.8GB/s」就是这一步，不是 PCIe 的上限（26GB/s）。
+                    #
+                    # _async_h2d 直接对 pool 的内存地址发 cudaMemcpyAsync，
+                    # 绕开 torch 的 pinned 判断，一个 18.8MB 的块一次 DMA 到位。
+                    _ok = False
+                    try:
+                        if isinstance(data, memoryview):
+                            _ok = _async_h2d(buf, data, int(buf.numel()), stream=_cs)
+                    except Exception:
+                        _ok = False
+                    if not _ok:
+                        buf.copy_(cpu, non_blocking=True)
                     ev.record(_cs)
                 return ev
             buf.copy_(cpu, non_blocking=True)
@@ -2801,7 +2820,27 @@ class VramSlotCache:
         #
         # 如果调用方没给这个数，就用 blob 的整数倍留一格（至少一格槽位的空间），
         # 这是运行期临时区的最小合理假设。
-        _reserve = int(getattr(self, "_vram_reserve_bytes", 0) or 0)
+        # **reserve 用「已经真实发生过的峰值」，不是估算。**
+        #
+        # forward 跑过至少一次之后，torch.cuda.max_memory_allocated() 就是真实
+        # 峰值，分配器也已经把 activation / cuBLAS workspace / 碎片的块拿在手上
+        # （memory_reserved - memory_allocated 那部分）。这两个数相加就是这个
+        # 引擎运行时真正占用的量，free 再减去它才是可以给槽位的空间。
+        #
+        # 以前用「规划器的 ws0 + 一点」，在第一次 forward 之前调用时必然不够
+        # （实测建好 arena 之后第一次 forward 就 OOM），所以才一直默认关。
+        _reserve = 0
+        try:
+            import torch as _tt
+
+            if _tt.cuda.is_available() and _tt.cuda.is_initialized():
+                _peak = int(_tt.cuda.max_memory_allocated())
+                _cached = max(0, int(_tt.cuda.memory_reserved()) - int(_tt.cuda.memory_allocated()))
+                _reserve = _peak + _cached
+        except Exception:
+            _reserve = 0
+        if _reserve <= 0:
+            _reserve = int(getattr(self, "_vram_reserve_bytes", 0) or 0)
         if _reserve <= 0:
             _reserve = int(self.blob_bytes)
         _usable = int(_free) - _reserve
@@ -3465,6 +3504,13 @@ def _gpu_addressable(data) -> bool:
     return obj is not None and hasattr(obj, "addressof")
 
 
+_DMA_STATS = {"ok_calls": 0, "ok_bytes": 0, "rc_fail": 0}
+
+
+def _async_h2d_stats() -> dict:
+    return dict(_DMA_STATS)
+
+
 def _async_h2d(dst, src, nbytes: int, stream=None) -> bool:
     """cudaMemcpyAsync from a host-pool slice straight into a device tensor.
 
@@ -3500,6 +3546,15 @@ def _async_h2d(dst, src, nbytes: int, stream=None) -> bool:
             ctypes.c_size_t(int(nbytes)), 1,
             ctypes.c_void_p(int(getattr(stream, "cuda_stream", stream))),
         )
+        # 统计：异步 DMA 成功几次、退化到 copy_ 几次、共多少字节。
+        # 用来核对「实测带宽是不是真的 26GB/s」——如果大量走退化路径，
+        # 观测到的带宽会被 sync memcpy 拉低，那不是硬件的锅。
+        _st = _DMA_STATS
+        if rc == 0:
+            _st["ok_calls"] += 1
+            _st["ok_bytes"] += int(nbytes)
+        else:
+            _st["rc_fail"] += 1
         return rc == 0
     except Exception:
         return False

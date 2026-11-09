@@ -1185,7 +1185,7 @@ class Engine:
             # 的 free 不覆盖 forward 的真实峰值（activation、cuBLAS workspace、
             # 分配器碎片）。要开必须先测出真实峰值再回来定 reserve，否则就是
             # 用一个没验证过的余量换一次启动失败。用 TI_AUTO_SLOTS=1 显式打开。
-            if __import__("os").environ.get("TI_AUTO_SLOTS") == "1":
+            if False:   # 移到第一次 forward 之后（那时峰值才真实）
                 _sl = getattr(getattr(self, "expert_store", None), "slots", None)
                 if _sl is not None and getattr(_sl, "slots", 0) > 0:
                     try:
@@ -3686,6 +3686,27 @@ class Engine:
                     "read_seconds", None)
                 _io_ms = ((float(_reader2) - _io0) * 1e3
                           if _reader2 is not None else 0.0)
+                # **第一次 decode 跑完之后，把槽位扩到显存允许的上限。**
+                #
+                # 放这里的理由：此刻所有 buffer 都真实分配过一遍，
+                # max_memory_allocated 就是峰值，memory_reserved-allocated 就是
+                # 分配器留住的可复用块。两者之和是这个引擎运行时真正占用的量，
+                # free 减去它才是能留给槽位的空间 —— 不需要猜任何余量。
+                #
+                # 放 __init__ 里做（以前的做法）必然失败：那时还没有 forward，
+                # 峰值未知，按估算留的 reserve 一定偏小，扩完就在随后的 forward
+                # 上 OOM。
+                if not getattr(self, "_grew_slots", False):
+                    self._grew_slots = True
+                    try:
+                        _s = getattr(getattr(self, "expert_store", None), "slots", None)
+                        if _s is not None and getattr(_s, "slots", 0) > 0:
+                            _added = _s.try_grow()
+                            if _added:
+                                print(f"[tinyinfer] slots {_s.slots - _added} -> "
+                                      f"{_s.slots} (filling spare VRAM)", flush=True)
+                    except Exception as _exc:
+                        print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
                 ctrl = getattr(self, "_prefetch_ctrl", None)
                 if ctrl is not None:
                     # 缺失队列长度（本步跨层累计）比 IO 时间更能反映 CPU 要填的
