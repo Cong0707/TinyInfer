@@ -1771,7 +1771,19 @@ class ExpertCache:
                 slots.append(pool.take(blob.total_bytes))
             except Exception:
                 slots.append(None)
-        target = int(__import__("os").environ.get("TI_READ_THREADS", "0")) or len(blobs)
+        # 并发深度默认跟随 ShardReader.threads（auto_threads 给的 16），
+        # **不能退化成 len(blobs)**。
+        #
+        # 这里原来写的是 int(env or 0) or len(blobs)：环境变量没设时取 0，
+        # 0 是假值，于是落到 len(blobs) —— 一笔 decode 的 miss 有两百多个，
+        # 就是两百多个并发。后果不是读得更快，而是：
+        #   1) 走的是共享的 pool_exec，那个池子同时被后台预热线程占着，两边抢；
+        #   2) 线程数超过 SSD 的队列深度（本机 QD 16 就饱和）之后只增加排队和切换。
+        # 实测同一份代码：默认（240）7631ms/步，显式 16 时 3376ms/步，快 2.26 倍，
+        # 而报告的磁盘带宽反而从 2.34GB/s 降到 1.22GB/s —— 高并发时大量时间
+        # 花在排队上，有效吞吐更低。
+        _env_threads = int(__import__("os").environ.get("TI_READ_THREADS", "0") or 0)
+        target = _env_threads or int(getattr(self.reader, "threads", 0) or 16)
 
         def one(blob, slot):
             if slot is None:
@@ -1787,11 +1799,23 @@ class ExpertCache:
             return [one(b, s) for b, s in zip(blobs, slots)]
         pool_exec = ex()
         if target < len(blobs):
-            # tuned depth (TI_READ_THREADS): bounded queue keeps other IO responsive
+            # 有界队列。池子按 target 常驻复用，不每次 new：一笔 decode 会多次调进
+            # 这里，反复创建/销毁线程池本身就是开销，而且每次新池子都要重新拿一批
+            # 文件句柄。这是默认路径（target 现在恒小于 miss 数），所以必须复用。
             from concurrent.futures import ThreadPoolExecutor
 
-            with ThreadPoolExecutor(max_workers=target, thread_name_prefix="tinyinfer-io") as tmp:
-                return [f.result() for f in [tmp.submit(one, b, s) for b, s in zip(blobs, slots)]]
+            _bounded = getattr(self, "_bounded_io", None)
+            if _bounded is None or getattr(_bounded, "_max_workers", None) != int(target):
+                try:
+                    if _bounded is not None:
+                        _bounded.shutdown(wait=False)
+                except Exception:
+                    pass
+                _bounded = ThreadPoolExecutor(max_workers=int(target),
+                                              thread_name_prefix="tinyinfer-io")
+                self._bounded_io = _bounded
+            return [f.result() for f in [_bounded.submit(one, b, s)
+                                         for b, s in zip(blobs, slots)]]
         return [f.result() for f in [pool_exec.submit(one, b, s) for b, s in zip(blobs, slots)]]
 
     def _fill_pin_pool(self) -> None:
