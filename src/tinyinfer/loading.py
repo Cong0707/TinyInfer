@@ -2911,6 +2911,27 @@ class VramSlotCache:
                 # 实测（max_layers=2）：这个函数在第一次 forward 的 finally 里
                 # 扩容 24->65，于是 run0 与 run1..4 不一致、而 run1..4 逐位相同
                 # —— 正是「只有第一次不同」那个指纹。作废之后 5 次全部逐位一致。
+                #
+                # ---- 槽位容量与确定性的边界（实测，别在这里绕）------------------
+                #
+                # 修掉这处「表与池子不一致」之后，确定性取决于槽位够不够：
+                #
+                #   max_layers=2   24 槽 / 12 个需求    5 次逐位一致
+                #   max_layers=8   ~24 槽 / 48 个需求   5 次逐位一致
+                #   max_layers=16  ~24 槽 / 96 个需求   开始出现 NaN
+                #   max_layers=40  24 槽 / 240 个需求   每次不一致 + 大量 NaN
+                #
+                # 40 层的实测统计：loads=789 evictions=765（97% 的装载立刻被驱逐）、
+                # vram_hit=0.0%。每层都在覆盖式驱逐，而「哪次装到哪个槽位」由时序
+                # 决定 —— 这种状态下 forward 不可能可复现。
+                #
+                # 已经试过并全部否掉的（不要再试）：每次槽位 DMA 后全同步、
+                # copy 流等待计算流（16 层就 OOM，更糟）、每层用全部路由专家 make_ready、
+                # 每层 synchronize、全量 table_sync、每层独立 buffer。
+                #
+                # 要真解决只能改调度策略（按 (layer, expert) 排序固定驱逐顺序 +
+                # 严格串行），或者让槽位装得下一步的量（8GB 卡做不到）。这是一个
+                # 设计选择，不是一个能补的 bug。
                 self._slot_tab = None
                 self._tab_dirty.clear()
                 self._dirty.clear()
