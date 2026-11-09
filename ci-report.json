@@ -1,0 +1,40 @@
+{
+  "ok": false,
+  "seconds": 60.9,
+  "layers": [
+    {
+      "name": "accuracy",
+      "ok": true,
+      "passed": 85,
+      "failed": 0,
+      "failures": [],
+      "seconds": 16.3
+    },
+    {
+      "name": "engine",
+      "ok": false,
+      "error": "RuntimeError('!handles_.at(i) INTERNAL ASSERT FAILED at \"C:\\\\\\\\actions-runner\\\\\\\\_work\\\\\\\\pytorch\\\\\\\\pytorch\\\\\\\\c10\\\\\\\\cuda\\\\\\\\CUDACachingAllocator.cpp\":487, please report a bug to PyTorch. ')",
+      "steps": 2,
+      "median_ms": 6527.7,
+      "build_s": 3.54
+    },
+    {
+      "name": "utilization",
+      "ok": true,
+      "checks": [],
+      "plan": {},
+      "vram": {},
+      "dma": {}
+    }
+  ],
+  "probe": {
+    "error": "RuntimeError('!handles_.at(i) INTERNAL ASSERT FAILED at \"C:\\\\\\\\actions-runner\\\\\\\\_work\\\\\\\\pytorch\\\\\\\\pytorch\\\\\\\\c10\\\\\\\\cuda\\\\\\\\CUDACachingAllocator.cpp\":487, please report a bug to PyTorch. ')",
+    "steps_ms": [
+      8355.0,
+      4700.4
+    ],
+    "obs": null,
+    "plan": null,
+    "build_s": 3.54
+  }
+}
