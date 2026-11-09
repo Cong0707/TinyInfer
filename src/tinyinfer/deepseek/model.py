@@ -306,22 +306,17 @@ class Block(HCBlockMixin):
         import os as _os
         from ..cpu_kernels import slab
 
-        # **默认就要用 pinned slab。** 原来这里要求显式设 TI_SLAB 环境变量，
-        # 不设就 st=None，于是每层的每个张量各自 .to(device) —— 那是 31~37 次
-        # 独立分配，且旧的那块要等 GC 才还。实测（CI 的 L2 层抓到）：
+        # slab 保持 opt-in。
         #
-        #   decode1 alloc=14.50GB (+3.26)
-        #   decode2 alloc=15.84GB (+1.34)
-        #   decode3 分配失败 !handles_ INTERNAL ASSERT
+        # 我试过把它改成默认启用（理由：per-tensor 分支每层 31~37 次独立分配，
+        # 分配器快照显示那条路累计 1501 次、9.24GB）。但 slab() 是**进程级**
+        # 6.4GB pinned 缓冲，一旦创建就锁住那么多物理页；和引擎自己的 host pool
+        # 叠在一起会把系统物理内存压到 CUDA 侧分配开始失败（正是之前反复出现的
+        # cuMemSetAccess OOM / !handles_ 那个机制）。
         #
-        # 而分配器快照显示 model.py:335 那条 else 分支累计 1501 次分配、9.24GB。
-        # 物理显存只有 8.5GB，超出的落到 WDDM 共享内存，所以不是立刻崩、是撑几步。
-        #
-        # slab 路径（上面的 if 分支）本来就是为了把一层合成一次 pinned H2D，
-        # 它同时避免了「每张量一次分配」。把它设成默认，TI_SLAB=0 可以显式关掉
-        # （诊断用：确认某问题是不是 slab 路径引入的）。
-        _slab_env = _os.environ.get("TI_SLAB")
-        st = None if _slab_env == "0" else slab()
+        # 所以默认仍是 None，要它得显式 TI_SLAB=1。真正的修法是让那 6.4GB 按需
+        # 分配（够一层用就行，~200MB），而不是启动就锁 6.4GB —— 那是另一件事。
+        st = None if _os.environ.get("TI_SLAB") is None else slab()
         if st is not None:
             # one layer = one pinned memcpy + one pinned H2D. Pageable per-tensor copies
             # were 763 transfers x 781us (8.3GB/s); a 190MB pinned H2D is ~7ms at 26GB/s.  # noqa: E501
@@ -363,9 +358,32 @@ class Block(HCBlockMixin):
                     set_weight(owner, name,
                             self._cpu_refs[self._wkey(owner, name)].to(device, non_blocking=True))
         else:
-            for (owner, name, _) in paths:
-                set_weight(owner, name,
-                        self._cpu_refs[self._wkey(owner, name)].to(device, non_blocking=True))
+            # **不再每次新建：复用同一块 per-block device staging。**
+            #
+            # 原来这里对每个权重张量 `to(device)`，每次新建一块 device 内存；
+            # 而 streamed 层**每一步**都会走这个分支（33 层 x ~174MB/层）。
+            # 旧的块要等 GC，实测累计到 14.5GB 而物理只有 8.5GB。
+            #
+            # 复用要点：同一时刻只有一层在使用这块缓冲（层是依次算完的），
+            # 所以一块就够。但**必须按层尺寸扩容**，不能共用一小块。
+            _need = 0
+            for (_, _, t) in paths:
+                _need = (_need + 255) // 256 * 256
+                _need += t.numel() * t.element_size()
+            _need = (_need + 255) // 256 * 256
+            _buf = getattr(self, '_wstage', None)
+            if _buf is None or _buf.numel() < _need:
+                self._wstage = _buf = torch.empty(int(_need), dtype=torch.uint8,
+                                                  device=device)
+            _off = 0
+            for (owner, name, t) in paths:
+                _off = (_off + 255) // 256 * 256
+                _n = t.numel() * t.element_size()
+                _buf[_off:_off + _n].copy_(
+                    self._cpu_refs[self._wkey(owner, name)].reshape(-1).view(torch.uint8),
+                    non_blocking=True)
+                set_weight(owner, name, _buf[_off:_off + _n].view(t.dtype).view(t.shape))
+                _off += _n
         if getattr(self, "engram", None) is not None:
             # engram tables stay on disk (row reads) but its small projection weights
             # (q/k/wkv, cached bf16) must follow the block.

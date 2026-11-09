@@ -37,7 +37,19 @@ def staging_buffer():
 
 
 _slab = None
-SLAB_BYTES = 6400 * (1 << 20)  # one 6.4GB pinned slab: every layer fits (max ~190MB)
+# **只锁一层需要的量，不是 6.4GB。**
+#
+# 注释说「every layer fits (max ~190MB)」—— 真实需求确实只有约 190MB，但原来
+# 锁了 6.4GB。pinned 内存是锁物理页的：6.4GB 常驻 + 引擎自己的 host pool，会把
+# 系统物理内存压到 CUDA 侧分配开始失败（cuMemSetAccess OOM / !handles_ 那条
+# 反复出现的路径），而且它用的是 `to(device)` 同步拷贝 —— 根本没必要留大块，
+# 每次只搬一层。
+#
+# 512MB 留了 2.5 倍余量（最大层实测 485MB），够用且不会挤压物理内存。
+# 1GB：最大层实测 485MB，加上每层 31~37 个张量按 256B 对齐的 padding，实测
+# 需要 ~520MB。512MB 刚好差一点（退化成 per-tensor 路径，device 侧又涨回 15GB），
+# 1GB 留了 2 倍余量。依然远小于原来的 6.4GB。
+SLAB_BYTES = 1024 * (1 << 20)
 
 
 def slab() -> "torch.Tensor | None":
