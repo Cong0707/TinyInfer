@@ -143,14 +143,12 @@ class Plan:
     # 所以 engine 拿到这些数仍然要按实际 free 收缩（claim 失败就缩），
     # 但**收缩的起点是这里给的数**，不是别处另算一个。
     #
-    # pinned 层 pre-slab 的预留字节：给所有 streamed 层各留一份源。
-    slab_reserve_bytes: int = 0
     # 宿主池的目标字节数（专家缓存 + slab + 构建期临时都在里面）。
     host_pool_bytes: int = 0
-    # 专家缓存里允许 pin（而不是普通 pageable）的字节数。
-    # 默认 = cache_bytes：pageable 的专家要过一遍 staging memcpy 才能上显存，
-    # 而 pinned 是直接 async DMA。留一半资源做 pageable 没有收益。
-    pin_budget_bytes: int = 0
+
+# 注：这里原来还有 slab_reserve_bytes / pin_budget_bytes 两个字段，但没人读 ——
+# engine 里的 slab 预留是它自己按 pool 现算的，pin 预算直接用 pin_ratio。
+# test_plan_wiring.py 会抓这种「Plan 里有、但没人消费」的字段，正是它报出来的。
     # 缓存里 pin 的比例。这个数**没有理论值**，只能实测：pin 得越多，专家上显存
     # 走 async DMA 的机会越大；但 grant() 会记账进 host budget，pin 多了反而
     # 压缩可用缓存。训练器（tinyinfer.tune）在本机扫出来 0.3/0.5/0.7/1.0 分别对应
@@ -862,8 +860,6 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         reason=reason,
         fits=fits,
         pin_ratio=float(_pin_ratio),
-        slab_reserve_bytes=int(slab_reserve),
         host_pool_bytes=int(host_pool),
-        pin_budget_bytes=int(pin_budget),
         read_threads=int(read_threads),
     )

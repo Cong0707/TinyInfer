@@ -28,7 +28,11 @@ def test_empty_pool_snapshot():
     assert sum(st.values()) == 8, st
     assert s["occupied"] == 0
     assert s["fill_ratio"] == 0.0
-    assert s["hit_rate"] == 0.0
+    # 槽位池不报命中率了（见 snapshot() 的 docstring）：它只知道「搬了多少次」，
+    # 不知道「有多少个专家本来就够用」—— 后者要按专家数数，只有
+    # ExpertTiers.need() 拿得到完整的 want 列表。两处各算一遍就是两个对不上的
+    # 命中率，所以统一从 collect_observability 出。
+    assert "hit_rate" not in s
 
 
 def test_states_always_sum_to_capacity():
@@ -51,14 +55,18 @@ def test_occupied_matches_bookkeeping():
     assert s["fill_ratio"] == pytest.approx(3 / 8)
 
 
-def test_hit_rate_is_computed_from_counters():
-    """池子只记 hits 和 loads（每次真正搬一次算一个 load）。"""
+def test_snapshot_does_not_invent_a_hit_rate():
+    """槽位池只报它真的知道的数：搬了多少次（loads），不报命中率。
+
+    原来这里有 hits 计数和 hit_rate，但 hits 从来没被自增过（恒为 0）——
+    第 2 章把它删了，改为在 collect_observability 里按专家数统一算。
+    这条测试锁住「快照不再凭空造一个命中率」这件事。
+    """
     p = _pool(8)
-    p.hits = 7
     p.loads = 3
     s = p.snapshot()
-    assert s["hit_rate"] == pytest.approx(0.7)
-    assert s["hits"] == 7 and s["loads"] == 3
+    assert "hit_rate" not in s
+    assert s["loads"] == 3
 
 
 def test_busiest_layers_reports_real_counts():
