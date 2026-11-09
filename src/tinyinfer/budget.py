@@ -359,6 +359,13 @@ class HostPool:
         self._off = 0
         self._lock = threading.Lock()
         self._owner = None
+        # 回收区。纯 bump 分配器在这里是不行的：启动时权重会从池子里切出去
+        # （weights.ShardStore.get 走 build_pool），而常驻层的 host 副本在权重
+        # 上显存之后就没用了（engine 里明确 b._cpu_refs = None）。那些字节如果
+        # 不回池子，就白白占着——实测启动后 9.53GB / 1246 次分配躺在那里，
+        # 池子的 39% 是死的，专家缓存只能拿到 13GB 而不是 22GB。
+        # 用简单 free list（首次适配）就够了：分配/释放都发生在启动期，量不大。
+        self._free: list[tuple[int, int]] = []
 
     @classmethod
     def from_claimed(cls, buffer, nbytes: int) -> "HostPool":
@@ -395,12 +402,48 @@ class HostPool:
     def free(self) -> int:
         return max(0, self.total - self._off)
 
+    def release(self, offset: int, n: int) -> None:
+        """把一段还回池子（合并相邻空闲块）。
+
+        只用于「确定不再有人引用」的字节 —— 例如常驻层的 host 副本在权重已经
+        复制到显存之后。调用方负责保证没有 tensor 还指向这段内存，否则就是
+        悬空指针。
+        """
+        n = int(n)
+        off = int(offset)
+        if n <= 0 or off < 0 or off + n > self.total:
+            return
+        with self._lock:
+            self._free.append((off, n))
+            self._free.sort()
+            merged: list[tuple[int, int]] = []
+            for o, sz in self._free:
+                if merged and merged[-1][0] + merged[-1][1] >= o:
+                    mo, msz = merged[-1]
+                    merged[-1] = (mo, max(mo + msz, o + sz) - mo)
+                else:
+                    merged.append((o, sz))
+            self._free = merged
+
     def alloc(self, n: int, align: int = 4096) -> memoryview | None:
-        """Carve n bytes (4096-aligned by default). Returns None when full."""
+        """Carve n bytes (4096-aligned by default). Returns None when full.
+
+        优先满足 free list（启动期权重回收出来的区域），否则从顶部 bump。
+        两套一起用：bump 保证顺序分配的效率，free list 保证回收的字节能被下一次
+        分配真正用上，而不是变成顶部永远越不过去的高水位。
+        """
         n = int(n)
         if n <= 0 or self._view is None:
             return None
         with self._lock:
+            for idx, (fo, fsz) in enumerate(self._free):
+                if fsz < n:
+                    continue
+                self._free.pop(idx)
+                if fsz > n + align:
+                    self._free.append((fo + n, fsz - n))
+                    self._free.sort()
+                return self._view[fo:fo + n]
             start = (self._off + align - 1) // align * align
             if start + n > self.total:
                 return None

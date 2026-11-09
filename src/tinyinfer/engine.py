@@ -995,9 +995,25 @@ class Engine:
 
                 def _mk(i):
                     b = self.block(i)
-                    # resident layers live in VRAM for the whole run; the pinned host
-                    # copy only exists for a to("cpu") that never happens on them
+                    # 常驻层整轮都住在显存里，host 副本只服务于一个永远不会发生的
+                    # to("cpu")。丢引用之外还要把那段字节还给池子 —— 池子是 bump
+                    # 分配器，光丢引用只是让它们变成顶部的高水位，别的分配拿不到
+                    # （实测启动后 1246 次分配共 9.53GB 躺在那里，占池子 39%）。
+                    _rel = []
+                    for key, t in list(getattr(b, "_cpu_refs", {}).items() or []):
+                        _o = getattr(t, "_tiny_pool_off", -1)
+                        _n = getattr(t, "_tiny_pool_len", 0)
+                        if isinstance(_o, int) and _o >= 0 and _n:
+                            _rel.append((_o, _n))
                     b._cpu_refs = None
+                    _pool = getattr(self, "host_pool", None)
+                    _rel_fn = getattr(_pool, "release", None) if _pool is not None else None
+                    if callable(_rel_fn) and _rel:
+                        for _o, _n in _rel:
+                            try:
+                                _rel_fn(_o, _n)
+                            except Exception:
+                                pass
                     return b
 
                 with _TPE2(max_workers=_nw, thread_name_prefix="tinyinfer-build") as _ex2:
