@@ -2571,6 +2571,10 @@ class Engine:
                     if _bad:
                         print("[flatverify] L%d bad=%d/%d" % (layer, _bad, total),
                               flush=True)
+        # 诊断：TI_FLAT_VIS=1 时在 set_weight 之前同步一次，验证「内核看不到
+        # 外部 DMA 写入」这个可见性假设。
+        if __import__("os").environ.get("TI_FLAT_VIS") == "1":
+            torch.cuda.synchronize()
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
             set_weight(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
         if getattr(b, "engram", None) is not None:
