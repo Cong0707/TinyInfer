@@ -2895,11 +2895,19 @@ class Engine:
                     del buf
                 print(f"[tinyinfer] CUDA OOM: streaming ring 3 -> {len(keep)} buffers "
                       f"(released {len(dropped)})", flush=True)
-        try:
-            if getattr(self, "expert_store", None) is not None:
-                self.expert_store.drop_slots()
-        except Exception:
-            pass
+        # **不碰槽位池。**
+        #
+        # 槽位的规则是：启动时一次建成，之后只做替换/覆写，直到进程结束。
+        # 清空它再重建有两个代价，都比省下来的显存贵：
+        #   1) 重建要重新分配 arena 并重新提交槽位表，这段窗口里每个专家都是
+        #      磁盘读（实测 drop 之后 loads 立刻飙到每步两百多）；
+        #   2) _ensure() 在显存紧张时有失败路径，重建失败就等于把引擎降级成
+        #      per-tensor 拷贝，而且再也回不去。
+        # OOM 的正确解法是规划阶段就把显存算准（resources.plan 统一给），
+        # 而不是运行时靠丢东西补救 —— 运行时丢掉的每一块，后面都要重新付一次
+        # 分配和填充的成本。
+        # 这里只收缩 streaming ring（那是可以少几个环的无状态缓冲），
+        # 槽位池保持原样。
         if self.device != "cpu":
             torch.cuda.empty_cache()
 
