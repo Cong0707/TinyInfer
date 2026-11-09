@@ -3615,7 +3615,19 @@ class Engine:
                           if _reader2 is not None else 0.0)
                 ctrl = getattr(self, "_prefetch_ctrl", None)
                 if ctrl is not None:
-                    self._prefetch_depth = ctrl.observe(_io_ms, _step_ms)
+                    # 缺失队列长度（本步跨层累计）比 IO 时间更能反映 CPU 要填的
+                    # 工作量：IO 只占单步 7% 时它对 PID 已经没有信号了。
+                    _qd = None
+                    try:
+                        _st = getattr(getattr(self.expert_store, "_tier_mgr", None),
+                                      "stats", None)
+                        if isinstance(_st, dict):
+                            _qd = int(_st.pop("queue_total", 0) or 0)
+                            _st.pop("queue_layers", None)
+                    except Exception:
+                        _qd = None
+                    self._prefetch_depth = ctrl.observe(
+                        _io_ms, _step_ms, queue_depth=_qd)
                     self._last_io_ms = _io_ms
                     self._last_step_ms = _step_ms
             except Exception:

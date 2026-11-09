@@ -53,9 +53,19 @@ class PID:
         self.prev_err = None
 
     def step(self, measured: float, dt: float = 1.0) -> float:
-        """喂一个测量值，返回下一步的控制量。"""
+        """喂一个测量值，返回下一步的控制量。
+
+        **误差方向是 measured - target（测量值高 = 输出高），不是反过来。**
+
+        这里控制的是「预取该多积极」，和被控量是正相关的：缺失越多（测量值越
+        高），越该加深预取。所以误差取 measured - target。
+
+        用相反的方向（target - measured）会得到一个负反馈回路：缺失越多 ->
+        输出越低 -> 预取越浅 -> 缺失更多。实测把 step 从 2508ms 推到 3800ms。
+        经典的 PID 是「维持目标」，而这里是「把它推向 0」，方向必须反。
+        """
         dt = max(1e-6, float(dt))
-        err = self.target - float(measured)
+        err = float(measured) - self.target
         deriv = 0.0 if self.prev_err is None else (err - self.prev_err) / dt
         cand_integral = self.integral + err * dt
         out = self.kp * err + self.ki * cand_integral + self.kd * deriv
@@ -78,8 +88,11 @@ class PrefetchController:
     两个深度之间每步横跳。
     """
 
-    def __init__(self, target_ratio: float = 0.30, depth_lo: int = 0, depth_hi: int = 4,
+    def __init__(self, target_ratio: float = 0.0, depth_lo: int = 0, depth_hi: int = 6,
                  kp: float = 6.0, ki: float = 1.5, kd: float = 0.5):
+        # target=0：队列长度越接近 0 越好，不是「维持在 30%」。
+        # 之前 target 用 0.30（从 IO 占比那套继承来的），配上正确的误差方向
+        # 之后会让 PID 稳定在一个「永远保持 30% 缺失」的荒谬平衡点。
         self.depth_lo = int(depth_lo)
         self.depth_hi = int(depth_hi)
         self.pid = PID(kp, ki, kd, lo=0.0, hi=1.0, target=float(target_ratio))
@@ -87,11 +100,31 @@ class PrefetchController:
         self.samples = 0
         self.history: list[tuple[float, int]] = []
 
-    def observe(self, io_ms: float, step_ms: float, *, min_step_ms: float = 5.0) -> int:
-        """喂一步的测量，返回更新后的预取深度。"""
+    def observe(self, io_ms: float, step_ms: float, *, min_step_ms: float = 5.0,
+                queue_depth: float | None = None) -> int:
+        """喂一步的测量，返回更新后的预取深度。
+
+        **两个测量源，优先用队列长度。**
+
+        一开始只用 IO 时间占比，但实测 IO 压到 100~170ms（占单步 7%）之后它
+        就饱和了 —— PID 把预取深度推到上限 4 也没法再降，而单步还有 2.2 秒是
+        别的东西。那个反馈量已经死了。
+
+        更直接的量是「这一步有多少个专家不在槽位里」，也就是 GPU 侧扫出来的
+        缺失队列长度。它才是 CPU 要填的工作量：队列越长，说明预取跟不上、
+        或者槽位不够，此时加深预取有意义；队列接近 0 说明够了，可以放浅。
+
+        两者都传时以队列长度为准（它离真实工作量更近）；只有 io_ms 时退回
+        原来的比例控制，保持兼容。
+        """
         if step_ms < min_step_ms:
             return self.depth
-        ratio = max(0.0, min(1.0, float(io_ms) / float(step_ms)))
+        if queue_depth is not None:
+            # 队列长度归一化到 [0,1]：以「一步要装的专家数」为满量程。
+            # 240 = 40 层 x topk 6，是这张卡上一步最多可能缺的个数。
+            ratio = max(0.0, min(1.0, float(queue_depth) / 240.0))
+        else:
+            ratio = max(0.0, min(1.0, float(io_ms) / float(step_ms)))
         out = self.pid.step(ratio)
         # 连续输出 -> 整数深度。0.5 附近加死区，避免横跳。
         want = self.depth_lo + out * (self.depth_hi - self.depth_lo)

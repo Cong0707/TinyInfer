@@ -674,6 +674,28 @@ class MoE:
             if (not getattr(self, "_all_pinned", False)
                     and not torch.cuda.is_current_stream_capturing()):
                 _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
+            # **缺失队列长度要能被观测，它是调优的对象。**
+            #
+            # GPU 侧扫出来「本层缺哪些专家」，CPU 侧按这个队列轮流填充。队列多长
+            # 直接决定了这一步要等多久的 IO —— 太长说明槽位不够或预取不够积极，
+            # 太短说明槽位/预取过剩、白占显存。autotune 的 PID 用它做反馈量。
+            #
+            # 记两个数：
+            #   last   本层这一跳的缺失数（瞬时）
+            #   total  本步累计（跨层），用来算「一步要搬多少个专家」
+            # 只在槽位池存在时记，否则没有意义。
+            if sl is not None:
+                try:
+                    _st = _mgr.stats if _mgr is not None else None
+                    if isinstance(_st, dict):
+                        _st["queue_last"] = int(_nmiss)
+                        _st["queue_total"] = int(_st.get("queue_total", 0)) + int(_nmiss)
+                        _st["queue_layers"] = int(_st.get("queue_layers", 0)) + 1
+                        _peak = int(_st.get("queue_peak", 0))
+                        if _nmiss > _peak:
+                            _st["queue_peak"] = int(_nmiss)
+                except Exception:
+                    pass
             if _nmiss:
                 _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
                 if _miss:
