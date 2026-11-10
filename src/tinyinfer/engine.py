@@ -291,8 +291,8 @@ class Engine:
         import os as _os2
         _os2.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         # hardware-derived plan (VRAM/RAM budget -> resident layers, slots, cache, chunk)
+        from .resources import detect as _detect_hw
         from .resources import model_profile as _model_profile
-        from .resources import plan as _hw_plan
         if device != "cpu":
             # measure the checkpoint: per-layer / expert / embed / head bytes come from
             # the safetensors headers, so the solver multiplies real numbers instead of
@@ -360,28 +360,46 @@ class Engine:
                 for _k in ("pin_ratio", "read_threads", "pool_ratio", "runtime_gb"):
                     if _cfg.get(_k) is not None:
                         _cal[_k] = _cfg[_k]
-            # speculation reserves its draft stages up front (tier 2 is the default)
-            self.hw_plan = _hw_plan(None, self.cfg.n_layers, model=_prof,
-                                    calibrate=_cal,
-                                    speculation=bool(getattr(self.tier, "mtp", False)))
-            # 把公式算出来的值写回配置（source=formula），下次启动就有据可依；
-            # 已有实测值时不要用公式覆盖它。
-            try:
-                from . import settings as _cfgmod
+            # **唯一决策者：Planner。**
+            #
+            # 旧的 resources.plan()（563 行启发式 + 12 个实测常数）已删除。现在
+            # 布局由目标函数解出来：T = 权重搬运 + 专家装载 + 计算，每一项都是
+            # 资源量的函数，谁更值钱由式子算。
+            #
+            # Planner 不做 IO、不碰 CUDA —— 它只接受「资源量」和「实测带宽」。
+            from . import planner as _pm
+            from . import tuning as _tun
 
-                if _cfgmod.get_model(_mdir).get("source") != "measured":
-                    _cfgmod.update(_mdir, {
-                        "expert_slots": int(self.hw_plan.expert_slots),
-                        "pin_ratio": float(self.hw_plan.pin_ratio),
-                        "read_threads": int(self.hw_plan.read_threads),
-                        "resident_layers": int(self.hw_plan.gpu_layers),
-                    }, source="formula")
+            _hw = _detect_hw()
+            _bw = _hw.bandwidth(_cal, model_dir=_mdir)
+            # 把实测带宽缓存进 tuning.json，下次启动不再测（测一次约 1 秒）
+            try:
+                _tun.update(_mdir, {k: float(v) for k, v in _bw.items()},
+                            source="measured")
             except Exception:
                 pass
+            # **模型几何必须齐全。** `_prof` 是 model_profile() 的输出，只含字节量
+            # （layer_bytes / expert_bytes / embed / head），没有层数和 topk ——
+            # 而没有这两个，目标函数里的 stream_s 和 expert_s 都恒为 0，求解器
+            # 会以为「全部动态装载最划算」，解出 resident=0。
+            _geo = dict(_prof or {})
+            _geo["n_layers"] = int(self.cfg.n_layers)
+            # 字段名按 TinyConfig 的真实定义取（不是 HF 的 num_experts_per_tok）。
+            # 取错会导致 topk=0 -> 目标函数里 expert_s 恒为 0 -> 求解器不给槽位，
+            # 而它自己不会报错（0 是合法输入），只会解出 resident 拉满的解。
+            _geo["topk"] = int(getattr(self.cfg, "n_activated_experts", 0) or 0)
+            _geo["n_experts"] = int(getattr(self.cfg, "n_routed_experts", 0) or 0)
+            _geo["tied_head"] = bool(getattr(self.cfg, "tie_word_embeddings", False))
+            self._planner = _pm.Planner(_hw, _geo, bandwidth=_bw, calibrate=_cal)
+            # hw_plan 直接就是 Layout —— 不再有第二种「规划结果」的形状。
+            self.hw_plan = self._planner.solve()
         else:
             self.hw_plan = None
         if self.hw_plan is not None:
             print(f"[tinyinfer] {self.hw_plan.reason}", flush=True)
+            print("[tinyinfer] layout: %d 层常驻 / %d 层流式，%d 个专家槽位"
+                  % (self.hw_plan.resident, self.hw_plan.stream_layers,
+                     self.hw_plan.slots), flush=True)
             # a model that keeps materialised layers needs its ceiling now, not on the
             # first block() call: the plan already knows the host budget
             if getattr(self.adapter, "family", "") == "qwen3_5":
@@ -995,17 +1013,17 @@ class Engine:
             self.enable_prefetch = bool(getattr(self.tier, "prefetch", False))
         else:
             self.enable_prefetch = bool(int(_pf_env))
-        # PID 式运行时调优：用「每步 IO 时间占比」做反馈，控制预取深度。
-        # 离线训练（tune.py）给的是起点，这个是运行中的闭环 —— 状态一直在变
-        # （预热进度、页缓存温度、别的进程抢内存），开环参数跟不上。
-        try:
-            from .autotune import PrefetchController
-
-            self._prefetch_ctrl = PrefetchController()
-            self._prefetch_depth = int(self._prefetch_ctrl.depth)
-        except Exception:
-            self._prefetch_ctrl = None
-            self._prefetch_depth = 2
+        # **预取深度固定为 0，不再用 PID 调。**
+        #
+        # 原来的 PrefetchController 用 PID 每步调整「提前几层」，前提是「每步都
+        # 有缺失的专家需要提前搬」—— 那是槽位严重不足时的形态。现在规划器算出
+        # 的槽位覆盖整步（本机 246/240），一步之内没有可预取的缺失，这个旋钮
+        # 失去了作用对象；而且 enable_prefetch 默认就是关的，PID 每步算出的值
+        # 从来没被使用。
+        #
+        # 运行中真正该调的是布局本身（几层常驻、几个槽位），那由
+        # Planner.observe() 负责 —— 见 _forward_inner 末尾。
+        self._prefetch_depth = 0
         self.cache_wo_a = False
         self.profile = False
         # CPU-side learned expert prefetcher (context tables; ~95% hit rate measured)
@@ -1280,29 +1298,6 @@ class Engine:
             # 的 free 不覆盖 forward 的真实峰值（activation、cuBLAS workspace、
             # 分配器碎片）。要开必须先测出真实峰值再回来定 reserve，否则就是
             # 用一个没验证过的余量换一次启动失败。用 TI_AUTO_SLOTS=1 显式打开。
-            if False:   # 移到第一次 forward 之后（那时峰值才真实）
-                _sl = getattr(getattr(self, "expert_store", None), "slots", None)
-                if _sl is not None and getattr(_sl, "slots", 0) > 0:
-                    try:
-                        # 运行期临时占用交给槽位池：这不是「猜的余量」，是规划器
-                        # 算过的 workspace（ws0 = WS_BASE + 8*WS_PER_TOKEN）加上
-                        # prefill 的一块。全拿走 free 的话第一次 forward 就在
-                        # activation 上 OOM（实测）。
-                        try:
-                            from .resources import WS_BASE, WS_PER_TOKEN
-                            _sl._vram_reserve_bytes = int(
-                                WS_BASE + 8 * WS_PER_TOKEN
-                                + max(int(self.hw_plan.prefill_chunk), 8)
-                                * WS_PER_TOKEN)
-                        except Exception:
-                            _sl._vram_reserve_bytes = 0
-                        _n = _sl.try_grow()
-                        if _n:
-                            print(f"[tinyinfer] expert slots grew by {_n} "
-                                  f"-> {_sl.slots} (fills spare VRAM)", flush=True)
-                    except Exception as _exc:
-                        print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
-
     # -- residency ---------------------------------------------------------
     def available_layers(self) -> int:
         """How many consecutive layers have all their shards fully on disk (size-checked).
@@ -3893,34 +3888,37 @@ class Engine:
                 # 放 __init__ 里做（以前的做法）必然失败：那时还没有 forward，
                 # 峰值未知，按估算留的 reserve 一定偏小，扩完就在随后的 forward
                 # 上 OOM。
-                if not getattr(self, "_grew_slots", False):
-                    self._grew_slots = True
+                # **运行中调整：唯一入口是 Planner.observe()。**
+                #
+                # 这一段以前是三件事挤在一起：try_grow()（按 free 扩槽位）、
+                # PrefetchController（PID 调预取深度）、以及各自的日志。它们
+                # 各看一个量、做局部决策、互不知道 —— 典型的补丁堆叠。
+                #
+                # 现在交给 observe()：它拿「当前布局 + 实测 free + 实测耗时」，
+                # 重解目标函数，用 should_migrate() 判断迁移值不值。不迁移就返回
+                # 原布局（一个字节都不动）。
+                #
+                # 为什么不是 PID：PID 假设连续控制、每步调整、代价为零；而改布局
+                # 要重建槽位池、搬层权重，代价是秒到分钟级。对离散高代价的决策
+                # 用 PID 是方法论错误。
+                _pl = getattr(self, "_planner", None)
+                if _pl is not None and not getattr(self, "_observed_first", False):
+                    self._observed_first = True
                     try:
-                        _s = getattr(getattr(self, "expert_store", None), "slots", None)
-                        if _s is not None and getattr(_s, "slots", 0) > 0:
-                            _added = _s.try_grow()
-                            if _added:
-                                print(f"[tinyinfer] slots {_s.slots - _added} -> "
-                                      f"{_s.slots} (filling spare VRAM)", flush=True)
+                        import torch as _t
+
+                        _free_b = float(_t.cuda.mem_get_info()[0])
+                        _new, _why = _pl.observe(
+                            self.hw_plan, free_vram_b=_free_b,
+                            measured={"step_s": float(_step_ms) / 1e3,
+                                      "io_s": float(_io_ms) / 1e3})
+                        if _new is not self.hw_plan:
+                            print("[tinyinfer] relayout: " + _why, flush=True)
+                            self.hw_plan = _new
                     except Exception as _exc:
-                        print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
-                ctrl = getattr(self, "_prefetch_ctrl", None)
-                if ctrl is not None:
-                    # 缺失队列长度（本步跨层累计）比 IO 时间更能反映 CPU 要填的
-                    # 工作量：IO 只占单步 7% 时它对 PID 已经没有信号了。
-                    _qd = None
-                    try:
-                        _st = getattr(getattr(self.expert_store, "_tier_mgr", None),
-                                      "stats", None)
-                        if isinstance(_st, dict):
-                            _qd = int(_st.pop("queue_total", 0) or 0)
-                            _st.pop("queue_layers", None)
-                    except Exception:
-                        _qd = None
-                    self._prefetch_depth = ctrl.observe(
-                        _io_ms, _step_ms, queue_depth=_qd)
-                    self._last_io_ms = _io_ms
-                    self._last_step_ms = _step_ms
+                        print(f"[tinyinfer] observe skipped: {_exc!r}", flush=True)
+                self._last_io_ms = _io_ms
+                self._last_step_ms = _step_ms
             except Exception:
                 pass
 

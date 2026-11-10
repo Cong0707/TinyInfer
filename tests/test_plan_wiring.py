@@ -25,10 +25,16 @@ def _read(rel):
 
 
 def _plan_fields():
-    """Plan dataclass 的字段名（按源码顺序）。"""
-    src = _read("resources.py")
-    m = re.search(r"class Plan:\n(.*?)\n\n", src, re.S)
-    assert m, "Plan dataclass not found"
+    """Layout dataclass 的字段名（按源码顺序）。
+
+    布局的唯一形状是 planner.Layout（旧的 resources.Plan 已删除 —— 那是用
+    12 个实测常数堆出来的启发式，换台机器就不对）。
+    """
+    src = _read("planner.py")
+    # dataclass 的 body 里有 docstring 和空行，不能简单按空行截断。
+    # 按「类定义开始到下一个顶层 class/def」取整段。
+    m = re.search(r"class Layout:\n(.*?)(?=\n(?:class |def |\Z))", src, re.S)
+    assert m, "Layout dataclass not found"
     body = m.group(1)
     return re.findall(r"^\s{4}([a-z_][a-z0-9_]*):", body, re.M)
 
@@ -38,7 +44,7 @@ def test_every_plan_field_is_consumed_or_documented():
     assert fields, "no Plan fields parsed"
     consumers = (_read("engine.py") + _read("server.py")
                  + _read("loading.py") + _read("deepseek/moe.py"))
-    plan_src = _read("resources.py")
+    plan_src = _read("planner.py")
     unconsumed = []
     for f in fields:
         # 三种读法都算消费：p.<f>、getattr(plan, "<f>")、以及单独出现的名字

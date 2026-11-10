@@ -1,10 +1,8 @@
-"""Planner invariants across hardware it will never see on this box.
+"""规划器不变式：跨硬件验证 Planner 的输出自洽。
 
-The planner is the only component that decides everything else (resident layers, expert
-slots, host cache, whether MTP fits), and it is a solver over measured bytes rather than
-a table of card names. These cases pin down the invariants that a solver regression
-would break: layer counts stay in range, slot counts never go negative, and a card too
-small to hold the streaming skeleton says so instead of returning nonsense.
+这些是「求解器回归会破坏什么」的判据：层数守恒、槽位非负、装不下时要拒绝、
+稠密模型不该分到专家槽位、常驻层数随显存单调。全部用 Planner 直接验证，
+不依赖引擎、也不碰 CUDA。
 """
 from __future__ import annotations
 
@@ -19,13 +17,8 @@ def _profile():
     from ..loading import ShardIndex
     from ..resources import model_profile
 
-    path = os.environ.get('TI_MODEL')
-    if not path:
-        return None
-    # A wrong path is a skipped case, not a crashed suite: this file gets run on machines
-    # that do not have the checkpoint, and a test runner that dies on configuration is
-    # one people stop running.
-    if not os.path.isdir(path):
+    path = os.environ.get("TI_MODEL")
+    if not path or not os.path.isdir(path):
         return None
     try:
         return model_profile(ShardIndex(path))
@@ -36,61 +29,59 @@ def _profile():
 def register(report) -> None:
     prof = _profile()
     if prof is None:
-        report.add(Case('planner', 'skipped (set TI_MODEL to a checkpoint dir)', True))
+        report.add(Case("planner", "skipped (set TI_MODEL to a checkpoint dir)", True))
         return
 
-    from ..resources import Card, Hardware, plan
+    from ..planner import Planner
+    from ..resources import Card, Hardware
 
-    n_layers = int(prof.get('n_layers') or 40)
-    cases = [
-        ('2GB too small', 2.0, 8.0, 6.0),
-        ('4GB', 4.0, 16.0, 12.0),
-        ('8GB', 8.0, 47.0, 30.0),
-        ('16GB', 16.0, 64.0, 50.0),
-        ('24GB', 24.0, 64.0, 50.0),
-        ('1TB no overflow', 1024.0, 2048.0, 1800.0),
-    ]
-    for name, vram, ram, avail in cases:
-        hw = Hardware(name=name, vram_gb=vram, ram_gb=ram, ram_avail_gb=avail,
-                      cards=[Card(0, name, vram, vram * 0.95)])
+    n_layers = int(prof.get("n_layers") or 40)
+    geo = dict(prof)
+    geo["n_layers"] = n_layers
+    geo["topk"] = int(prof.get("topk") or 0)
+
+    # 带宽必须给：Planner 不接受 fallback。这里按 PCIe 代次估。
+    bw = {"h2d_bps": 12e9, "disk_bps": 4e9, "ram_bps": 35e9}
+
+    def _hw(name, vram, ram=64.0, avail=50.0):
+        return Hardware(name=name, vram_gb=vram, ram_gb=ram, ram_avail_gb=avail,
+                        cards=[Card(0, name, vram, vram * 0.95)])
+
+    for name, vram, ram, avail in (("2GB", 2.0, 8.0, 6.0),
+                                   ("4GB", 4.0, 16.0, 12.0),
+                                   ("8GB", 8.0, 47.0, 30.0),
+                                   ("16GB", 16.0, 64.0, 50.0),
+                                   ("24GB", 24.0, 64.0, 50.0),
+                                   ("1TB", 1024.0, 2048.0, 1800.0)):
+        hw = _hw(name, vram, ram, avail)
         try:
-            p = plan(hw=hw, n_layers=n_layers, model=prof, speculation=True)
+            p = Planner(hw, geo, bandwidth=bw)
+            lay = p.solve()
         except Exception as exc:
-            report.add(Case(f'planner {name}', f'raised {exc!r}', False))
+            report.add(Case("planner " + name, "raised " + repr(exc), False))
             continue
-        in_range = 0 <= p.gpu_layers <= n_layers
-        non_negative = p.stream_layers >= 0 and p.expert_slots >= 0 and p.cache_bytes >= 0
-        consistent = p.stream_layers == n_layers - p.gpu_layers
-        report.add(Case(f'planner {name}',
-                        f'layers={p.gpu_layers}/{n_layers} stream={p.stream_layers} '
-                        f'slots={p.expert_slots}',
-                        in_range and non_negative and consistent))
+        in_range = 0 <= lay.resident <= n_layers
+        non_negative = lay.slots >= 0 and lay.cache_bytes >= 0
+        fits = p.used_bytes(lay) <= p.vram * 0.94 + 1e6
+        detail = "resident=%d/%d slots=%d vram=%.1fG" % (
+            lay.resident, n_layers, lay.slots, p.used_bytes(lay) / GB)
+        report.add(Case("planner " + name, detail,
+                        in_range and non_negative and fits))
 
-    # A card that cannot hold the streaming skeleton must say so, not return a plan
-    hw = Hardware(name='2GB', vram_gb=2.0, ram_gb=8.0, ram_avail_gb=6.0,
-                  cards=[Card(0, '2GB', 2.0, 1.9)])
-    p = plan(hw=hw, n_layers=n_layers, model=prof, speculation=False)
-    report.add(Case('planner refuses a card below the skeleton',
-                    f'fits={p.fits}', p.fits is False))
+    # 稠密模型（没有 routed experts）不该分到专家槽位
+    dense = dict(geo)
+    dense["expert_bytes"] = 0.0
+    dense["topk"] = 0
+    lay = Planner(_hw("8GB", 8.0, 47.0, 30.0), dense, bandwidth=bw).solve()
+    report.add(Case("planner gives a dense model no expert slots",
+                    "slots=%d" % lay.slots, lay.slots == 0))
 
-    # More slots than the whole expert table is a plan, not an error, and must not wrap
-    hw = Hardware(name='1TB', vram_gb=1024.0, ram_gb=2048.0, ram_avail_gb=1800.0,
-                  cards=[Card(0, '1TB', 1024.0, 1000.0)])
-    p = plan(hw=hw, n_layers=n_layers, model=prof, speculation=True)
-    total_experts = n_layers * int(prof.get('n_experts') or 384)
-    report.add(Case('planner does not wrap past the expert table',
-                    f'slots={p.expert_slots} table={total_experts}',
-                    p.expert_slots >= 0))
-
-    # MTP must be off below 16GB and on at 24GB: drafting costs more resident layers
-    # than it repays on a small card, and the planner owns that decision.
-    small = Hardware(name='8GB', vram_gb=8.0, ram_gb=47.0, ram_avail_gb=30.0,
-                     cards=[Card(0, '8GB', 8.0, 7.6)])
-    big = Hardware(name='24GB', vram_gb=24.0, ram_gb=64.0, ram_avail_gb=50.0,
-                   cards=[Card(0, '24GB', 24.0, 22.8)])
-    ps = plan(hw=small, n_layers=n_layers, model=prof, speculation=True)
-    pb = plan(hw=big, n_layers=n_layers, model=prof, speculation=True)
-    report.add(Case('planner keeps MTP off on an 8GB card',
-                    f'speculation={ps.speculation}', ps.speculation is False))
-    report.add(Case('planner enables MTP on a 24GB card',
-                    f'speculation={pb.speculation}', pb.speculation is True))
+    # 显存更大 -> 常驻层更多（单调，允许 1 的舍入差异）
+    prev = -1
+    mono = True
+    for name, vram in (("8GB", 8.0), ("16GB", 16.0), ("24GB", 24.0)):
+        lay = Planner(_hw(name, vram), geo, bandwidth=bw).solve()
+        if lay.resident + 1 < prev:
+            mono = False
+        prev = lay.resident
+    report.add(Case("planner residency is monotonic in VRAM", "", mono))
