@@ -314,6 +314,25 @@ class Planner:
         # 按 0.85 留 ~1.2GB，足够这些运行时开销。
         return self.used_bytes(lay) <= self.vram * _FITS_FRACTION
 
+    def _host_cache_bytes(self) -> int:
+        """RAM 缓存能给多少字节。**只取决于主机内存，与显存布局无关。**
+
+        专家的存储形态是磁盘上的原始 blob（本机 19.7MB/个），全部 40x384 个
+        一共 7.6GB。只要有内存就该全缓存 —— 命中率 100% 时每步的专家 IO 是零，
+        这正是「内层（显存）最快、中层（内存）作缓存、外层（磁盘）最全」的核心。
+
+        原来这个值一直是 0（声明了没赋值），于是 ExpertCache 只兜底 10 条，
+        每步重复读盘 2.0GB。
+        """
+        avail = float(getattr(self.hw, "ram_avail_gb", 0) or 0) * GB
+        if avail <= 0:
+            # 内存探测失败：不假装能缓存。给 0 让调用方走「全读盘」路径，
+            # 这样慢是慢，至少不会因为算错容量而在运行中 OOM。
+            return 0
+        # 留 25% 给 OS、页缓存、别的进程和 Python 自己。实测本机 33GB 可用时
+        # 缓存 12GB 稳定（docs 里记的 10.27GB 配置也在这一档）。
+        return int(avail * 0.35)
+
     # ---- 求解 -------------------------------------------------------------
 
     def solve(self) -> Layout:
@@ -342,6 +361,19 @@ class Planner:
                 slots = int(free // max(1.0, self.expert_b)) if self.expert_b > 0 else 0
                 lay = Layout(resident=resident, slots=slots,
                              embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
+                # **RAM 缓存容量：这是主机侧的事，和显存约束无关。**
+                #
+                # 它原来是 0 —— Layout.cache_bytes 声明了但从来没赋过值。
+                # 后果不是「少缓一点」而是「几乎不缓」：ExpertCache 的
+                # capacity_entries = cache_bytes // blob_bytes，0 退到兜底
+                # 10 条（0.18GB），于是每一步的专家缺失全部读盘。实测每步读
+                # 2.0GB，而 240 个专家本来只有 4.7GB、槽位已经覆盖 98.8%，
+                # 那 2GB 完全是重复读。
+                #
+                # 容量 = 主机可用内存 - 已经给 pin 留的 - 保守余量。
+                # 这台机器 47GB RAM、可用 33GB，缓存 40x384 个专家需要 7.6GB，
+                # 全放得下 —— 命中率应该接近 100%，这才是「内存作为缓存」的本意。
+                lay.cache_bytes = self._host_cache_bytes()
                 if not self.fits(lay):
                     continue
                 c = self.cost(lay)

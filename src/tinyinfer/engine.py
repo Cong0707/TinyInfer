@@ -674,8 +674,24 @@ class Engine:
                         _per_layer = max(_lb, float((_prof or {}).get("max_layer_bytes", 0) or 0) * 0.5)
                 except Exception:
                     _per_layer = 240e6
-                _slab_need = (self.cfg.n_layers
-                              - (hw.gpu_layers if hw is not None else 0)) * _per_layer
+                # **slab 需要的是「双缓冲环的几块」，不是「每个流式层一块」。**
+                #
+                # 原来写的是 (n_layers - gpu_layers) * per_layer：30 个流式层
+                # x 387MB = 11.6GB。但那 30 层是**依次**算完再被下一层覆盖的，
+                # 同一时刻只活着 2~3 块（当前 + 预取的下一层 + 上一块还没退的）。
+                #
+                # 这个错误直接吃掉了整个专家缓存：_slab_reserve 按 11.6GB*1.15
+                # 算出 13.13GB，而 host_pool 一共才 13.3GB，于是 _pool_avail
+                # 只剩 192MB 兜底 —— ExpertCache 的 capacity_entries 变成 10 条
+                # （0.19GB），每一步的专家缺失全部读盘 2.0GB。实测 decode 2.5s。
+                #
+                # 环的大小：_flat_state 用的是 BUF_COUNT 块，预取最多提前一层，
+                # 所以 3 块够（当前 / 预取中 / 刚 release 完还没退）。
+                _SLAB_RING = 3
+                _n_stream_layers = (self.cfg.n_layers
+                                    - (hw.gpu_layers if hw is not None else 0))
+                _slab_need = min(_n_stream_layers,
+                                 _SLAB_RING * 1) * _per_layer
                 _slab_reserve = 0
                 _flat_flag = __import__("os").environ.get("TI_FLAT")
                 if self.host_pool is not None and not (_flat_flag is not None
