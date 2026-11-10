@@ -77,7 +77,8 @@ class Hardware:
         # too tight (a planned 6.4GB layout actually allocated 7.0GB on an 8GB card).
         return max(0.0, vram - 1.5 * max(1, len(self.cards) or 1))
 
-    def bandwidth(self, calibrate: dict | None = None) -> dict:
+    def bandwidth(self, calibrate: dict | None = None,
+                  model_dir: str | None = None) -> dict:
         """这台机器的三条带宽，byte/s。**现场测，没有默认值。**
 
         规划器做取舍全靠这三个数：常驻一层省下来的 H2D、一次磁盘读、一次
@@ -97,52 +98,60 @@ class Hardware:
             return {k: float(cached[k]) for k in ("h2d_bps", "disk_bps", "ram_bps")}
 
         out = {}
-        # --- H2D：pinned 到显存
+        # --- H2D：必须用引擎真实的搬运方式，不能是裸 copy_
+        #
+        # 裸 copy_ 测出来 7.1GB/s，但那条路 torch 会先做 pageable staging memcpy
+        # （见 loading._async_h2d 的注释）。引擎实际走 cudaMemcpyAsync 直发，
+        # 两者不是一回事 —— 测错的话规划器会按「很慢」布局，过度驻留。
+        #
+        # 所以这里直接调 _async_h2d（和装载路径同一个函数），块大小取真实层的
+        # 量级（174MB），并且先跑两轮预热（第一次会建 context/触碰页）。
+        out["h2d_bps"] = 1.0
         try:
+            import time as _t
+
             import torch
 
-            n = 64 << 20
+            from .loading import _async_h2d
+
+            n = 174 << 20
             cpu = torch.empty(n, dtype=torch.uint8, pin_memory=True)
             gpu = torch.empty(n, dtype=torch.uint8, device="cuda")
+            ok = 0
             for _ in range(2):
-                gpu.copy_(cpu, non_blocking=False)
-            torch.cuda.synchronize()
-            t0 = __import__("time").perf_counter()
-            for _ in range(5):
-                gpu.copy_(cpu, non_blocking=False)
-            torch.cuda.synchronize()
-            dt = (__import__("time").perf_counter() - t0) / 5
-            out["h2d_bps"] = float(n / max(dt, 1e-9))
+                if _async_h2d(gpu, cpu, n):
+                    ok += 1
+                torch.cuda.synchronize()
+            if ok:
+                t0 = _t.perf_counter()
+                for _ in range(3):
+                    _async_h2d(gpu, cpu, n)
+                torch.cuda.synchronize()
+                dt = (_t.perf_counter() - t0) / 3
+                out["h2d_bps"] = float(n / max(dt, 1e-9))
         except Exception:
-            # 没有 GPU：规划器本来就不会走显存路径，用不到这个数。给 1.0 让
-            # 它不会除以 0，而不是假装它是 26.5e9。
-            out["h2d_bps"] = 1.0
+            pass
 
-        # --- disk：顺序读
+        # --- disk：必须读真实 checkpoint 分片，不能读临时文件
+        #
+        # 临时文件测出来 8.7GB/s —— 那是页缓存直接命中（刚写进去的数据还在内存里），
+        # 不是盘的速度。而专家 blob 的真实读取模式是「从几十 GB 的分片里随机 seek」，
+        # 两者能差一个数量级。
+        #
+        # calibrate.measure_disk 已经在做正确的事（读真实分片、区分 seq/rand、用
+        # readinto 绕开对象分配），直接复用。
+        out["disk_bps"] = 1.0
+        out["disk_rand_bps"] = 1.0
         try:
-            import os
-            import tempfile
+            from .calibrate import measure_disk
 
-            block = 32 << 20
-            with tempfile.NamedTemporaryFile(delete=False) as f:
-                f.write(b"\0" * block)
-                path = f.name
-            try:
-                with open(path, "rb") as fh:
-                    fh.read(block)
-                t0 = __import__("time").perf_counter()
-                with open(path, "rb") as fh:
-                    for _ in range(4):
-                        fh.read(block)
-                dt = (__import__("time").perf_counter() - t0) / 4
-                out["disk_bps"] = float(block / max(dt, 1e-9))
-            finally:
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
+            md = measure_disk(model_dir) if model_dir else {}
+            if md.get("seq_gbps"):
+                out["disk_bps"] = float(md["seq_gbps"]) * 1e9
+            if md.get("rand_gbps"):
+                out["disk_rand_bps"] = float(md["rand_gbps"]) * 1e9
         except Exception:
-            out["disk_bps"] = 1.0
+            pass
 
         # --- ram：memcpy
         try:

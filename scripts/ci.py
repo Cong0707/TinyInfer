@@ -139,6 +139,17 @@ try:
         out["dma"] = _async_h2d_stats()
     except Exception:
         out["dma"] = None
+    # 规划器做时间取舍全靠这三条带宽，必须是这台机器实测的
+    try:
+        out["bandwidth"] = eng.hw_plan and None
+    except Exception:
+        pass
+    try:
+        from tinyinfer.resources import detect as _detect
+
+        out["bandwidth"] = _detect().bandwidth(model_dir=M)
+    except Exception as exc:
+        out["bandwidth"] = {"error": repr(exc)[:200]}
     try:
         p = torch.cuda.get_device_properties(0)
         # **用 mem_get_info，不要用 memory_allocated。**
@@ -218,6 +229,15 @@ def layer_utilization(args, probe):
 
     # 显存：占满多少。留太多说明没吃满（浪费），但这是报告项不是失败项 ——
     # 不同模型/卡的合理区间不同，硬判会误报。
+    # 带宽：规划器做取舍全靠这三个数，必须是实测的
+    bw = probe.get("bandwidth") or {}
+    if bw:
+        h2d = float(bw.get("h2d_bps") or 0) / 1e9
+        dsk = float(bw.get("disk_bps") or 0) / 1e9
+        dskr = float(bw.get("disk_rand_bps") or 0) / 1e9
+        checks.append(("带宽：h2d %.1f / disk %.1f (rand %.1f) GB/s" % (
+            h2d, dsk, dskr), h2d > 1.0 and dsk > 0.1))
+
     if vram:
         usable = max(0.01, vram.get("total_gb") or 0.01)
         used = vram.get("used_gb") or 0.0
