@@ -24,6 +24,33 @@ from ..nn import rms_norm
 from ..weights import ShardStore
 
 
+# 进程级 device staging：所有 Block 共用一块。
+#
+# 为什么不用 self._wstage（每 block 一块）：实测 36 个 streamed 层各持一块
+# ~174MB 的 staging，加起来 6.3GB，第一次 forward 就把 8GB 卡撑到 17GB。
+# 而层是依次算完的 —— 同一时刻只有一层在搬，一块就够。
+#
+# 扩容策略：按「见过的最大层」长，只增不减（缩了下次还要长，抖动）。
+# 最大层由 checkpoint 决定（本机 468MB），所以上限可预期。
+_STAGE: dict = {}
+
+
+def _stage_buffer(device) -> "torch.Tensor":
+    """拿共享 staging 块。没有就建一个最小的（第一次调用会立刻按需扩容）。"""
+    t = _STAGE.get(str(device))
+    if t is None:
+        t = torch.empty(1, dtype=torch.uint8, device=device)
+        _STAGE[str(device)] = t
+    return t
+
+
+def _stage_grow(nbytes: int, device) -> "torch.Tensor":
+    """扩到 *恰好* 够用。旧块不主动释放 —— 分配器会回收（引用计数归零后）。"""
+    t = torch.empty(int(nbytes), dtype=torch.uint8, device=device)
+    _STAGE[str(device)] = t
+    return t
+
+
 def set_weight(owner, name: str, tensor) -> None:
     """Point a module's weight at a new tensor without losing its Parameter identity.
 
@@ -342,15 +369,21 @@ class Block(HCBlockMixin):
                 # 注意：这里不能复用同一块给「同时活着」的层 —— 但 streamed 层是
                 # 依次算完就丢的（下一层覆盖上一层），所以一块就够。真正需要保活
                 # 的是 slab 覆盖的那些层，它们走 _flat_state 的环形缓冲，不走这里。
-                # 用临时块搬：拷完立刻不再持有，让分配器能复用它。
+                # **用模块级共享的一块 staging。**
                 #
-                # 一开始想缓存成 self._weight_stage_dev 复用，但那样会永久占住
-                # 一块 ~174MB，在这个已经贴到上限的卡上直接导致 free=0MB。
-                # 而 per-layer 的临时块在函数返回后引用计数归零、分配器立即可复用
-                # （同一 size 的块下次直接命中缓存），不需要我们持有。
-                _wbuf = torch.empty(int(total), dtype=torch.uint8, device=device)
-                _wbuf.copy_(st[:total], non_blocking=False)
-                gpu = _wbuf
+                # 不能用 self._wstage：Block 是每层独立的对象，那就是 36 块、
+                # 每块 ~174MB = 6.3GB。实测第一次 forward 就撑到 17GB。
+                #
+                # 用临时块也不行：set_weight 把权重指向了它，Block 持有引用，
+                # 函数返回后释放不掉。
+                #
+                # 正确形态：模块级一块，所有 block 共用。同一时刻只有一层在搬
+                # （层是依次算完的），所以一块够；按「见过的最大层」扩容。
+                _wbuf = _stage_buffer(device)
+                if _wbuf.numel() < int(total):
+                    _wbuf = _stage_grow(int(total), device)
+                _wbuf[:int(total)].copy_(st[:total], non_blocking=False)
+                gpu = _wbuf[:int(total)]
                 for (owner, name, t), o, n in zip(paths, offsets, nbytes):
                     set_weight(owner, name, gpu[o:o + n].view(t.dtype).view(t.shape))
             else:
@@ -371,18 +404,34 @@ class Block(HCBlockMixin):
                 _need = (_need + 255) // 256 * 256
                 _need += t.numel() * t.element_size()
             _need = (_need + 255) // 256 * 256
-            _buf = getattr(self, '_wstage', None)
-            if _buf is None or _buf.numel() < _need:
-                self._wstage = _buf = torch.empty(int(_need), dtype=torch.uint8,
-                                                  device=device)
+            _buf = _stage_buffer(device)
+            if _buf.numel() < int(_need):
+                _buf = _stage_grow(int(_need), device)
+            # **逐个张量搬也要走直接 DMA。**
+            #
+            # copy_ 对「源是 pool 切片」的情况会先做 pageable staging memcpy
+            # 再发 DMA —— torch 不认 frombuffer 出来的内存是 pinned。实测这一步
+            # 产生 2562 次 Pageable HtoD、2080ms（占单步 43%），而 Pinned 只有
+            # 1238 次。两者是同一条路，区别只在于有没有绕开 torch 的 pinned 判断。
+            from ..loading import _async_h2d
+
             _off = 0
             for (owner, name, t) in paths:
                 _off = (_off + 255) // 256 * 256
                 _n = t.numel() * t.element_size()
-                _buf[_off:_off + _n].copy_(
-                    self._cpu_refs[self._wkey(owner, name)].reshape(-1).view(torch.uint8),
-                    non_blocking=True)
-                set_weight(owner, name, _buf[_off:_off + _n].view(t.dtype).view(t.shape))
+                _src = self._cpu_refs[self._wkey(owner, name)]
+                _dst = _buf[_off:_off + _n]
+                # _async_h2d 接受 tensor 源（它内部取 data_ptr）。权重来自 pool
+                # 切片，地址是真 pinned（cudaHostAlloc），只是 torch 的 is_pinned()
+                # 判断不出来 —— 所以直接对地址发 DMA。
+                _done = False
+                try:
+                    _done = bool(_async_h2d(_dst, _src, _n))
+                except Exception:
+                    _done = False
+                if not _done:
+                    _dst.copy_(_src.reshape(-1).view(torch.uint8), non_blocking=True)
+                set_weight(owner, name, _dst.view(t.dtype).view(t.shape))
                 _off += _n
         if getattr(self, "engram", None) is not None:
             # engram tables stay on disk (row reads) but its small projection weights

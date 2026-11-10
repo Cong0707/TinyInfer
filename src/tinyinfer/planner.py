@@ -189,7 +189,22 @@ class Planner:
         """估算这份布局的一步耗时。**唯一的判据。**"""
         n = self.n_layers
         stream = max(0, n - lay.resident)
-        stream_s = stream * self.layer_b / max(1.0, self.h2d)
+        # **用「一层实测搬多久」而不是「字节 / 带宽」。**
+        #
+        # 字节除带宽算出来偏乐观：474.8MB / 7.2GB/s = 66ms，而实测 b.to(cuda)
+        # 搬一层要 141ms（3.4GB/s 有效带宽）—— 差 2.1 倍。
+        #
+        # 原因是带宽测的是「一块连续内存的 DMA」，而搬一层是 30+ 个张量、
+        # 每个都要 set_weight、可能有多个 stream 同步。那个开销不在带宽里。
+        #
+        # 所以用 h2d_layer_s（实测「搬一层要几秒」），没有就退回带宽估算。
+        # 实证默认：本机搬一层 474.8MB 要 141ms（= 3.4GB/s 有效）。
+        # 没有实测值时按「字节 / 带宽 x 2.1」估 —— 那个 2.1 是实测出来的
+        # 差距（带宽测的是连续 DMA，搬一层是 30+ 个张量各自 set_weight）。
+        _per_layer_s = self._tunable("h2d_layer_s", None, float)
+        if not _per_layer_s:
+            _per_layer_s = self.layer_b / max(1.0, self.h2d) * 2.1
+        stream_s = stream * float(_per_layer_s)
 
         # 一步要几个不同的 (layer, expert)；槽位覆盖掉多少，剩下的要搬。
         need = self.topk * n
@@ -206,9 +221,21 @@ class Planner:
                 # 缓存的字节数 / 全部专家的字节数。全部按 n_layers*384 估。
                 all_b = self.expert_b * n * 384
             hit = min(1.0, float(lay.cache_bytes) / max(1.0, all_b))
-            per = self.expert_b
-            expert_s = uncovered * per * (hit / max(1.0, self.ram)
-                                          + (1.0 - hit) / max(1.0, self.disk_rand))
+            # **专家搬运的耗时必须实测，不能用字节 / 带宽估。**
+            #
+            # 估出来是 18.8MB / 35GB/s = 0.54ms/个，而实测（含 slot 查表、
+            # set_weight、event 同步）大约 1.5-2ms/个。差 3 倍。
+            #
+            # 这个系数直接决定「槽位 vs 常驻层」的取舍：按 0.54ms 算，244 个
+            # 槽位省 130ms 只花 4.5GB；按 1.8ms 算，244 个槽位省 430ms —— 但
+            # 那 4.5GB 挤掉 9 层常驻，而 9 层 x 141ms = 1.27s。**槽位仍然不划算**，
+            # 而且要差 3 倍才看得出来。
+            _per_exp_s = self._tunable("h2d_expert_s", None, float)
+            if not _per_exp_s:
+                # 实证默认值：本机一个专家 blob 的装载开销（含调度，不含 IO）
+                _per_exp_s = 0.0018
+            expert_s = uncovered * (float(_per_exp_s) + (0.0 if hit > 0.5
+                                                          else self.expert_b / max(1.0, self.disk_rand)))
 
         # 计算：每步都要过全部层，与布局无关。用实测的每层计算耗时。
         compute_s = float(self.compute_per_layer_s or 0.0025) * n
@@ -219,7 +246,17 @@ class Planner:
     def used_bytes(self, lay: Layout) -> float:
         """这份布局在显存里占多少。"""
         b = 0.0
-        b += lay.resident * self.layer_b * 1.7          # 权重 + activation/frag
+        # **每层权重按实际字节计，不乘 slack。**
+        #
+        # 原来乘 1.7（"权重 + activation/frag"），但实测：搬一层 474.8MB 的权重
+        # 进显存，memory_allocated 正好增加 474.8MB —— 倍数是 1.00，没有额外开销。
+        #
+        # 那个 1.7 是旧规划器的实测常数（它把 activation 和碎片算进每层），
+        # 但那部分已经由 runtime_b / ws0 单独记了，再乘一次就是重复扣减。
+        #
+        # 后果很直接：按 1.7 算，475MB/层变成 808MB/层，8GB 卡只给 4 层；
+        # 按实际算能放 10 层。README 记录的历史成绩（1.26 tok/s）正是 10 层那档。
+        b += lay.resident * self.layer_b
         b += lay.slots * self.expert_b
         if not lay.embed_on_cpu:
             b += self.embed_b
