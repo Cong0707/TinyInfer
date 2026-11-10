@@ -356,12 +356,21 @@ class Planner:
         # 组数由模型结构决定（本机 4 组），所以总量 = 组数 x 2 x layer_b。
         # 拿不到组数时按「全部流式层都各一块 x 2」上界估 —— 宁可缓存小一点，
         # 也要保证 slab 能建起来，因为 slab 是图的前提。
+        # **slab 是「每层一块」，不是「每组 2 块」。**
+        #
+        # `_flat_setup` 里 slab_total = sum(sizes[i] for i in streamed)，也就是
+        # 每个流式层各占一块主机 pinned（本机 35 x 174MB = 6GB）。我上一版按
+        # 「4 组 x 2 块」扣，只扣了 1.4GB，剩下 4.6GB 的缺口全由缓存占走 ——
+        # 实测池里只剩 6.4GB，slab 只覆盖 11/35 层，其余 24 层退回逐 tensor
+        # 搬运，成绩锁在 0.48 tok/s。
+        #
+        # 按层扣之后缓存会小一些，但 slab 能覆盖全部流式层 —— 那才是图能成立
+        # 的前提，也是「一层一次 DMA」取代「一层几十次 copy_」的前提。
         _n_stream = max(0, int(self.n_layers) - int(getattr(self.cal, "resident", 0) or 0))
         if _n_stream <= 0:
-            # 调用方还没解出 resident，先用保守上界（12 组）
-            _signature_groups = 12
-        else:
-            _signature_groups = 4
+            # 调用方还没解出 resident：按全模型估（最坏情况，缓存给小）
+            _n_stream = int(self.n_layers)
+        _signature_groups = _n_stream
         _slab_b = _signature_groups * 2 * self.layer_b
         return max(0, _budget - int(_slab_b))
 

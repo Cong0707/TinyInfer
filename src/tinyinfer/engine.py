@@ -1277,7 +1277,14 @@ class Engine:
                     b._cpu_refs = None
             # flat streaming builds each streamed block and copies its weights into the
             # pinned slab -- all inside the same pool
+            #
+            # **在这里就把 TI_FLAT 打开。** 不打开的话 _flat_enabled() 走
+            # `flag is None or flag != "1"` 那条分支，把 _flat_state 置成 "off"，
+            # 之后无论谁再设环境变量都不会重建（off 是终态）。
+            # 而 slab 不是可选加速：它是「整层一次 DMA + 地址固定」的唯一来源，
+            # 也是 CUDA graph 能 replay 的前提。留成可选就等于永远拿不到图。
             try:
+                __import__("os").environ.setdefault("TI_FLAT", "1")
                 self._flat_enabled()
             except Exception as exc:
                 print(f"[tinyinfer] flat setup at start-up failed: {exc!r}", flush=True)
@@ -2172,6 +2179,33 @@ class Engine:
     # pinned bandwidth) instead of ~31 pageable per-tensor copies that each cost a
     # host round-trip; the next layer is copied on a side stream while the current
     # one computes, so the transfer hides behind the GPU.
+    def _release_flat_state(self) -> None:
+        """丢掉当前 slab 并把它占的 pool 切片还回去。
+
+        **不还就会泄漏。** `_flat_setup` 从 host_pool 里切每一层的
+        pinned 块（本机 35 x 174MB = 7.6GB），重跑 setup 之前必须先
+        把这些切片的账冲掉，否则第二次只能拿到残余空间：实测第一次
+        used=3.44GB/free=9.64GB，第二次 used=10.89GB/free=2.19GB，
+        slab 从 35 层掉到 9 层，成绩从能跑变成 0.37 tok/s。
+        """
+        st = getattr(self, "_flat_state", None)
+        if isinstance(st, tuple) and len(st) >= 3:
+            hosted = st[2]
+            if isinstance(hosted, dict):
+                for _blk in hosted.values():
+                    # HostPool.release(offset, n) 是按池内偏移还的。
+                    _off = getattr(_blk, "_tiny_pool_off", -1)
+                    _rel = getattr(self.host_pool, "release", None)
+                    if _off is not None and _off >= 0 and _rel is not None:
+                        try:
+                            _rel(int(_off), int(_blk.numel()))
+                        except Exception:
+                            pass
+        self._flat_state = None
+        self._flat_ev = {}
+        self._flat_done = {}
+        self._flat_slot_owner = {}
+
     def _flat_enabled(self) -> bool:
         st = getattr(self, "_flat_state", None)
         if st == "off":
@@ -2693,8 +2727,13 @@ class Engine:
             self._flat_slot_owner = {}
             self._flat_done = {}
         prev = self._flat_slot_owner.get(buf_idx)
+        # **不 pop 事件。** 原来这里是 `_flat_done.pop(prev, None)`，取出即删。
+        # 而一个槽位在一次 forward 里可能被反复占用（主路径 + 预取交替），
+        # 第二次需要等同一层时事件已经被 pop 掉了，于是这次覆盖无人守护 ——
+        # 实测就是「关掉预取 finite=True、开预取 finite=False」。
+        # 事件对象本身很小，留着到最后统一清理，换掉一类难查的竞态。
         if prev is not None and prev != layer:
-            done = self._flat_done.pop(prev, None)
+            done = self._flat_done.get(prev)
             if done is not None:
                 self._copy_stream.wait_event(done)
         self._flat_slot_owner[buf_idx] = layer
@@ -4034,8 +4073,18 @@ class Engine:
                 try:
                     _eo0 = __import__("os")
                     _eo0.environ["TI_FLAT"] = "1"
-                    self._flat_state = None
-                    _flat_ok = bool(self._flat_enabled())
+                    # **已经有 slab 就复用，不要拆了重建。**
+                    #
+                    # 拆掉再建会丢两层账：(a) release 让 _flat_state 变 None，
+                    # 若重建失败，主路径的 _flat_enabled 也回到 off，整步退回
+                    # 逐 tensor；(b) 重建要从同一个 host_pool 重新切 7.6GB，
+                    # 而池子已经被上一轮的切片占着 —— 实测第二次只剩 2.19GB，
+                    # slab 从 35 层掉到 9 层。
+                    # 图需要的是「地址固定」，已经建好的 slab 本来就满足。
+                    if isinstance(getattr(self, "_flat_state", None), tuple):
+                        _flat_ok = True
+                    else:
+                        _flat_ok = bool(self._flat_enabled())
                 except Exception as _e0:
                     print(f"[tinyinfer] slab for graph unavailable: {_e0!r}",
                           flush=True)
@@ -4145,8 +4194,18 @@ class Engine:
                 try:
                     _env_os = __import__("os")
                     _env_os.environ["TI_FLAT"] = "1"
-                    self._flat_state = None
-                    _flat_ok = bool(self._flat_enabled())
+                    # **已经有 slab 就复用，不要拆了重建。**
+                    #
+                    # 拆掉再建会丢两层账：(a) release 让 _flat_state 变 None，
+                    # 若重建失败，主路径的 _flat_enabled 也回到 off，整步退回
+                    # 逐 tensor；(b) 重建要从同一个 host_pool 重新切 7.6GB，
+                    # 而池子已经被上一轮的切片占着 —— 实测第二次只剩 2.19GB，
+                    # slab 从 35 层掉到 9 层。
+                    # 图需要的是「地址固定」，已经建好的 slab 本来就满足。
+                    if isinstance(getattr(self, "_flat_state", None), tuple):
+                        _flat_ok = True
+                    else:
+                        _flat_ok = bool(self._flat_enabled())
                 except Exception as _exc:
                     print(f"[tinyinfer] slab for graph unavailable: {_exc!r}",
                           flush=True)
