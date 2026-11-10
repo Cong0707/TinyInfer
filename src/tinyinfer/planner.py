@@ -103,12 +103,34 @@ class Cost:
 class Planner:
     """统一规划与调整。不做 IO、不碰 CUDA —— 只接受资源量和实测带宽。"""
 
-    def __init__(self, hw, model, bandwidth=None, calibrate=None):
+    def __init__(self, hw, model, bandwidth=None, calibrate=None,
+                 model_dir=None):
         self.hw = hw
         self.model = dict(model or {})
+        self.model_dir = str(model_dir or "")
         self.cal = dict(calibrate or {})
+        # **带宽优先级：调用方显式给 > 训练器实测存下的 > 现场测**
+        #
+        # 训练器（tinyinfer.tune）测多次取中位数后写进 tuning.json；那是比
+        # 单次现场测量更可信的值（单次可能撞页缓存，disk 能差一倍）。
+        # 所以这里是「读配置」而不是每次都重测 —— 重测留给训练器。
         if bandwidth is None:
-            bandwidth = hw.bandwidth(self.cal) if hasattr(hw, "bandwidth") else {}
+            stored = {}
+            try:
+                import tinyinfer.tuning as _tn
+
+                _p = _tn.params(getattr(self, "model_dir", "")) or {}
+                stored = {k: _p[k] for k in
+                          ("h2d_bps", "disk_bps", "disk_rand_bps", "ram_bps")
+                          if _p.get(k)}
+            except Exception:
+                stored = {}
+            if stored and stored.get("h2d_bps"):
+                bandwidth = stored
+            elif hasattr(hw, "bandwidth"):
+                bandwidth = hw.bandwidth(self.cal)
+            else:
+                bandwidth = {}
         self.h2d = float(bandwidth.get("h2d_bps") or 1.0)
         self.disk = float(bandwidth.get("disk_bps") or 1.0)
         self.disk_rand = float(bandwidth.get("disk_rand_bps") or self.disk)
@@ -126,6 +148,40 @@ class Planner:
         caps = getattr(hw, "cards", None) or []
         self.vram = sum(c.total_gb for c in caps) * GB if caps else 0.0
         self.has_gpu = bool(caps) and self.vram > 0
+
+        # ---- 训练器可调的三个量 ------------------------------------------
+        #
+        # 这三个**不由「资源量 ÷ 单元大小」推出**，必须实测，所以它们是参数
+        # 而不是求解结果。训练器（tinyinfer.tune）扫它们，写进 tuning.json，
+        # 这里优先读环境变量（训练器扫参用），其次读 tuning，最后用初值。
+        #
+        # 注意：resident / slots / cache_bytes **不在**这里 —— 它们由目标函数
+        # 解出来，不是可调参数。以前把 slots 做成可调导致规划器被上一轮的旧值
+        # 永久锁死。
+        import os as _os
+        self.compute_per_layer_s = self._tunable(
+            "compute_per_layer_s", 0.0025, float)
+        self.pin_ratio = self._tunable("pin_ratio", 0.5, float)
+        self.ws_base_gb = self._tunable("ws_base_gb", None, float)
+
+    def _tunable(self, name, default, cast):
+        """读一个可调量：环境变量（训练器用）> calibrate > 默认。"""
+        import os as _os
+
+        env_key = "TI_TUNE_" + name.upper()
+        v = _os.environ.get(env_key)
+        if v not in (None, ""):
+            try:
+                return cast(v)
+            except (TypeError, ValueError):
+                pass
+        v = self.cal.get(name)
+        if v is not None:
+            try:
+                return cast(v)
+            except (TypeError, ValueError):
+                pass
+        return default
 
     # ---- 目标函数 ---------------------------------------------------------
 
@@ -155,7 +211,7 @@ class Planner:
                                           + (1.0 - hit) / max(1.0, self.disk_rand))
 
         # 计算：每步都要过全部层，与布局无关。用实测的每层计算耗时。
-        compute_s = float(self.cal.get("compute_per_layer_s") or 0.0025) * n
+        compute_s = float(self.compute_per_layer_s or 0.0025) * n
         return Cost(stream_s=stream_s, expert_s=expert_s, compute_s=compute_s)
 
     # ---- 资源约束 ---------------------------------------------------------

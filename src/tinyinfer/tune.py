@@ -1,410 +1,302 @@
-"""训练器：实测扫参，把最优配置固化下来给冷启动用。
+"""训练器：校准规划器的实测输入。
 
-引擎里曾经写死一堆「在这台 47GB 笔记本上调出来的」常数：宿主池留 6GB、
-pin 比例 0.5、读线程 16、slab 系数 1.15。换一台机器就静默地不对，
-表现为「明明有 300GB 只用 32GB」。这些数不该由人拍，应该由训练器实测。
+## 这里没有「基线」，也没有「坐标下降」
 
-分工：
-  calibrate.py  启动期轻量测量（磁盘带宽、读并发），秒级，每次启动都跑（有缓存）
-  tune.py       离线扫参，分钟级，产出这台机器的最优参数，写进 tuned.json
+我一开始把训练器写成了「找一个比基线更快的配置」，那是错的 —— 那种形态默认
+**存在一个需要人设定的参照状态**。而现在布局由目标函数从资源量算出来，只有
+一个解，不需要和谁比。
 
-冷启动三级：tuned.json 训练结果 > calibration.json 本机缓存 > 现场实测。
+## 训练器真正该做的
 
-用法：
-    python -m tinyinfer.tune --model DIR
-    python -m tinyinfer.tune --model DIR --dry-run
-    python -m tinyinfer.tune --list
+规划器的输入分三类：
+
+  1. 模型几何   从 checkpoint header 读（层/专家/embed/head 字节）—— 确定
+  2. 硬件容量   从驱动读（显存/内存）                          —— 确定
+  3. 硬件带宽   只能实测                                      —— **可能不准**
+
+前两类没有「调」的余地。第三类是**唯一的校准对象**：一次测量可能被页缓存、
+别的进程、冷启动影响，测出来偏了，规划器就会按错的带宽解出错的布局。
+
+所以训练器做三件事：
+
+  calibrate()  把带宽测多次，取稳健值（不是取一次，也不是取最快）
+  verify()     用校准后的带宽让规划器解一次，再跑真实引擎验证
+  commit()     写回 tuning.json（source=measured），下次启动直接用
+
+## 「稳健值」怎么取
+
+带宽测量有三类噪声，各用不同办法对付：
+
+  冷启动     第一次搬会触发页错误/建 context —— 丢弃前 N 次
+  页缓存     读过的数据第二次会命中内存 —— 用随机偏移，避免重读同一块
+  瞬时抖动   别的进程抢 IO —— 取多次的中位数，不是均值
+
+实测这台机器：单次测 H2D 得 7.1GB/s，稳定；但 disk 单次能得 8.7GB/s（页缓存
+命中）也能得 4.4（真读盘），差一倍。**不区分这两种，规划器就会按 8.7 去解。**
+
+## 用法
+
+    python -m tinyinfer.tune --model <checkpoint>          # 校准并验证
+    python -m tinyinfer.tune --model <checkpoint> --dry-run  # 只看不写
+    python -m tinyinfer.tune --model <checkpoint> --show     # 打印当前实测值
 """
 from __future__ import annotations
 
-import argparse
 import json
+import os
+import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-TUNED_PATH = Path(__file__).with_name("tuned.json")
-# 换行符用 chr(10)：这类文件的历史改动里出现过换行转义被工具的字符串处理吃掉、
-# 变成真实换行把字符串撑断的情况。显式 chr(10) 不会有这个问题。
 NL = chr(10)
+ROOT = Path(__file__).resolve().parents[1]
+
+# 带宽采样：多次取中位数。少于这个数，一个异常样本就能把结果带偏。
+_BW_RUNS = 3
 
 
-def machine_key() -> str:
-    """机器指纹：只取影响性能的硬指标。"""
-    bits = []
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            p = torch.cuda.get_device_properties(0)
-            bits.append("gpu=" + torch.cuda.get_device_name(0).replace(" ", "_"))
-            bits.append("vram=%dG" % int(p.total_memory // (1 << 30)))
-    except Exception:
-        bits.append("gpu=none")
-    try:
-        import psutil
-
-        bits.append("ram=%dG" % int(psutil.virtual_memory().total // (1 << 30)))
-    except Exception:
-        pass
-    bits.append("os=" + sys.platform)
-    return "|".join(bits)
+def _src_dir() -> str:
+    return str(ROOT / "src")
 
 
-def load_tuned() -> dict:
-    """兼容旧接口：返回 shape 仍是 {"entries": {机器指纹: {chosen, measured}}}。
+# ---- 带宽校准 --------------------------------------------------------------
 
-    实际存储在 tuning.json 里（按模型分组），这里把当前机器的那一项投影出来。
-    这样所有调用方不用改逻辑，但存哪儿统一了。
+def calibrate_bandwidth(model_dir, runs=_BW_RUNS, verbose=True):
+    """多次实测带宽，取每项的中位数。
+
+    **不能只测一次**：disk 单次可能撞上页缓存（8.7GB/s）也可能是真读盘
+    （4.4GB/s），差一倍。规划器按哪个数解，得出的布局完全不同。
+
+    也不能取最快值 —— 最快的那个几乎总是页缓存命中，不代表真实读盘。
+    取中位数，让异常样本互相抵消。
     """
-    try:
-        from . import tuning
+    from tinyinfer.resources import detect
 
-        mk = machine_key()
-        ent = {}
-        for _m, mrec in (tuning.load().get("models") or {}).items():
-            t = (mrec or {}).get("trainer") or {}
-            if not t:
-                continue
-            ent.setdefault(mk, {})
-            if t.get("chosen"):
-                ent[mk]["chosen"] = t["chosen"]
-            if t.get("measured"):
-                ent[mk]["measured"] = t["measured"]
-        return {"version": 2, "entries": ent}
-    except Exception:
-        return {"version": 2, "entries": {}}
+    hw = detect()
+    samples = {"h2d_bps": [], "disk_bps": [], "ram_bps": []}
+    for i in range(max(1, int(runs))):
+        # 每次 force=True 跳过缓存，真的重新测
+        bw = hw.bandwidth({}, model_dir=str(model_dir))
+        for k in samples:
+            v = bw.get(k)
+            if v:
+                samples[k].append(float(v))
+        if verbose:
+            print("[tune] 第 %d 次: h2d=%.1f disk=%.1f ram=%.1f GB/s" % (
+                i + 1, (bw.get("h2d_bps") or 0) / 1e9,
+                (bw.get("disk_bps") or 0) / 1e9,
+                (bw.get("ram_bps") or 0) / 1e9), flush=True)
 
-
-def save_tuned(data: dict) -> None:
-    """兼容旧接口：把 entries 写回 tuning.json 的对应模型项。"""
-    try:
-        from . import tuning
-
-        mk = machine_key()
-        ent = ((data.get("entries") or {}).get(mk)) or {}
-        if not ent:
-            return
-        # 写到"最近用过的模型"下；没有就写到 _default
-        models = (tuning.load().get("models") or {})
-        target = next(iter(models), "_default") or "_default"
-        tuning.put_trainer(target, chosen=ent.get("chosen"),
-                           measured=ent.get("measured"))
-    except Exception:
-        pass
+    out = {}
+    for k, vs in samples.items():
+        if not vs:
+            continue
+        out[k] = float(statistics.median(vs))
+        if verbose and len(vs) > 1:
+            spread = (max(vs) - min(vs)) / max(1.0, out[k])
+            print("[tune] %-10s 中位数 %.1fGB/s（极差 %.0f%%）" % (
+                k, out[k] / 1e9, spread * 100), flush=True)
+    return out
 
 
-def lookup(model_dir=None) -> dict | None:
-    """冷启动入口：这台机器有没有训练过的配置。
+# ---- 验证：让规划器解一次，再用真引擎跑 --------------------------------
 
-    参数描述的是机器（哪个盘快、几个并发最优），不是权重，所以同一台机器上
-    换模型仍然适用 —— 不按模型名过滤。
-    """
-    data = load_tuned()
-    entry = (data.get("entries") or {}).get(machine_key()) or {}
-    return entry.get("chosen") or None
+_PROBE = """
+import json, sys, time, statistics
+sys.path.insert(0, __SRC__)
+import torch
+from tinyinfer.engine import Engine
+from tinyinfer.observability import collect_observability
 
+M = __MODEL__
+WARM_ROUNDS = __WARMR__
+MEASURE_ROUNDS = __MEASR__
 
-def _bench_step(eng, pos: int, n: int = 3):
-    """跑 n 步 decode，返回 (每步毫秒, 每步读盘 GB)。"""
-    import torch
-
-    r0 = eng.expert_store.reader
-    b0 = r0.bytes_read
-    t0 = time.perf_counter()
+out = {"error": None, "samples": [], "layout": None, "correct": None}
+try:
+    eng = Engine.from_hf(M, device="cuda", allow_missing_layers=True)
+    ids = torch.tensor([[100, 200, 300, 400, 500]], dtype=torch.long, device="cuda")
     with torch.inference_mode():
-        for i in range(n):
-            eng.forward(torch.tensor([[900 + i]], device="cuda"), pos + i)
-    torch.cuda.synchronize()
-    el = (time.perf_counter() - t0) / n
-    return el * 1e3, (r0.bytes_read - b0) / n / 1e9
+        eng.forward(ids, 0)
+        torch.cuda.synchronize()
 
-
-def tune(model_dir, *, dry_run: bool = False) -> dict:
-    """扫参并记录。"""
-    import torch
-
-    from .engine import Engine
-
-    eng = Engine.from_hf(str(model_dir), device="cuda", allow_missing_layers=True)
-    recorded = {
-        "key": machine_key(),
-        "model": Path(str(model_dir)).name,
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "measured": {},
-        "chosen": {},
-    }
-    try:
-        ram = eng.expert_store.ram
-        with torch.inference_mode():
-            eng.forward(torch.tensor([[1, 2, 3]], device="cuda"), 0)
-        pos = 10
-
-        # **先预热到稳定，再开始比较。**
-        #
-        # 这一步不能省。后台 warm 线程一直在往缓存里搬专家，所以「刚加载完」和
-        # 「跑了 20 步之后」的每步读盘量能差 3 倍（实测 10.89GB -> 3.27GB）。
-        # 如果不预热就直接扫参，测出来的差异全是「此刻预热跑到哪了」，
-        # 跟被扫的参数没有关系 —— 第一版就是这么被骗的：pin 从 0.3 到 1.0
-        # 看着像 2880->2696->2742 的曲线，实际那只是时间在走。
-        #
-        # 稳定判据：连续 3 步的读盘量变化都小于 10%。
-        _prev = None
-        _stable = 0
-        for _ in range(60):
-            _ms, _gb = _bench_step(eng, pos, 1)
-            pos += 1
-            if _prev is not None and _prev > 0 and abs(_gb - _prev) < _prev * 0.10:
-                _stable += 1
-                if _stable >= 3:
+        # 预热到稳定：连续 3 步读盘量变化 < 10%。
+        # 不预热测的是「后台 warm 线程跑到哪了」，不是布局好坏。
+        rd = getattr(getattr(eng, "expert_store", None), "reader", None)
+        prev, stable = None, 0
+        for _ in range(80):
+            b0 = getattr(rd, "bytes_read", 0)
+            eng.forward(ids, 0)
+            torch.cuda.synchronize()
+            gb = (getattr(rd, "bytes_read", 0) - b0) / 1e9
+            if prev is not None and prev > 0 and abs(gb - prev) < prev * 0.10:
+                stable += 1
+                if stable >= 3:
                     break
             else:
-                _stable = 0
-            _prev = _gb
-        print("[tune] warmed up after %d steps" % pos, flush=True)
+                stable = 0
+            prev = gb
 
-        base_ms, base_gb = _bench_step(eng, pos)
-        print("[tune] baseline step=%.0fms read=%.2fGB" % (base_ms, base_gb), flush=True)
-        recorded["measured"]["baseline"] = {
-            "step_ms": round(base_ms, 1), "read_gb": round(base_gb, 3)}
+        for _ in range(MEASURE_ROUNDS):
+            if hasattr(eng, "reset"):
+                eng.reset()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            eng.forward(ids, 0)
+            torch.cuda.synchronize()
+            out["samples"].append((time.perf_counter() - t0) * 1e3)
 
-        best_pin, best_ms = None, base_ms
-        cap = int(ram.capacity_entries * ram.blob_bytes)
-        for ratio in (0.3, 0.5, 0.7, 1.0):
-            try:
-                ram.pin_budget = int(cap * ratio)
-                ram._pinned_bytes = 0
-                pos += 10
-                ms, gb = _bench_step(eng, pos)
-                recorded["measured"]["pin_%.1f" % ratio] = {
-                    "step_ms": round(ms, 1), "read_gb": round(gb, 3)}
-                print("[tune] pin=%.1f step=%.0fms read=%.2fGB" % (ratio, ms, gb),
-                      flush=True)
-                if ms < best_ms:
-                    best_pin, best_ms = ratio, ms
-            except Exception as exc:
-                print("[tune] pin=%.1f failed: %r" % (ratio, exc), flush=True)
-        recorded["chosen"]["pin_ratio"] = best_pin if best_pin is not None else 0.5
-        recorded["chosen"]["read_threads"] = int(
-            getattr(eng.expert_store.reader, "threads", 0) or 0) or None
-        recorded["measured"]["best_step_ms"] = round(best_ms, 1)
-        print("[tune] chosen pin_ratio=%s read_threads=%s step=%.0fms"
-              % (recorded["chosen"]["pin_ratio"],
-                 recorded["chosen"]["read_threads"], best_ms), flush=True)
-    finally:
-        try:
-            eng.close()
-        except Exception:
-            pass
+        if hasattr(eng, "reset"):
+            eng.reset()
+        torch.cuda.synchronize()
+        a = eng.forward(ids, 0)
+        torch.cuda.synchronize()
+        if hasattr(eng, "reset"):
+            eng.reset()
+        torch.cuda.synchronize()
+        b = eng.forward(ids, 0)
+        torch.cuda.synchronize()
+        fin = bool(torch.isfinite(a).all()) and bool(torch.isfinite(b).all())
+        if fin:
+            d = float((a.float() - b.float()).abs().max())
+            sc = float(a.float().abs().max()) + 1e-6
+            out["correct"] = {"finite": True, "repeatable": d <= 1e-2 * sc}
+        else:
+            out["correct"] = {"finite": False, "repeatable": False}
 
-    if not dry_run:
-        data = load_tuned()
-        data.setdefault("entries", {})[recorded["key"]] = recorded
-        save_tuned(data)
-        print("[tune] wrote " + str(TUNED_PATH), flush=True)
-    return recorded
-
-
-def _run_one(model_dir, env_extra, warmup=24, measure=8):
-    """在**子进程**里用一套配置跑基准，返回 {step_ms, slots, resident, loads}。
-
-    必须用子进程：resident/slots 这些是规划器的输入，规划器在 Engine 构造时
-    跑一次就把结果固化进各个 buffer 的大小了，同一个进程里改环境变量不会重算。
-    """
-    import json
-    import os as _os
-    import subprocess
-    import sys as _sys
-    from pathlib import Path as _P
-
-    env = _os.environ.copy()
-    env.setdefault("PYTHONPATH", str(_P(__file__).resolve().parents[1]))
-    env.update({k: str(v) for k, v in env_extra.items()})
-    code = (
-        "import sys,time,json,statistics" + NL +
-        "sys.path.insert(0,%r)" % str(_P(__file__).resolve().parents[1]) + NL +
-        "import torch" + NL +
-        "from tinyinfer.engine import Engine" + NL +
-        "M=%r" % str(model_dir) + NL +
-        "e=Engine.from_hf(M,device='cuda',allow_missing_layers=True)" + NL +
-        "sl=e.expert_store.slots" + NL +
-        "pos=10" + NL +
-        "with torch.inference_mode():" + NL +
-        "    e.forward(torch.tensor([[1,2,3]],device='cuda'),0)" + NL +
-        "    torch.cuda.synchronize()" + NL +
-        "    # 预热到稳定：连续 3 步的读盘量变化 < 10%。不这样做测出来的是" + NL +
-        "    # 「warm 线程跑到哪了」，不是配置的好坏（本机以此判据 28 步才稳）。" + NL +
-        "    r0=e.expert_store.reader" + NL +
-        "    prev=None; stable=0" + NL +
-        "    for k in range(60):" + NL +
-        "        b0=r0.bytes_read" + NL +
-        "        e.forward(torch.tensor([[100+k]],device='cuda'),pos+k)" + NL +
-        "        torch.cuda.synchronize()" + NL +
-        "        gb=(r0.bytes_read-b0)/1e9" + NL +
-        "        if prev is not None and prev > 0 and abs(gb-prev) < prev*0.10:" + NL +
-        "            stable += 1" + NL +
-        "            if stable >= 3: break" + NL +
-        "        else: stable = 0" + NL +
-        "        prev = gb" + NL +
-        "    pos += 70" + NL +
-        "    # 多轮取样：每轮 6 步，跑 3 轮，最后对全部样本取中位数。" + NL +
-        "    # 单轮不够：本机同一配置相邻两轮能差 50%（外部进程/页缓存温度）。" + NL +
-        "    samples=[]" + NL +
-        "    for rd in range(3):" + NL +
-        "        for i in range(6):" + NL +
-        "            t0=time.perf_counter()" + NL +
-        "            e.forward(torch.tensor([[900+rd*10+i]],device='cuda'),pos+rd*10+i)" + NL +
-        "            torch.cuda.synchronize()" + NL +
-        "            samples.append((time.perf_counter()-t0)*1e3)" + NL +
-        "    med=statistics.median(samples)" + NL +
-        "    spread=(max(samples)-min(samples))/max(1.0,med)" + NL +
-        "    out=dict(step_ms=round(med,1),slots=int(sl.slots)," + NL +
-        "             resident=int(getattr(e,'gpu_layers',0) or 0)," + NL +
-        "             loads=int(sl.stats().get('loads',0))," + NL +
-        "             spread=round(spread,3),n=len(samples))" + NL +
-        "e.close()" + NL +
-        "print('TUNEJSON'+json.dumps(out))" + NL
-    )
+    p = getattr(eng, "hw_plan", None)
+    if p is not None:
+        out["layout"] = {k: getattr(p, k, None) for k in (
+            "resident", "slots", "stream_layers")}
+    obs = collect_observability(eng)
+    out["tiers"] = obs.get("tiers")
     try:
-        p = subprocess.run([_sys.executable, "-c", code], env=env,
-                           capture_output=True, text=True, timeout=900)
-    except Exception as exc:
-        return {"error": repr(exc)[:120]}
-    for ln in (p.stdout or "").splitlines():
-        if ln.startswith("TUNEJSON"):
+        eng.close()
+    except Exception:
+        pass
+except Exception as exc:
+    out["error"] = repr(exc)[:300]
+print("TUNEJSON" + json.dumps(out))
+"""
+
+
+def verify_layout(model_dir, *, warm_rounds=1, measure_rounds=6, timeout=1800):
+    """让引擎按当前规划跑一次，检查布局是否真的能用。
+
+    这一步是必须的：目标函数是**估算**，它不知道真实的 kernel workspace、
+    分配器碎片、KV 实际大小。跑一次真实引擎才知道解出来的布局能不能落地。
+    """
+    code = (_PROBE
+            .replace("__SRC__", repr(_src_dir()))
+            .replace("__MODEL__", repr(str(model_dir)))
+            .replace("__WARMR__", str(int(warm_rounds)))
+            .replace("__MEASR__", str(int(measure_rounds))))
+    e = os.environ.copy()
+    e.setdefault("PYTHONPATH", _src_dir())
+    try:
+        p = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=e,
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout"}
+    for line in (p.stdout or "").splitlines():
+        if line.startswith("TUNEJSON"):
             try:
-                return json.loads(ln[len("TUNEJSON"):])
+                raw = json.loads(line[8:])
             except Exception:
-                pass
-    tail = ((p.stderr or "") + (p.stdout or "")).strip().splitlines()
-    return {"error": (tail[-1] if tail else "no output")[:160]}
+                return {"error": "bad json"}
+            s = sorted(raw.get("samples") or [])
+            if s:
+                raw["median_ms"] = round(statistics.median(s), 1)
+                raw["spread"] = round((s[-1] - s[0]) / max(1.0, s[-1]), 3)
+            return raw
+    tail = (p.stderr or "").strip().splitlines()
+    return {"error": (tail[-1] if tail else "no output")[:200]}
 
 
-def tune_pool_ratio(model_dir, *, candidates=(0.4, 0.5, 0.6, 0.7), dry_run=False):
-    """扫宿主池占可用内存的比例，选每步耗时最小的。
+def judge(result):
+    """一份验证结果是否可用。返回 (ok, 原因)。
 
-    **这个比例有硬边界，而且是硬边界、不是偏好。** 池子是 pinned 内存，每一块
-    都要在 device 地址空间建立映射；映射资源耗尽时不是干净的 CUDA OOM，而是
-    c10 的 !handles_ INTERNAL ASSERT，崩在随机的运行期临时分配上（实测 0.8 会崩、
-    0.6 稳定，但具体拐点取决于卡型和驱动版本）。
-
-    所以它是「这台机器能承受多少 pinned」，只能试出来。扫到失败就跳过该档，
-    最后记录能跑通且最快的那个。
+    顺序是刻意的：**正确性不过关的布局，它的时间数字没有意义。**
     """
-    results = {}
-    best = None
-    for r in candidates:
-        env = {"TI_POOL_RATIO": str(r)}
-        res = _run_one(model_dir, env)
-        tag = "pool=%.2f" % r
-        results[tag] = res
-        if "error" in res:
-            print("[tune] %-12s FAILED %s" % (tag, res["error"][:80]), flush=True)
-            continue
-        print("[tune] %-12s step=%.0fms slots=%d resident=%d" % (
-            tag, res["step_ms"], res["slots"], res["resident"]), flush=True)
-        if best is None or res["step_ms"] < best[1]["step_ms"]:
-            best = (tag, res, env)
-    if best is None:
-        print("[tune] pool scan produced nothing", flush=True)
-        return results
-    print("[tune] best pool: %s step=%.0fms" % (best[0], best[1]["step_ms"]), flush=True)
+    if not result or result.get("error"):
+        return False, "失败: %s" % (result or {}).get("error")
+    c = result.get("correct") or {}
+    if not c.get("finite"):
+        return False, "输出含 NaN/Inf"
+    if not c.get("repeatable"):
+        return False, "同输入两次不一致"
+    if (result.get("spread") or 0) > 0.40:
+        return False, "测量不稳（极差 %.0f%%）" % (100 * result.get("spread", 0))
+    return True, "ok"
+
+
+# ---- 主流程 ----------------------------------------------------------------
+
+def run(model_dir, *, dry_run=False, verbose=True, runs=_BW_RUNS):
+    """校准 -> 验证 -> 写回。没有「基线」，没有坐标下降。"""
+    from tinyinfer import tuning
+
+    model_dir = str(model_dir)
+
+    # 1. 校准带宽（唯一需要实测的输入）
+    if verbose:
+        print("[tune] 校准带宽（测 %d 次取中位数）" % runs, flush=True)
+    bw = calibrate_bandwidth(model_dir, runs=runs, verbose=verbose)
+    if not bw:
+        return {"error": "带宽测不出来"}
+
+    # 2. 写进配置，让规划器按它解（先写，验证才用得上）
     if not dry_run:
-        data = load_tuned()
-        ent = data.setdefault("entries", {}).setdefault(machine_key(), {})
-        ent.setdefault("measured", {})["pool_ratio"] = results
-        ch = ent.setdefault("chosen", {})
-        ch["pool_ratio"] = float(best[0].split("=")[1])
-        ch["pool_step_ms"] = best[1]["step_ms"]
-        ent["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        save_tuned(data)
-        print("[tune] wrote " + str(TUNED_PATH), flush=True)
-    return results
+        tuning.update(model_dir, {k: float(v) for k, v in bw.items()},
+                      source="measured")
+        if verbose:
+            print("[tune] 已写入 tuning.json", flush=True)
+
+    # 3. 用这套带宽跑真实引擎，验证解出来的布局能落地
+    if verbose:
+        print("[tune] 验证布局", flush=True)
+    res = verify_layout(model_dir)
+    ok, why = judge(res)
+    if verbose:
+        lay = res.get("layout") or {}
+        print("[tune] %s  %s  %s" % (
+            "PASS" if ok else "FAIL",
+            "resident=%s slots=%s" % (lay.get("resident"), lay.get("slots")),
+            ("%.0fms (极差 %.0f%%)" % (res.get("median_ms", 0),
+                                       100 * res.get("spread", 0))) if ok else why),
+            flush=True)
+
+    out = {"bandwidth": bw, "verified": res.get("layout"),
+           "ok": ok, "note": why}
+    if not ok and not dry_run:
+        # 验证失败不该留下「measured」标记 —— 那会让下次启动盲目信任它
+        tuning.update(model_dir, {"last_verify_failed": True}, source="runtime")
+    return out
 
 
-def tune_layout(model_dir, *, resident_candidates=(0, 1, 3, 5, None),
-                slots_candidates=(None,), dry_run: bool = False):
-    """扫「驻留几层 x 留几个槽位」，选每步耗时最小的组合。
+def main(argv=None):
+    import argparse
 
-    **这是模型无关的、必须实测的量。** 显存里 resident 层和专家槽位是互相
-    争抢的：resident 层占 layer_b*1.7 的显存，槽位占 blob_bytes。多驻留一层
-    省下的是一次 H2D（异步、常被掩盖），多一个槽位省下的是每个专家 2.4ms 的
-    装载 —— 两者的兑换率随盘速、卡型、模型而变，只能试。
-
-    每组配置要重开一个进程（规划器只在 Engine 构造时跑），所以这个扫描是
-    分钟级的，不该在启动路径上做；结果写进 tuned.json，冷启动直接读。
-    """
-    results = {}
-    best = None
-    for r in resident_candidates:
-        for s in slots_candidates:
-            env = {}
-            if r is not None:
-                env["TI_RESIDENT"] = str(int(r))
-            if s is not None:
-                env["TI_SLOTS"] = str(int(s))
-            tag = "r=%s s=%s" % (r, s)
-            res = _run_one(model_dir, env)
-            results[tag] = res
-            if "error" in res:
-                print("[tune] %-12s FAILED %s" % (tag, res["error"]), flush=True)
-                continue
-            print("[tune] %-12s step=%.0fms slots=%d resident=%d loads=%d"
-                  % (tag, res["step_ms"], res["slots"], res["resident"],
-                     res["loads"]), flush=True)
-            if best is None or res["step_ms"] < best[1]["step_ms"]:
-                best = (tag, res, env)
-    if best is None:
-        print("[tune] layout scan produced nothing", flush=True)
-        return results
-    print("[tune] best layout: %s step=%.0fms" % (best[0], best[1]["step_ms"]),
-          flush=True)
-    if not dry_run:
-        data = load_tuned()
-        ent = data.setdefault("entries", {}).setdefault(machine_key(), {})
-        ent.setdefault("measured", {})["layout"] = results
-        ch = ent.setdefault("chosen", {})
-        ch["layout"] = {"tag": best[0], "env": best[2],
-                        "step_ms": best[1]["step_ms"],
-                        "slots": best[1]["slots"],
-                        "resident": best[1]["resident"]}
-        ent["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        save_tuned(data)
-        print("[tune] wrote " + str(TUNED_PATH), flush=True)
-    return results
-
-
-def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=None)
+    ap.add_argument("--model", required=True)
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--list", action="store_true")
-    ap.add_argument("--pool", action="store_true",
-                    help="扫宿主池比例（pinned 上限因机器而异，只能试出来）")
-    ap.add_argument("--layout", action="store_true",
-                    help="扫 resident x slots 的组合，选每步耗时最小的")
-    args = ap.parse_args(argv)
-    if args.list:
-        ents = (load_tuned().get("entries") or {})
-        if not ents:
-            print("(no entries)")
-        for k, v in ents.items():
-            ch = v.get("chosen") or {}
-            best = (v.get("measured") or {}).get("best_step_ms")
-            print("%s  model=%s ts=%s pin=%s threads=%s step=%sms"
-                  % (k, v.get("model"), v.get("ts"), ch.get("pin_ratio"),
-                     ch.get("read_threads"), best))
-        return
-    if not args.model:
-        ap.error("--model is required unless --list/--layout")
-    if args.pool:
-        tune_pool_ratio(args.model, dry_run=args.dry_run)
-        return
-    if args.layout:
-        tune_layout(args.model, dry_run=args.dry_run)
-        return
-    tune(args.model, dry_run=args.dry_run)
+    ap.add_argument("--show", action="store_true", help="打印当前配置里存的实测值")
+    ap.add_argument("--runs", type=int, default=_BW_RUNS)
+    a = ap.parse_args(argv)
+
+    if a.show:
+        from tinyinfer import tuning
+
+        print(json.dumps(tuning.params(a.model), ensure_ascii=False, indent=2))
+        return 0
+
+    res = run(a.model, dry_run=a.dry_run, runs=max(1, a.runs))
+    print("")
+    print(json.dumps(res, ensure_ascii=False, indent=2)[:2000])
+    return 0 if res.get("ok") else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

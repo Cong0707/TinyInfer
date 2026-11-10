@@ -101,10 +101,45 @@ def measure_disk(model_dir: str | Path) -> dict:
     try:
         p = paths[0]
         size = os.path.getsize(p)
-        # 顺序：读 96MB
+        # 顺序：读 96MB。**起始偏移每次随机**：固定读文件头的话，第二次测量
+        # 就全在页缓存里了 —— 实测同一份 checkpoint 连测两次得到 4.4GB/s 和
+        # 7.4GB/s，差 68%。规划器按 7.4 去解，会得出「搬运很便宜」的错误结论。
+        #
+        # 要让页缓存失效，只能读「大概率还没被读过」的区域：48 个分片里随机挑，
+        # 再在文件内随机偏移。不完美（缓存大的机器仍可能命中），但比固定读头准。
         n = min(96 << 20, max(8 << 20, size // 8))
+        _off = random.randrange(0, max(1, size - n))
         t0 = time.perf_counter()
-        got = _read_bytes(p, 0, n)
+        got = _read_bytes(p, _off, n)
+        # **优先用 NO_BUFFERING 重测一次。** 普通读会命中页缓存：实测同一份
+        # checkpoint 连测三次是 4.45 / 10.51 / 10.33 GB/s —— 后两次全是缓存。
+        # 47GB 内存的机器上，96MB 的块读一次就进缓存了，随机偏移也没用。
+        #
+        # NO_BUFFERING 绕开页缓存，测到的才是盘。它有 4KiB 对齐要求，
+        # loading._WindowsDirect 已经处理了这件事。
+        try:
+            from .loading import _WindowsDirect
+
+            # 注意签名：read(path, offset, nbytes, dest) -> None
+            # （写进 dest，不返回值）。第一次写这行时我按「返回值」用了，
+            # 拿到 None 去算，得出 30503GB/s 这种荒唐数字。
+            _d = _WindowsDirect()
+            # scratch 有上限（默认 32MB），单次不能读超过它。分多次读到 96MB ——
+            # 每次偏移不同，才能反映「从盘上连续拉一大段」的真实带宽。
+            _chunk = min(n, int(getattr(_d, "_scratch_size", 32 << 20)))
+            _reads = max(1, n // _chunk)
+            _buf = bytearray(_chunk)
+            _mv = memoryview(_buf)
+            _aligned = (_off // 4096) * 4096
+            t0 = time.perf_counter()
+            for _i in range(_reads):
+                _d.read(p, _aligned + _i * _chunk, _chunk, _mv)
+            _dt = time.perf_counter() - t0
+            if _dt > 0:
+                out["seq_gbps"] = round(_reads * _chunk / 1e9 / _dt, 2)
+                out["seq_direct"] = True
+        except Exception as _exc:
+            out["seq_direct_error"] = repr(_exc)[:80]
         dt = time.perf_counter() - t0
         if dt > 0 and got > 0:
             out["seq_gbps"] = round(got / 1e9 / dt, 2)
