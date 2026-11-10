@@ -2369,7 +2369,7 @@ class Engine:
         # 真正安全的环深度 = 预取提前量 + 1。预取不开启时 2 就够，开启时
         # 要覆盖「当前 + 预取中的那几层」。取 4 是本机显存允许的上限
         # （4 x 463MB = 1.85GB），再大就挤掉槽位了。
-        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "4"))))
+        _ring_n = max(2, int(__import__("os").environ.get("TI_RING", "4")))
         bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(_ring_n)]
         pinned_gb = 0.0
         # Pinned budget. Pinning all 17.9GB of streamed weights starved the expert
@@ -2627,8 +2627,26 @@ class Engine:
               f"{pinned_gb:.1f}GB {'slab' if self._host_slab else 'per-tensor'} pinned source",
               flush=True)
 
-    def _flat_apply(self, layer: int, buf_idx: int) -> None:
+    def _flat_apply(self, layer: int, buf_idx: int, stream=None) -> None:
+        """把一层权重搬进环块。**流必须显式传入，绝不读 current_stream。**
+
+        实测（一次 forward 内采样 current_stream）：
+            {0: 1, 2710229284720: 37}
+        37 次跑在第三个流上，而 forward 主体在默认流（0）上 —— 那 37 次 DMA
+        与消费它的 kernel **不在同一条流**，driver 层没有任何顺序保证，于是
+        kernel 读到的是尚未落地的字节。这是 slab 路径 NaN 的真正根因，也解释
+        了为什么 TI_FLAT_SYNC=1（全设备同步）能掩盖它。
+
+        current_stream 会漂移的原因：_flat_prefetch 用
+        `with torch.cuda.stream(self._copy_stream)` 包住 _flat_apply，任何提前
+        return / 异常路径都可能让上下文栈与直觉不一致；prefetch 之后主路径再
+        调 apply 时，栈可能还停在 copy stream 上。
+
+        所以这里不再相信隐式状态：调用方显式给 stream，否则用默认流。
+        """
         self._flat_applies = getattr(self, "_flat_applies", 0) + 1
+        _tgt_stream = stream if stream is not None else torch.cuda.default_stream()
+        self._flat_tgt_stream = _tgt_stream
         lay, bufs, host = self._flat_state
         b = self.block(layer)
         offs, total = lay[layer]
@@ -2692,7 +2710,7 @@ class Engine:
                 from .loading import _async_h2d as _ah2d
 
                 _ok = bool(_ah2d(buf, host[layer], int(total),
-                                 stream=torch.cuda.current_stream()))
+                                 stream=_tgt_stream))
             except Exception:
                 _ok = False
             if not _ok:
@@ -2710,7 +2728,7 @@ class Engine:
             # 在覆盖之前 wait —— 主机侧不等，只是把依赖显式交给 driver。
             try:
                 _dev_ev = torch.cuda.Event()
-                _dev_ev.record(torch.cuda.current_stream())
+                _dev_ev.record(_tgt_stream)
                 if getattr(self, "_flat_dma_ev", None) is None:
                     self._flat_dma_ev = {}
                 self._flat_dma_ev[layer] = _dev_ev
@@ -2747,7 +2765,7 @@ class Engine:
         _vis_ev = None
         try:
             _vis_ev = torch.cuda.Event()
-            _vis_ev.record(torch.cuda.current_stream())
+            _vis_ev.record(_tgt_stream)
         except Exception:
             _vis_ev = None
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
