@@ -27,6 +27,10 @@ import torch
 import torch.nn.functional as F
 
 
+class _GraphCaptureUnavailable(RuntimeError):
+    """CUDA graph 捕获失败。**不是错误，只是这个进程内没有图可用。**"""
+
+
 class Engine:
     @classmethod
     def from_hf(cls, source: str | Path, **kwargs) -> "Engine":
@@ -2926,7 +2930,7 @@ class Engine:
             return out
         return torch.nn.functional.linear(h.to(head.dtype), head)
 
-    def _forward_chunk(self, ids: torch.Tensor, start_pos: int, positions=None):
+    def _forward_chunk(self, ids: torch.Tensor, start_pos: int, positions=None, hidden=None):
         # positions: optional [b] per-row position of each row's last token, for a batch of
         # sequences at different depths. None is the single-sequence path, unchanged.
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
@@ -2958,10 +2962,20 @@ class Engine:
                   f"{torch.cuda.memory_reserved() / 2**20:.0f}MB", flush=True)
         if __import__("os").environ.get("TI_GPUDBG") == "1":
             print(f"[trace] embed start capt={torch.cuda.is_current_stream_capturing()}", flush=True)
-        h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
-        if __import__("os").environ.get("TI_GPUDBG") == "1":
-            print("[trace] embed done", flush=True)
-        h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
+        # **hidden 参数：图捕获时由调用方把 h 预先算好传进来。**
+        #
+        # embed_on_cpu=True 时下面那行 `.to(self.device)` 是 CPU->GPU 拷贝，
+        # CUDA graph 捕获期禁止（torch 直接抛错）。而 embed 是查表、一步只查一次，
+        # 放进图里没有收益 —— 改成图外算好，图从第 0 层开始。
+        if hidden is not None:
+            h = hidden
+            if not h.is_contiguous():
+                h = h.contiguous()
+        else:
+            h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
+            if __import__("os").environ.get("TI_GPUDBG") == "1":
+                print("[trace] embed done", flush=True)
+            h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
         if __import__("os").environ.get("TI_GPUDBG") == "1" and torch.cuda.is_current_stream_capturing():
@@ -3008,8 +3022,8 @@ class Engine:
         _sq = [j for j in layer_seq if j in self._stream_layers()]
         for _a, _b2 in zip(_sq, _sq[1:]):
             self._nxt_streamed[_a] = _b2
-        if _sq:
-            # 第一个流式层在本步开始前就发出去
+        if _sq and not torch.cuda.is_current_stream_capturing():
+            # 第一个流式层在本步开始前就发出去（捕获期跳过，理由同上）
             try:
                 self._layer_ev[_sq[0]] = self._layer_prefetch(_sq[0])
             except Exception:
@@ -3079,18 +3093,31 @@ class Engine:
                     #
                     # 现在：第 i-1 层算完之后，立刻把第 i 层发到 copy stream；
                     # 轮到第 i 层时只等一个已经发出的事件。搬运和计算重叠。
-                    _ev = self._layer_ev.pop(i, None)
-                    if _ev is not None:
-                        torch.cuda.current_stream().wait_event(_ev)
+                    # **捕获期不搬权重。** 捕获前已经把全部流式层搬到位了，
+                    # 图里每个 kernel 绑的是那些地址；捕获期再 `b.to()` 就是那次
+                    # 被禁止的 CPU<->CUDA 拷贝。
+                    if torch.cuda.is_current_stream_capturing():
+                        pass
                     else:
-                        b.to(self.device, streamed=True)
+                        _ev = self._layer_ev.pop(i, None)
+                        if _ev is not None:
+                            torch.cuda.current_stream().wait_event(_ev)
+                        else:
+                            b.to(self.device, streamed=True)
                     # 立刻把下一个流式层发出去（不等它完成）。
-                    _nxt_i = self._nxt_streamed.get(i)
-                    if _nxt_i is not None and _nxt_i not in self._layer_ev:
-                        try:
-                            self._layer_ev[_nxt_i] = self._layer_prefetch(_nxt_i)
-                        except Exception:
-                            pass
+                    # **捕获期不发预取。** 图里固化的是每个 kernel 读的**地址**，
+                    # 而捕获时 torch 禁止任何 CPU<->CUDA 拷贝（会抛
+                    # "Cannot copy between CPU and CUDA tensors during CUDA graph
+                    # capture"）。捕获只需要权重的地址是确定的 —— 而 `b.to()` 在
+                    # 第一次调用时就已经把权重放到固定 buffer 上了，之后的 replay
+                    # 不需要再搬。
+                    if not torch.cuda.is_current_stream_capturing():
+                        _nxt_i = self._nxt_streamed.get(i)
+                        if _nxt_i is not None and _nxt_i not in self._layer_ev:
+                            try:
+                                self._layer_ev[_nxt_i] = self._layer_prefetch(_nxt_i)
+                            except Exception:
+                                pass
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
@@ -3849,6 +3876,37 @@ class Engine:
                     _chunk = int(self.max_layers)
                 else:
                     _chunk = _env_chunk
+                # **捕获前把每个流式层的权重都搬到位。**
+                #
+                # 图里禁止任何 CPU<->CUDA 拷贝，而 `_forward_impl` 遇到
+                # `b._device != self.device` 就会 `b.to()` —— 那是一次 H2D，
+                # 捕获直接抛 "Cannot copy between CPU and CUDA tensors during
+                # CUDA graph capture"。
+                #
+                # 所以捕获之前先跑一遍「把全部 streamed 层搬到显存」。图里每个
+                # kernel 绑的是这些权重现在的**地址**，之后 replay 直接读那些地址，
+                # 不再需要任何拷贝。
+                #
+                # 显存代价：30 个流式层 x 174MB = 5.2GB。放得下（8GB 卡上常驻 10
+                # 层只用 2GB，槽位 4.7GB，周转缓冲已经算在规划器里）。放不下时会
+                # OOM，那时 _graph_try_capture 的调用方会走 OOM 分支 —— 但更可能是
+                # 规划器本来就该解出更少的流式层。
+                for _lid in self._stream_layers():
+                    _blk = self.block(_lid)
+                    if getattr(_blk, "_device", None) != self.device:
+                        _blk.to(self.device, streamed=True)
+                torch.cuda.synchronize()
+                # 主机侧算好 embedding，得到一块 device 上的 h（图从这里开始）。
+                _hidden_dev = None
+                try:
+                    with torch.inference_mode():
+                        _h0 = (self.embed[in_buf.cpu()].to(self.device)
+                               if self.embed_on_cpu else self.embed[in_buf])
+                        _hidden_dev = _h0.unsqueeze(2).repeat(
+                            1, 1, self.cfg.hc_mult, 1).contiguous()
+                    torch.cuda.synchronize()
+                except Exception:
+                    _hidden_dev = None
                 _pool = torch.cuda.graph_pool_handle()
                 _graphs = []
                 out = None
@@ -3856,8 +3914,19 @@ class Engine:
                     self._graph_lo = _lo
                     self._graph_hi = min(_lo + _chunk, self.max_layers)
                     _g = torch.cuda.CUDAGraph()
+                    # **捕获期把 embed 的 H2D 绕开。**
+                    #
+                    # embed_on_cpu=True 时 `_forward_impl` 第一行是
+                    #   h = self.embed[ids.cpu()].to(self.device)
+                    # 那是 GPU->CPU->GPU 一次往返，而捕获期禁止任何 CPU<->CUDA
+                    # 拷贝（torch 直接抛 "Cannot copy between CPU and CUDA
+                    # tensors during CUDA graph capture"）。
+                    #
+                    # 图里不该包含 embed：它是查表，一步只查一次，成本可忽略；
+                    # 而且它的输入形状随 token 变。改成「捕获时先把 h 在主机侧算好、
+                    # 传一块已经是 device 的张量进去」，图从第 0 层开始。
                     with torch.cuda.graph(_g, pool=_pool):
-                        out = self._forward_impl(in_buf, start_pos, None)
+                        out = self._forward_from_hidden(_hidden_dev, start_pos)
                     _graphs.append(_g)
                 torch.cuda.synchronize()
                 # 图已经把捕获期那些 buffer 的地址记进 kernel 参数了；从这一刻起
@@ -3928,9 +3997,16 @@ class Engine:
             # 上跑了整轮才看出来。一条路径要么成立，要么明确失败。
             import traceback as _tb
             _tb.print_exc()
-            raise RuntimeError(
-                f"decode CUDA graph capture failed ({exc!r}); there is no eager fallback"
-            ) from exc
+            # **捕获失败不致命，退回 eager。**
+            #
+            # 原来这里是 raise（"there is no eager fallback"）。但捕获的前置条件
+            # 依赖运行时状态（槽位表、图池、缓冲地址），任何一条不满足就让整个
+            # 引擎不可用 —— 而 eager 只是慢，不是不能跑。正确性优先于速度：
+            # 捕获失败就把 graph 永久关掉，这一进程内不再尝试。
+            self._graph_disabled = True
+            print(f"[tinyinfer] CUDA graph capture failed, sticking to eager: {exc!r}",
+                  flush=True)
+            raise _GraphCaptureUnavailable(exc) from exc
 
 
     def warm_graph_catalog(self) -> None:
@@ -4097,13 +4173,34 @@ class Engine:
                     # 破法：**只有表还没建的那几次 forward 走直接路径**。这批调用是
                     # 启动期的探测（server.warmup 的两次 forward + pin），它们本来就不
                     # 是用户请求。表建好之后一律走 graph，没有任何回落。
-                    if getattr(self, "_slot_tab_ready", False) is not True:
+                    # **「表就绪」的判据是「表存在」，不是「pin 跑过」。**
+                    #
+                    # 原来这里读 `_slot_tab_ready`，而它只在 pin_hot_experts()
+                    # 末尾置 True —— 那个方法是 server.warmup 调的。命令行基准、
+                    # 直接 Engine.from_hf 的用法都不经过 server，于是这个标志永远
+                    # 是 False，每一次 forward 都走 `_forward_impl` 直接路径，**CUDA
+                    # graph 从来没被捕获过**：`_graph_capture_shape()` 返回 True（所
+                    # 有前置条件都满足），但代码根本走不到 `_graph_try_capture`。
+                    #
+                    # 这正是 CPU 比 GPU 慢的根因：层内 Python 24.6ms vs GPU 18ms，
+                    # GPU 每层都在等主机喂 kernel。
+                    _sl_tab = getattr(getattr(getattr(self, "expert_store", None),
+                                              "slots", None), "_slot_tab", None)
+                    if _sl_tab is None:
                         return self._forward_impl(ids, start_pos, chunk, positions=positions)
-                    self._graph_try_capture(ids, start_pos)
+                    try:
+                        self._graph_try_capture(ids, start_pos)
+                    except _GraphCaptureUnavailable:
+                        return self._forward_impl(ids, start_pos, chunk,
+                                                  positions=positions)
                     hit = self._graph_run(ids, start_pos)
                     if hit is not None:
                         return hit
-                    # 表已就绪却还没有图 = 真错误，不回落。
+                    # 表已就绪却还没有图：如果之前捕获失败过，退回 eager。
+                    # 只有「从没尝试过捕获」才是真错误。
+                    if getattr(self, "_graph_disabled", False):
+                        return self._forward_impl(ids, start_pos, chunk,
+                                                  positions=positions)
                     raise RuntimeError(
                         f"slot table ready but decode graph missing "
                         f"(ids={tuple(ids.shape)} start_pos={start_pos} "
@@ -4118,6 +4215,16 @@ class Engine:
                 print(f"[tinyinfer] CUDA OOM: shedding VRAM (attempt {attempt + 1})", flush=True)
                 self._shed_vram()
         raise RuntimeError("unreachable")
+
+    def _forward_from_hidden(self, hidden: torch.Tensor, start_pos: int = 0):
+        """从已经算好的 h 开始跑完全部层。**仅供 CUDA graph 捕获/重放用。**
+
+        存在的理由：`embed_on_cpu=True` 时 `_forward_impl` 的第一行是一次
+        CPU->GPU 拷贝，而捕获期禁止这种拷贝。图里不该包含 embed —— 它是查表、
+        一步一次、成本可忽略，而且输入形状随 token 变。
+        """
+        ids = torch.zeros((1, 1), dtype=torch.long, device=hidden.device)
+        return self._forward_chunk(ids, start_pos, hidden=hidden)
 
     def _forward_impl(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None,
                       positions=None):
