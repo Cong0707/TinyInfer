@@ -213,10 +213,51 @@ class Planner:
             _per_layer_s = self.layer_b / max(1.0, self.h2d) * 2.1
         stream_s = stream * float(_per_layer_s)
 
-        # 一步要几个不同的 (layer, expert)；槽位覆盖掉多少，剩下的要搬。
+        # **一步要几个不同的 (layer, expert)，以及「下一步还要重搬多少」。**
+        #
+        # 原来写的是 uncovered = need - slots，slots >= need 时 expert_s 直接
+        # 归零 —— 规划器于是认为「槽位覆盖整步需求 = 专家零成本」，拼命加槽位
+        # （本机解出 245 个、占 4.5GB 显存 + 4.5GB 主机预算，把常驻层和缓存
+        # 都挤掉了）。
+        #
+        # 但路由**每一步都在变**：实测把 240 个需求全装进槽位之后，相邻两步
+        # 的 (layer, expert) 集合只重合 35%。也就是说每步仍有约 65% 要换进来。
+        # 换的时候字节从哪来，完全取决于主机缓存：
+        #   cache 够大 -> 从内存搬到显存（ram 带宽）
+        #   cache 不够 -> 读盘（disk 带宽）
+        # 这才是槽位和缓存真正联动的地方，也是 T 里唯一能同时反映两者的项。
         need = self.topk * n
-        uncovered = max(0, need - lay.slots)
-        if self.expert_b <= 0 or uncovered == 0:
+        # 相邻两步的路由重合度。**实测 0.988，不是 0.35。**
+        #
+        # 0.35 那个数是拿 5 个 token 一起跑出来的（那是 prefill 形状，
+        # _last_ids 每层有 12~28 个专家），不能当 decode 的单步复用率。
+        # 单 token decode 的实测快照：
+        #   步后槽位 242，保留 239，新增 3  ->  保留率 98.8%
+        # 也就是说槽位覆盖整步之后，每步只有两三个专家要换。
+        #
+        # 这个数字直接决定「槽位 vs 常驻层」的取舍：按 0.35 算，每步要搬
+        # 156 个专家、expert_s=1.85s，规划器就会得出「槽位无用」的结论；
+        # 按 0.988 算，每步只搬 3 个、expert_s 接近 0，槽位才显得值那 4.5GB。
+        _reuse = float(self._tunable("route_reuse", 0.988, float) or 0.988)
+        _reuse = min(1.0, max(0.0, _reuse))
+        # **本步要从「槽位之外」装进显存的专家数。**
+        #
+        # 一步一步看清楚：本步需要 need 个 (layer, expert)。它们中的 1-reuse
+        # 是新的（上一槽位里没有），必须搬进来；复用的那部分已经在显存里。
+        #
+        # 关键：**搬进来的这些能不能留下，取决于槽位够不够。** 槽位 >= need
+        # 时，本步的 need 个和上一步的 need 个能同时驻留，下一步的复用率就是
+        # 真实的 0.35 —— 也就是说只有 (1-reuse)*need 需要新搬。
+        # 槽位 < need 时，池子装不下一步的全部需求，上一步的专家被本步挤掉，
+        # 下一步又得全搬 —— 命中率塌到 0。
+        #
+        # 所以 effective_reuse 不是常数，它由「槽位 / need」这个覆盖比决定：
+        #   覆盖比 = 1  -> 复用率 = route_reuse
+        #   覆盖比 < 1  -> 复用率线性衰减（槽位空着的地方留不住东西）
+        _cover = min(1.0, float(max(0, int(lay.slots))) / max(1.0, float(need)))
+        _eff_reuse = _reuse * _cover
+        uncovered = need * (1.0 - _eff_reuse)
+        if self.expert_b <= 0 or uncovered <= 0:
             expert_s = 0.0
         else:
             # 命中主机缓存的走 ram→显存，未命中的走盘。
@@ -309,6 +350,29 @@ class Planner:
             _SLAB_RING = 3
             b += _SLAB_RING * max(self.layer_b, self.max_layer_b * 0.5)
         b += 0.20 * GB                                    # workspace
+        # **运行时固定开销：rope 表。**
+        #
+        # 这是模型常量（1M 位置 x rotary_dim），不是每层权重，但它必须驻留
+        # 在显存上才能算 attention。本机实测两张表各 268.4MB，合计 0.54GB。
+        #
+        # 规划器原来完全不算这一项，于是解出来的布局在「纸面上」装得下、
+        # 实际跑到 rope_cache.get_table 就在 t.to(device) 那里 OOM：
+        #   RuntimeError: !handles_.at(i) INTERNAL ASSERT FAILED
+        # 这类 OOM 不该在运行期暴露 —— 规划器要么把它算进预算，要么明确
+        # 说「这张卡放不下这个模型」。
+        #
+        # 按位置数与 rotary 维数估：seq_len x (rotary_dim/2) x complex64。
+        # 拿不到配置时按实测的 0.54GB 兜底。
+        try:
+            _seqlen = int(self.model.get("max_position_embeddings") or 0)
+            _rot = int(self.model.get("rotary_dim") or 0)
+            if _seqlen > 0 and _rot > 0:
+                # 两张表（yarn 与原始各一），complex64 = 8 字节/元素
+                b += 2 * _seqlen * (_rot // 2) * 8
+            else:
+                b += 0.54 * GB
+        except Exception:
+            b += 0.54 * GB
         return b
 
     def fits(self, lay: Layout) -> bool:
@@ -326,7 +390,7 @@ class Planner:
         # 按 0.85 留 ~1.2GB，足够这些运行时开销。
         return self.used_bytes(lay) <= self.vram * _FITS_FRACTION
 
-    def _host_cache_bytes(self) -> int:
+    def _host_cache_bytes(self, *, n_stream=None, slots=None) -> int:
         """RAM 缓存能给多少字节。**只取决于主机内存，与显存布局无关。**
 
         专家的存储形态是磁盘上的原始 blob（本机 19.7MB/个），全部 40x384 个
@@ -366,13 +430,20 @@ class Planner:
         #
         # 按层扣之后缓存会小一些，但 slab 能覆盖全部流式层 —— 那才是图能成立
         # 的前提，也是「一层一次 DMA」取代「一层几十次 copy_」的前提。
-        _n_stream = max(0, int(self.n_layers) - int(getattr(self.cal, "resident", 0) or 0))
+        _n_stream = int(n_stream if n_stream is not None
+                        else max(0, self.n_layers
+                                 - int(getattr(self.cal, "resident", 0) or 0)))
         if _n_stream <= 0:
-            # 调用方还没解出 resident：按全模型估（最坏情况，缓存给小）
-            _n_stream = int(self.n_layers)
-        _signature_groups = _n_stream
-        _slab_b = _signature_groups * 2 * self.layer_b
-        return max(0, _budget - int(_slab_b))
+            _n_stream = 0
+        # slab 每个流式层各占一块主机 pinned（不是「每组 2 块」）：
+        # `_flat_setup` 里 slab_total = sum(sizes[i] for i in streamed)。
+        _slab_b = _n_stream * self.layer_b
+        # **槽位本身也在池里占地方。** 每个槽位在 host 侧对应一个 blob 的
+        # 载入来源（cache 里的条目），以及 VramSlotCache 的 arena 记账。
+        # 不扣这一项的后果是「槽位越多、缓存越大」同时成立，两家加起来
+        # 超过池子 —— 实测 245 槽位 + slab 23 层时显存直接 OOM。
+        _slots_b = int(slots) * self.expert_b if slots else 0
+        return max(0, _budget - int(_slab_b) - int(_slots_b))
 
     # ---- 求解 -------------------------------------------------------------
 
@@ -399,27 +470,59 @@ class Planner:
                 free = self.vram * _FITS_FRACTION - self.used_bytes(probe)
                 if free < 0:
                     continue
-                slots = int(free // max(1.0, self.expert_b)) if self.expert_b > 0 else 0
-                lay = Layout(resident=resident, slots=slots,
-                             embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
-                # **RAM 缓存容量：这是主机侧的事，和显存约束无关。**
+                _max_slots = (int(free // max(1.0, self.expert_b))
+                              if self.expert_b > 0 else 0)
+                # **槽位在显存和主机预算上都要付费，所以不能只取最大值。**
                 #
-                # 它原来是 0 —— Layout.cache_bytes 声明了但从来没赋过值。
-                # 后果不是「少缓一点」而是「几乎不缓」：ExpertCache 的
-                # capacity_entries = cache_bytes // blob_bytes，0 退到兜底
-                # 10 条（0.18GB），于是每一步的专家缺失全部读盘。实测每步读
-                # 2.0GB，而 240 个专家本来只有 4.7GB、槽位已经覆盖 98.8%，
-                # 那 2GB 完全是重复读。
+                # 原来这里是 slots = 最大能装下的数量，等价于假设「专家装载
+                # 零成本」。可槽位每多一个：显存多 expert_b（挤掉常驻层），
+                # 主机预算也多 expert_b（挤掉专家缓存）—— 实测 245 个槽位把
+                # 缓存压到 0.19GB，命中率掉到接近 0，专家全走磁盘，T=1.879s。
                 #
-                # 容量 = 主机可用内存 - 已经给 pin 留的 - 保守余量。
-                # 这台机器 47GB RAM、可用 33GB，缓存 40x384 个专家需要 7.6GB，
-                # 全放得下 —— 命中率应该接近 100%，这才是「内存作为缓存」的本意。
-                lay.cache_bytes = self._host_cache_bytes()
-                if not self.fits(lay):
-                    continue
-                c = self.cost(lay)
-                if best is None or c.total_s < best[0].total_s:
-                    best = (c, lay)
+                # 所以对每个 resident 扫一遍槽位档位，让目标函数自己在
+                # 「少搬专家」和「缓存装得下」之间找平衡。
+                _step = max(8, _max_slots // 8) if _max_slots > 0 else 8
+                _slot_choices = sorted(set(
+                    [0, _max_slots]
+                    + list(range(_step, _max_slots, _step))))
+                for slots in _slot_choices:
+                    lay = Layout(resident=resident, slots=slots,
+                                     embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
+                    # **RAM 缓存容量：这是主机侧的事，和显存约束无关。**
+                    #
+                    # 它原来是 0 —— Layout.cache_bytes 声明了但从来没赋过值。
+                    # 后果不是「少缓一点」而是「几乎不缓」：ExpertCache 的
+                    # capacity_entries = cache_bytes // blob_bytes，0 退到兜底
+                    # 10 条（0.18GB），于是每一步的专家缺失全部读盘。实测每步读
+                    # 2.0GB，而 240 个专家本来只有 4.7GB、槽位已经覆盖 98.8%，
+                    # 那 2GB 完全是重复读。
+                    #
+                    # 容量 = 主机可用内存 - 已经给 pin 留的 - 保守余量。
+                    # 这台机器 47GB RAM、可用 33GB，缓存 40x384 个专家需要 7.6GB，
+                    # 全放得下 —— 命中率应该接近 100%，这才是「内存作为缓存」的本意。
+                    # **主机侧和显存侧一起解。**
+                    #
+                    # 原来 cache_bytes 由 _host_cache_bytes() 单独算（按主机可用内存
+                    # 的 35%，再扣一块固定的 slab 份额），和显存侧的 resident/slots
+                    # 是两个互不相干的调用。后果是两本账各算各的，谁都不知道对方
+                    # 拿了多少 —— 实测缓存拿 11.26GB、slab 只剩 3.13GB 一层都建不
+                    # 起来；反过来的配置又能把 slab 撑满却让缓存命中率掉到 30%。
+                    #
+                    # 现在按同一份预算同时解：
+                    #   显存: resident*layer_b + slots*expert_b + ring*layer_b
+                    #   主机: slab(流式层数*layer_b) + cache(slots 个热点专家)
+                    # 两者共享 host 可用内存这一个上限，且 slab 与 cache 此消彼长。
+                    # 目标函数里 expert_s 同时依赖两边：slots 多则少搬专家，cache
+                    # 大则命中的那部分不读盘 —— 所以让求解器自己找平衡点，而不是
+                    # 让两个常数分别在两处拍板。
+                    _stream_n = max(0, self.n_layers - resident)
+                    lay.cache_bytes = self._host_cache_bytes(n_stream=_stream_n,
+                                                            slots=slots)
+                    if not self.fits(lay):
+                        continue
+                    c = self.cost(lay)
+                    if best is None or c.total_s < best[0].total_s:
+                        best = (c, lay)
             # 剪枝：resident 继续减，stream_s 只会单调增（搬更多层），而 expert_s
             # 最多降到 0（槽位覆盖全部）。所以「已经确定的下界」是
             #

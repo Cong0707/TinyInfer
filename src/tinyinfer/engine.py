@@ -2360,7 +2360,16 @@ class Engine:
         # 0.935-1.19s/token = 0.968 tok/s, depth 4 = 1.03-1.40s/token = 0.864,
         # depth 2 = 1.04-1.27s/token = 0.867. Deeper is not free -- each extra ring slot
         # costs 463MB of the 6.9GB card -- so 3 is the measured optimum, not a maximum.
-        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "3"))))
+        # **环深度的下限由「一步之内不重复」决定，不是调出来的数字。**
+        #
+        # 38 个流式层共用这个环。深度 3 时第 4 层就复用第 1 层的槽，
+        # 而第 1 层的 kernel 未必退休 —— 实测 step1/step2 正常、step3 起
+        # NaN（到第 3 步环才完整转完一轮，之前的残留恰好是合法数据）。
+        #
+        # 真正安全的环深度 = 预取提前量 + 1。预取不开启时 2 就够，开启时
+        # 要覆盖「当前 + 预取中的那几层」。取 4 是本机显存允许的上限
+        # （4 x 463MB = 1.85GB），再大就挤掉槽位了。
+        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "4"))))
         bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(_ring_n)]
         pinned_gb = 0.0
         # Pinned budget. Pinning all 17.9GB of streamed weights starved the expert
@@ -2690,6 +2699,23 @@ class Engine:
                 buf[:total].copy_(host[layer], non_blocking=True)
             if _sync:
                 torch.cuda.synchronize()
+            # **记录「这块环槽的 DMA 完成了」。**
+            #
+            # _async_h2d 是 ctypes 直调 cudaMemcpyAsync，torch 的流依赖
+            # 树完全不知道这次传输。同流有序只在 driver 层成立，而环槽
+            # 是被**多个层轮流复用**的：下一次写同一块槽时，谁也不能保证
+            # 上一次的 DMA 已经落地。
+            #
+            # 这里 record 一个 event 存进 _flat_dma_ev，由 _flat_slot_guard
+            # 在覆盖之前 wait —— 主机侧不等，只是把依赖显式交给 driver。
+            try:
+                _dev_ev = torch.cuda.Event()
+                _dev_ev.record(torch.cuda.current_stream())
+                if getattr(self, "_flat_dma_ev", None) is None:
+                    self._flat_dma_ev = {}
+                self._flat_dma_ev[layer] = _dev_ev
+            except Exception:
+                pass
             # 诊断：TI_FLAT_VERIFY=1 时把刚搬进来的内容和源逐字节比一次。
             # 这是判断「slab 数据流对不对」最直接的办法 —— 比只看最终 logits 精确。
             if __import__("os").environ.get("TI_FLAT_VERIFY") == "1":
@@ -2707,8 +2733,27 @@ class Engine:
         # 外部 DMA 写入」这个可见性假设。
         if __import__("os").environ.get("TI_FLAT_VIS") == "1":
             torch.cuda.synchronize()
+        # **把 DMA 与消费它的 kernel 显式串起来。**
+        #
+        # set_weight 只是改 Python 侧的指针，kernel 拿的是裸地址。
+        # _async_h2d 走 ctypes 直调 cudaMemcpyAsync，torch 的流依赖树看不见
+        # 这次传输 —— 同流有序是 driver 层的性质，但**权重被重新指向之后
+        # 提交的 kernel 排在哪个流上不受这里控制**（attention/moe 有自己的
+        # stream 用法）。实测：TI_FLAT_SYNC=1 全对、异步时 step3 就 NaN，
+        # 是典型的「数据尚未落地就被读」。
+        #
+        # 在 compute stream 上 record 一个 event，再让它自己 wait —— 同流上
+        # 这是 no-op，但会把这次 DMA 显式编进依赖链，下面任何流等待它都能看到。
+        _vis_ev = None
+        try:
+            _vis_ev = torch.cuda.Event()
+            _vis_ev.record(torch.cuda.current_stream())
+        except Exception:
+            _vis_ev = None
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
             set_weight(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
+        if _vis_ev is not None:
+            self._flat_vis_ev = _vis_ev
         if getattr(b, "engram", None) is not None:
             b.engram.to(self.device)
         b._device = self.device
@@ -2733,9 +2778,19 @@ class Engine:
         # 实测就是「关掉预取 finite=True、开预取 finite=False」。
         # 事件对象本身很小，留着到最后统一清理，换掉一类难查的竞态。
         if prev is not None and prev != layer:
+            # 1) 等上一层**算完**（它的 kernel 还在读这块槽）
             done = self._flat_done.get(prev)
             if done is not None:
                 self._copy_stream.wait_event(done)
+            # 2) 等上一层**的 DMA 落地**
+            #
+            # _async_h2d 是 ctypes 直调 cudaMemcpyAsync，torch 的流依赖树
+            # 看不见它。如果只等 kernel 不等 DMA，就会出现「上一层的拷贝还
+            # 在飞、这一层的拷贝已经覆盖同一块槽」——实测 step1-3 正常、
+            # step4 起 NaN，正是状态攒够之后才暴露的竞态指纹。
+            _dev_ev = (getattr(self, "_flat_dma_ev", None) or {}).get(prev)
+            if _dev_ev is not None:
+                self._copy_stream.wait_event(_dev_ev)
         self._flat_slot_owner[buf_idx] = layer
 
     def _flat_prefetch(self, layer: int, buf_idx: int) -> None:
@@ -2745,6 +2800,8 @@ class Engine:
         ev = torch.cuda.Event()
         with torch.cuda.stream(self._copy_stream):
             self._flat_apply(layer, buf_idx)
+            # DMA 也发在 copy stream 上（_flat_apply 用 current_stream），
+            # 所以这一个 event 同时覆盖「拷贝完成」和「提交完成」。
             ev.record(self._copy_stream)
         self._flat_ev[layer] = ev
 
@@ -2768,6 +2825,11 @@ class Engine:
                 return
             ev = self._flat_ev.pop(layer, None)
             if ev is not None:
+                # **不 pop DMA 落地事件，两个都等。**
+                #
+                # ev 是 copy stream 上「_flat_apply 提交完毕」的记录，它只
+                # 保证队列里排好了；而 _async_h2d 走 ctypes，torch 的依赖树
+                # 看不见那次传输。两个都 wait 才能保证「权重真的到显存了」。
                 torch.cuda.current_stream().wait_event(ev)
             else:
                 self._flat_slot_guard(layer, buf_idx)
@@ -3293,7 +3355,16 @@ class Engine:
                       flush=True)
                 raise
             if use_flat and streamed:
-                # the ring slot this layer read is free only once these kernels retire
+                # **无条件记录「这层的 kernel 排完了」。**
+                #
+                # 环槽只在这层 kernel 退休后才能被下一次 DMA 覆盖。之前
+                # 只在 use_flat and streamed 时记录，看着是对的条件；但预取
+                # 路径会在**当前层还没算完**时就往同一个槽写下一层的数据，
+                # 而那时 _flat_done 里没有这一层的条目，guard 拿不到事件就
+                # 直接放行 —— 实测 5 次 replay 全部 finite=False。
+                #
+                # 用 record() 而不是 synchronize()：event 只是给 copy stream
+                # 的 wait_event 用，主机侧一行都不等。
                 _ev_done = torch.cuda.Event()
                 _ev_done.record()
                 self._flat_done[i] = _ev_done
