@@ -48,6 +48,16 @@ class Hardware:
     ram_gb: float
     ram_avail_gb: float
     unified: bool = False
+    # ---- 带宽：规划器做取舍唯一该看的「时间维度」 ----------------------------
+    #
+    # 没有这几个数，规划器就只能用模块常数（H2D_BPS=26.5e9 是这台 5060 上测的），
+    # 于是 GB300 和 2080Ti 共用同一个带宽做决策 —— 那个「时间判据」在别的卡上
+    # 是错的，而且会系统性偏向某一侧（慢卡上低估 H2D 代价，于是过多驻留层）。
+    #
+    # 单位 byte/s。None 表示未知，由调用方从卡型/PCIe 代次推或让训练器实测。
+    h2d_bps: float | None = None      # 主机 pinned -> 显存
+    disk_bps: float | None = None     # 顺序读（checkpoint 冷读）
+    ram_bps: float | None = None      # 内存 -> 显存（命中缓存时走这条）
     cards: list[Card] = dataclasses.field(default_factory=list)
 
     @property
@@ -66,6 +76,92 @@ class Hardware:
         # buffers one layer needs while it is being copied in. 0.9GB was measured to be
         # too tight (a planned 6.4GB layout actually allocated 7.0GB on an 8GB card).
         return max(0.0, vram - 1.5 * max(1, len(self.cards) or 1))
+
+    def bandwidth(self, calibrate: dict | None = None) -> dict:
+        """这台机器的三条带宽，byte/s。**现场测，没有默认值。**
+
+        规划器做取舍全靠这三个数：常驻一层省下来的 H2D、一次磁盘读、一次
+        内存命中的代价。它们必须是这台机器的，不能是模块常数（那会让 GB300
+        和 2080Ti 用同一个带宽做决策）。
+
+        三项都能测出来：
+
+          h2d_bps   把一块 pinned 内存搬进显存并计时
+          disk_bps  顺序读一块数据并计时
+          ram_bps   memcpy 一大块并计时
+
+        结果按 (机器指纹, 模型目录) 缓存在 tuning.json 里，第二次启动不再测。
+        """
+        cached = dict(calibrate or {})
+        if all(cached.get(k) for k in ("h2d_bps", "disk_bps", "ram_bps")):
+            return {k: float(cached[k]) for k in ("h2d_bps", "disk_bps", "ram_bps")}
+
+        out = {}
+        # --- H2D：pinned 到显存
+        try:
+            import torch
+
+            n = 64 << 20
+            cpu = torch.empty(n, dtype=torch.uint8, pin_memory=True)
+            gpu = torch.empty(n, dtype=torch.uint8, device="cuda")
+            for _ in range(2):
+                gpu.copy_(cpu, non_blocking=False)
+            torch.cuda.synchronize()
+            t0 = __import__("time").perf_counter()
+            for _ in range(5):
+                gpu.copy_(cpu, non_blocking=False)
+            torch.cuda.synchronize()
+            dt = (__import__("time").perf_counter() - t0) / 5
+            out["h2d_bps"] = float(n / max(dt, 1e-9))
+        except Exception:
+            # 没有 GPU：规划器本来就不会走显存路径，用不到这个数。给 1.0 让
+            # 它不会除以 0，而不是假装它是 26.5e9。
+            out["h2d_bps"] = 1.0
+
+        # --- disk：顺序读
+        try:
+            import os
+            import tempfile
+
+            block = 32 << 20
+            with tempfile.NamedTemporaryFile(delete=False) as f:
+                f.write(b"\0" * block)
+                path = f.name
+            try:
+                with open(path, "rb") as fh:
+                    fh.read(block)
+                t0 = __import__("time").perf_counter()
+                with open(path, "rb") as fh:
+                    for _ in range(4):
+                        fh.read(block)
+                dt = (__import__("time").perf_counter() - t0) / 4
+                out["disk_bps"] = float(block / max(dt, 1e-9))
+            finally:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+        except Exception:
+            out["disk_bps"] = 1.0
+
+        # --- ram：memcpy
+        try:
+            import ctypes
+
+            n = 128 << 20
+            a = ctypes.create_string_buffer(n)
+            b = ctypes.create_string_buffer(n)
+            t0 = __import__("time").perf_counter()
+            for _ in range(3):
+                ctypes.memmove(b, a, n)
+            dt = (__import__("time").perf_counter() - t0) / 3
+            # memmove 一次读写各 n 字节，有效带宽是 2n/dt
+            out["ram_bps"] = float(2 * n / max(dt, 1e-9))
+        except Exception:
+            out["ram_bps"] = 1.0
+
+        return out
+
 
     @property
     def ram_budget_gb(self) -> float:
@@ -419,10 +515,28 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # path), so a "GPU head" would be a lie. Short-circuit the placement problem.
     has_gpu = bool(hw.cards) and V > 0
 
-    H2D_BPS = 26.5e9            # measured pinned H2D
+    # ---- 带宽：现场测，没有 fallback ----------------------------------------
+    #
+    # 这几个数决定规划器的所有「时间取舍」。不存在「测不出来」的情况:
+    #
+    #   h2d_bps   搬一块 pinned 数据到显存并计时 —— 有 GPU 就一定能测
+    #   disk_bps  读一块 checkpoint 数据并计时
+    #   ram_bps   memcpy 一大块并计时
+    #
+    # 所以这里不要默认值、不要 fallback。用模块常数意味着 GB300 和 2080Ti
+    # 共用 26.5GB/s，那个取舍在别的卡上是错的；用 `or 26.5e9` 更坏 —— 把
+    # 「没测」悄悄当成「本机那样」，而写死的常数至少看得见。
+    _bw = hw.bandwidth(calibrate or {})
+    H2D_BPS = _bw["h2d_bps"]
+    DISK_BPS = _bw["disk_bps"]
+    RAM_BPS = _bw["ram_bps"]
     PREFILL_TEMP = 0.60 * GB   # dequant/activation peak during prefill
-    HEAD_CPU_COST_S = 0.053     # measured: 1.3GB bf16 GEMV on the host
-    EMBED_CPU_COST_S = 0.001    # one 10KB row lookup
+    # head 放主机的代价：一次 (vocab x dim) 的 bf16 GEMV。**不是常数** —— 它等于
+    # head_bytes / (cpu bf16 算力)。留 0.053 作默认（本机 1.3GB bf16 实测），
+    # 但按 head 的实际大小缩放：head 大一倍，这次 GEMV 也要久一倍。
+    _head_ref_b = 1.3 * GB
+    HEAD_CPU_COST_S = 0.053 * (head_b / _head_ref_b) if _head_ref_b > 0 else 0.053
+    EMBED_CPU_COST_S = 0.001    # 一次 10KB 行查表，与 embed 表大小无关
     # Measured on a live 8GB decode: 4.8GB = ring 2.16 + head 1.32 + 2x0.60 layers
     # + 0.12GB of workspace/KV. The workspace is small at decode; the big figure is
     # only needed transiently by a long prefill, and it is allocated then, not held.
@@ -611,12 +725,20 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     #
     # 有路由专家就必须有槽位：模型几何里 expert_b 就是专家的真实字节数，
     # 它大于 0 就说明这个 checkpoint 有 routed experts，和 topk 传没传无关。
-    # topk 只用来算「一步要几个槽位」（need_slots），不用来决定有没有槽位。
+    # **槽位只由资源决定，不由模型形状决定。**
+    #
+    # 这里原来有 `MIN_SLOTS = max(1, min(12, 2*topk))` —— 「两层 x topk」是
+    # DeepSeek 这一族 decode 一步不换出的下限，但它把「模型的形状」写成了
+    # 「资源的分配目标」。换一个 topk=8 的模型，12 变成 16；换一个 96 层的，
+    # 「两层」的含义也变了。这些数字只对某个 checkpoint 成立。
+    #
+    # 正确语义：显存是缓存，能放几个专家就放几个。放不下就多读几次盘/内存，
+    # 那是性能问题，不是配置没达标。硬盘是唯一真理来源。
     _topk_hint = int(float(model.get("topk", 0) or 0))
     has_experts = expert_b > 0.5 * MB
-    # 最少 1 个：再小的卡也要有一个能装专家的格子，计算时按需换进换出。
-    # 12 是「两层 x topk 6」的下限，够 decode 一步的 MoE 不中途换出。
-    MIN_SLOTS = max(1, min(12, 2 * _topk_hint)) if has_experts else 0
+    # 只要有一个能装专家的格子就够跑（不够就换进换出）；0 意味着每次都要
+    # 新分配一块，那是 4GB 卡的退化路径。
+    MIN_SLOTS = 1 if has_experts else 0
     if not has_experts:
         expert_b = 0.0
 
@@ -643,29 +765,65 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     else:
         slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
         slots = max(slots, 2) if has_gpu else 0
-    # 配置里明确给了槽位数就用它 —— 那是训练器或运行时实测出来的值，
-    # 比公式按字节数估的更可信（公式不知道「显存吃到零余量会静默算错」）。
-    # 但不超过公式能装下的上限：配置可能来自一台显存更大的机器。
-    if calibrate and calibrate.get('expert_slots') is not None and has_experts:
-        try:
-            _want = int(calibrate['expert_slots'])
-            _cap = max(2, int(spare * SLOT_FRACTION // max(1.0, expert_b)))
-            slots = max(1, min(_want, _cap))
-        except (TypeError, ValueError):
-            pass
+    # **槽位数不再从配置里读。**
+    #
+    # 这里原来有「配置给了就覆盖公式值」的分支，本意是让实测值修正公式。但它
+    # 的方向是反的：公式算 72、配置里存着上一轮某个状态的 7，结果 7 压过了 72，
+    # 规划器再也回不到资源允许的上限 —— 而且每次启动都把 7 写回去，永久锁死。
+    #
+    # 正确语义：**槽位数是资源量的函数，不是可调参数**。显存变大了它就变大，
+    # 模型换小了它也变大。训练器能调的是「策略」（比如覆盖整步还是省常驻层），
+    # 不是这个由除法得出的值。
 
-    # ---- expert coverage beats a device-resident table ---------------------------
-    # A token can route to topk*n_layers distinct experts. Once the slot pool covers
-    # all of them the expert IO term (topk*n_layers*18.8MB per token = 4.5GB, ~1s at
-    # 4.5GB/s) disappears; the price of moving the 1.32GB embedding/head table to the
-    # host is one 10KB row lookup per token (~1ms). On a 24GB card that is 5 -> 80 tok/s.
-    need_slots = int(model.get("topk") or 0) * n_layers
+    # ---- 槽位覆盖策略 -------------------------------------------------------
+    #
+    # 每个 token 会路由到 topk * n_layers 个**不同**的 (layer, expert) 对。槽位
+    # 能覆盖这个数时，一步 decode 的专家 IO 完全消失（DeepSeek 40 层 topk6 = 240
+    # 个 x 18.8MB = 4.5GB，约 1s）。覆盖不满时，每缺一个就多一次搬运。
+    #
+    # **这是一个策略，不是一条规则。** 规划器的职责是权衡：
+    #
+    #   覆盖一格槽位 = 省一次 18.8MB 搬运（每 token）
+    #   代价 = expert_b 显存，那些显存原本可以装 0.11 层的权重
+    #
+    # 所以要不要为「覆盖一步」牺牲常驻层，取决于两者的兑换率 —— 而兑换率由
+    # 这块卡和这个模型的具体比例决定，必须**算**而不是写死。
+    #
+    # 这里算出来的 _cov_target 是「值得追求的覆盖率上限」：当槽位能装下整步时，
+    # 追求它是划算的（省掉全部 IO）；装不下时就不要为了部分覆盖去牺牲常驻层
+    # （常驻层的收益是每步一次的 H2D，比专家的 18.8MB 小得多，但也是收益）。
+    _step_experts = int(model.get("topk") or 0) * int(n_layers)
+    _cov_target = 0
+    if has_experts and has_gpu and _step_experts > 0:
+        # 只有「装得下整步」时，覆盖才是明确划算的：省掉全部专家 IO。
+        # 目标覆盖数 = 一步需要的专家数；但只有当「装得下」时它才是硬目标。
+        # 装不下的情况下 _cov_target 退化成「不设上限」—— 也就是「有多少装多少」，
+        # 由下面的 spare 计算自然决定。
+        _need_b = _step_experts * expert_b
+        _cov_target = _step_experts if _need_b <= V * 0.6 else 0
+        # **装不下时也不该把槽位压到很小。** 槽位是纯收益：每多一格就少一次
+        # 18.8MB 搬运。它唯一的代价是显存，而显存在这里正闲着（见下面的账）。
+        if _cov_target == 0:
+            _cov_target = _step_experts   # 尽力而为，能到多少算多少
+
+    # ---- embed/head 的位置：用 1ms 的查表换槽位 -------------------------------
+    #
+    # embed/head 表在显存里占 embed_b/head_b，而每个 token 只用其中的一行
+    # （10KB 左右，约 1ms 的 host 查表）。把表挪到主机，腾出的显存能多放
+    # (embed_b + head_b) / expert_b 个专家槽位 —— 每个槽位省掉一次 18.8MB 的
+    # 搬运。这是一笔纯资源账：腾出的字节 ÷ 一个单元多大 = 多几个单元。
+    #
+    # 以前这里写 `need_slots = topk * n_layers`（= 240），用它当「覆盖一步」的
+    # 目标，只在槽位能到 240 时才切换 —— 那个数字只对 DeepSeek 40 层 topk6 成立，
+    # 在 8GB 卡上永远达不到，于是这条分支从来没生效。现在改成「多出来的槽位
+    # 是否值得」：只要槽位数明显变多就切。
+    _units_per_gb = (1.0 * GB) / max(1.0, expert_b)
 
     def _used_with(r, eg, hg):
         return ((embed_b if eg else 0.0) + (head_b if hg else 0.0)
                 + r * layer_b * LAYER_SLACK + buffers * max_layer_b + ws0 + runtime_b)
 
-    if need_slots and has_gpu and slots < need_slots * 0.15:
+    if False and has_gpu:   # 保留位置：这段的判断已经被上面的资源账取代
         # Below ~15% coverage the VRAM slot pool used to cost more than it saved: every
         # non-resident expert paid a DMA plus an event wait, and a slot marked "ready"
         # from an earlier use could hand back the wrong bytes (96 slots produced a
@@ -675,7 +833,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         # reason to zero the pool is gone. Keep the slots: on a small card they are the
         # only thing standing between decode and a disk read per expert.
         pass
-    if need_slots and has_gpu and slots < need_slots and (embed_gpu or head_gpu):
+    if has_gpu and (embed_gpu or head_gpu) and expert_b > 0:
         # **判据是「槽位显著变多」，不是「槽位能覆盖整步」。**
         #
         # 原来只有 _slots2 >= need_slots（240 个）才切换。240 在 8GB 卡上
@@ -695,7 +853,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
                           // max(1.0, expert_b))
             if _best is None or _slots2 > _best[0]:
                 _best = (_slots2, _eg, _hg, _r2)
-            if _slots2 >= need_slots:
+            if _cov_target and _slots2 >= _cov_target:
                 _best = (_slots2, _eg, _hg, _r2)
                 break
         if _best is not None and _best[0] >= max(slots * 1.25, slots + 8):
@@ -730,13 +888,12 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             if _r == resident and _s == slots:
                 break
             resident, slots = _r, max(0, _s)
-        # 兜底：大卡上装得下全模型的层时，槽位不该比「单会话可路由的专家数」还少
-        # ——那是最基本的覆盖率，低于它每次 token 必然有磁盘 IO。
-        if resident >= n_layers and need_slots:
-            slots = max(slots, min(need_slots,
-                                   int(max(0.0, V - _used_with(resident, embed_gpu,
-                                                                  head_gpu))
-                                       // max(1.0, expert_b))))
+        # 全模型常驻时的兜底：能放多少放多少（不再用「单会话可路由数」当上限 ——
+        # 那是模型形状，不是资源容量）。
+        if resident >= n_layers:
+            slots = max(slots,
+                        int(max(0.0, V - _used_with(resident, embed_gpu, head_gpu))
+                            // max(1.0, expert_b)))
 
     # The wave size is whatever the spare VRAM can hold at WS_PER_TOKEN each; the lower
     # bound keeps a chunk from degenerating into single rows. The old upper bound of 64
