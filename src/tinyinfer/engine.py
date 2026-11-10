@@ -2685,6 +2685,79 @@ class Engine:
                                              self.max_layers))
         return self._stream_set
 
+    def _layer_prefetch(self, layer_id: int):
+        """把一层 streamed 权重发到 copy stream，返回要等的 event。**不阻塞。**
+
+        _layer_ev 用的是「事件记录在 copy stream 上」这个标准做法：调用方随后
+        用 current_stream().wait_event(ev)，GPU 侧自然形成「拷贝 -> 计算」的依赖，
+        主机侧一行都不等。这样第 i 层的计算和第 i+1 层的搬运在时间上重叠。
+        """
+        ev = torch.cuda.Event()
+        cs = getattr(self, "_copy_stream", None)
+        if cs is None:
+            cs = self._copy_stream = torch.cuda.Stream(device=self.device)
+        b = self.block(layer_id)
+        paths = b._weight_paths()
+        # 源必须 pin 过：pinned 源走 pinned 带宽（6.1GB/s），pageable 会被
+        # 驱动先在主机侧分块暂存一遍（实测慢 3 倍）。
+        refs = getattr(b, "_cpu_refs", None)
+        if not refs:
+            refs = {}
+            for (owner, name, t) in paths:
+                k = b._wkey(owner, name)
+                refs[k] = t.pin_memory() if (t.is_cpu and t.device.type == "cpu"
+                                             and not t.is_pinned()) else t
+            b._cpu_refs = refs
+        if b._device == self.device:
+            # 已经在显存里（上一轮搬过），不用再发。
+            return ev.record_on(cs) if hasattr(ev, "record_on") else ev
+        need = 0
+        for (_, _, t) in paths:
+            need = (need + 255) // 256 * 256
+            need += t.numel() * t.element_size()
+        need = (need + 255) // 256 * 256
+        # **每层独立一块，不能用共享 staging。**
+        #
+        # set_weight 让这一层的权重指向这块 buffer，于是层持有它。用共享 staging
+        # 的话，下一层的预取会覆盖上一层的字节 —— 而上一层的 kernel 可能还在
+        # 异步执行。实测症状就是 finite=False（数值垃圾，不报错）。
+        #
+        # 显存账：同时最多两块（当前层 + 预取的下一层），而常驻层拿走了大头。
+        # 规划器按「常驻层 + 槽位 + 一块周转」算的，这里正好对上。
+        _prev = getattr(self, "_layer_buf", None)
+        buf = _prev.get(layer_id)
+        if buf is None or buf.numel() < int(need):
+            if _prev is None:
+                _prev = {}
+                self._layer_buf = _prev
+            buf = torch.empty(int(need), dtype=torch.uint8, device=self.device)
+            _prev[layer_id] = buf
+        with torch.cuda.stream(cs):
+            off = 0
+            for (owner, name, t) in paths:
+                off = (off + 255) // 256 * 256
+                n = t.numel() * t.element_size()
+                src = refs.get(b._wkey(owner, name))
+                if src is None:
+                    off += n
+                    continue
+                dst = buf[off:off + n]
+                # 直接对 pool 地址发 DMA（torch 不认 frombuffer 出来的 pinned）。
+                done = False
+                try:
+                    from .loading import _async_h2d
+
+                    done = bool(_async_h2d(dst, src, n, stream=cs))
+                except Exception:
+                    done = False
+                if not done:
+                    dst.copy_(src.reshape(-1).view(torch.uint8), non_blocking=True)
+                set_weight(owner, name, dst.view(t.dtype).view(t.shape))
+                off += n
+            ev.record(cs)
+        b._device = self.device
+        return ev
+
     def _stream_prefetch(self, layer_id: int, stream):
         """Async-copy a streamed layer's weights into its rotating buffer (copy stream).
 
@@ -2912,6 +2985,19 @@ class Engine:
         events = []
         if self._v5_enabled and self._v5_stream is None:
             self._v5_stream = torch.cuda.Stream(device=self.device)
+        # 流式层的双缓冲预取状态：(layer -> 已发出的 CUDA event)。
+        self._layer_ev = {}
+        # 本步内「下一个流式层」的映射：i -> 下一个流式层的 layer_id。
+        self._nxt_streamed = {}
+        _sq = [j for j in layer_seq if j in self._stream_layers()]
+        for _a, _b2 in zip(_sq, _sq[1:]):
+            self._nxt_streamed[_a] = _b2
+        if _sq:
+            # 第一个流式层在本步开始前就发出去
+            try:
+                self._layer_ev[_sq[0]] = self._layer_prefetch(_sq[0])
+            except Exception:
+                pass
         use_flat = self.device != "cpu" and not self._v5_enabled and self._flat_enabled()
         streamed_seq = [i for i in layer_seq if i in self._stream_layers()] if self._v5_enabled else []
         flat_seq = [i for i in layer_seq if i in self._stream_layers()] if use_flat else []
@@ -2967,8 +3053,28 @@ class Engine:
                         self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
                         b.to(self.device, streamed=True)
                 else:
-                    # streamed 层复用 staging；常驻层独立分配。
-                    b.to(self.device, streamed=True)
+                    # **流式层：上一层已经把本层的权重发到 copy stream 上了。**
+                    #
+                    # 原来是「轮到第 i 层才开始搬第 i 层」——同步 H2D，GPU 在
+                    # 搬运期间完全空转。实测 decode 单步 CUDA 汇总 3585ms，其中
+                    # Memcpy HtoD 829+534ms、fp8_gemv 813ms、bt_gemv 747ms，
+                    # 而单独测这些 kernel 都只要 59~164us —— 差 90 倍不是 kernel
+                    # 慢，是 kernel 在等权重到位。
+                    #
+                    # 现在：第 i-1 层算完之后，立刻把第 i 层发到 copy stream；
+                    # 轮到第 i 层时只等一个已经发出的事件。搬运和计算重叠。
+                    _ev = self._layer_ev.pop(i, None)
+                    if _ev is not None:
+                        torch.cuda.current_stream().wait_event(_ev)
+                    else:
+                        b.to(self.device, streamed=True)
+                    # 立刻把下一个流式层发出去（不等它完成）。
+                    _nxt_i = self._nxt_streamed.get(i)
+                    if _nxt_i is not None and _nxt_i not in self._layer_ev:
+                        try:
+                            self._layer_ev[_nxt_i] = self._layer_prefetch(_nxt_i)
+                        except Exception:
+                            pass
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
