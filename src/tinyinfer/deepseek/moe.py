@@ -709,6 +709,14 @@ class MoE:
                     #
                     # want 用本步路由到的全部专家（_last_ids 是去重后的），
                     # 这样 vram_hit 才等于「本来就够用、不需要搬」的专家个数。
+                    # want 用本步路由到的全部专家（_last_ids 是去重后的）。
+                    #
+                    # **不要改成 _miss。** 我试过，成绩从 8624ms 掉到 19998ms。
+                    # 原因：_last_ids 装得宽，是为了让槽位**预先覆盖多个 token 的
+                    # 专家集合**；下一 token 路由到其中任何一个都是命中。改成只装
+                    # 当前缺失的，等于每步都从零开始装，槽位永远没有预热。
+                    #
+                    # 852~896 次装载是「宽装」的代价，也是「下步命中」的来源。
                     _want = getattr(self, "_last_ids", None) or _miss
                     _mgr.need(self.layer_id, _want)
                     _mgr.commit(self.layer_id)
