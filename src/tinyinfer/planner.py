@@ -323,10 +323,21 @@ class Planner:
         #
         # 这不是兜底：0 是一个明确的「未知」语义，而且它的影响是保守方向
         # （宁可少给槽位），不是编造一个看起来合理的数。
+        # **未知时不能用 0。**
+        #
+        # 我一开始把「未测到」按 0 处理，理由是「保守：认为槽位无复用价值，
+        # 于是不会为了槽位牺牲常驻层」。方向错了 —— 槽位在这台机器上是**可用性
+        # 前提**：slots=0 时 MoE 连纯 GPU 路径都进不去（
+        #   arena unusable: 0 blocks, 0 buffers），整个模型跑不起来。
+        #
+        # 所以「未知」的正确处理是：按「覆盖不到整步」的最坏情况给槽位（重用率
+        # 取 0 会让求解器完全放弃槽位，那是另一个极端）。这里取一个明确的
+        # 「不知道就先按 2 步换一遍」的中点，等引擎跑出真实值后 observe() 覆盖。
         try:
             _reuse = float(self._required("route_reuse", float))
         except RuntimeError:
-            _reuse = 0.0
+            # 未知：假设一半专家会换（0.5），既不给零槽位、也不假装全命中
+            _reuse = 0.5
         _reuse = min(1.0, max(0.0, _reuse))
         # **本步要从「槽位之外」装进显存的专家数。**
         #
@@ -511,19 +522,37 @@ class Planner:
         return b
 
     def fits(self, lay: Layout) -> bool:
-        """这份布局装得下吗。
+        """这份布局装得下吗。**口径必须和真实分配一致。**
 
-        **0.85 不是保守，是实测出来的。**
+        这里曾经是 `used_bytes(lay) <= vram * 0.85` —— 一个「留 15% 给运行时
+        开销」的比例。实测它不够也不统一：同样的 0.85 在不同模型上留出的绝对
+        字节数不同，而运行时开销（rope 表、KV、activation、分配器碎片）不是
+        按比例长的。
+
+        现在按三件事分别判，每一件都有明确来源：
+
+          used_bytes  <= usable_vram - headroom
+
+        其中 headroom = 最大单次分配的字节数。为什么需要它：rope 表是
+        268MB 的**单个张量**，分配时要一块连续的显存；而 used_bytes 只保证
+        「稳定态装得下」。实测 6.81GB / 6.86GB（差 61MB）时，rope 那 268MB
+        照样 OOM —— 那是「总账够、单笔不够」。
         """
-        # used_bytes 只算「权重 + 槽位 + workspace」。它不包含：
-        #   - rope 表（每层一份，随 seq len 长）
-        #   - KV cache（本步 seq 长度）
-        #   - activation（每层中间张量，bf16 5120 宽）
-        #   - cuBLAS handle、分配器碎片、torch graph 私有池
-        # 实测：按 0.94 卡（7.46/7.93GB）留下的 470MB 不够，14 层布局在
-        # rope_cache.get_table 里 OOM（!handles_ INTERNAL ASSERT）。
-        # 按 0.85 留 ~1.2GB，足够这些运行时开销。
-        return self.used_bytes(lay) <= self.usable_vram()
+        _headroom = float(self.cal.get("max_single_alloc_bytes") or 0.0)
+        if _headroom <= 0:
+            # 没测过最大单次分配时，用「这份布局真正要放到显存上的最大张量」
+            # 当代表 —— 从 header 读出来，不是常数。
+            #
+            # 注意只算**实际进显存**的：embed/head 放在 CPU 时（embed_on_cpu /
+            # head_on_cpu）它们不参与显存分配，拿它们当 headroom 会把预算砍掉
+            # 1.3GB（实测：headroom 取 embed_b=1324MB 后 resident 从 5 掉到 0）。
+            _cand = [self.max_layer_b]
+            if not lay.embed_on_cpu:
+                _cand.append(self.embed_b)
+            if not lay.head_on_cpu and not self.tied_head:
+                _cand.append(self.head_b)
+            _headroom = max(_cand)
+        return (self.used_bytes(lay) + _headroom) <= self.usable_vram()
 
     def usable_vram(self) -> float:
         """这句卡此刻真正能用的字节。问驱动，不用比例。
@@ -547,8 +576,32 @@ class Planner:
             raise RuntimeError(
                 'Planner.usable_vram: cannot query the driver for free VRAM '
                 f'({exc!r}). The planner has no fallback fraction.') from exc
-        _used = float(self.cal.get('engine_reserved_bytes') or 0.0)
-        return float(free) + _used
+        # **上限是「物理总量」，不是「此刻 free」。**
+        #
+        # 我第一版写成 `free + engine_reserved_bytes`，那是在算「现在还能分配
+        # 多少」；但规划器要回答的是「这份布局总共要占多少，占完之后装不装得
+        # 下」。两者差一个「此刻已经占掉的部分」：
+        #
+        #   查询时刻：模型还没 build，free 很小（arena 已经分配了一部分）
+        #   free + reserved = 3.95GB，而物理是 8.52GB
+        #
+        # 于是规划器以为只有 3.95GB 可用，却解出 6.81GB 的布局 —— 它自己矛盾，
+        # 跑到 rope 表那里 OOM。
+        #
+        # 正确口径：物理总量。used_bytes 算的就是「整个布局占多少」，两者同一
+        # 口径才能比。
+        # **口径：物理总量里「这个进程能拿到的部分」。**
+        #
+        # 直接用 _total 会把驱动/桌面合成占掉的显存算进来（这台卡 8.52GB
+        # 里只有 7.93GB 对进程可见）。正确的量是 free + 本进程已分配 ——
+        # 那正是「总量减去别的东西占的」。
+        try:
+            import torch as _t3
+
+            _alloc = int(_t3.cuda.memory_allocated(torch.device("cuda", _idx)))
+        except Exception:
+            _alloc = 0
+        return float(free) + float(_alloc)
     def _host_cache_bytes(self, *, n_stream=None, slots=None) -> int:
         """RAM 缓存能给多少字节。**只取决于主机内存，与显存布局无关。**
 

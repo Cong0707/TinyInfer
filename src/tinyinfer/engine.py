@@ -3493,6 +3493,30 @@ class Engine:
                 self._last_routing[i] = b.ffn._last_ids
             if streamed and self.device != "cpu" and not use_flat:
                 b.to("cpu")  # free VRAM for the next streamed layer
+        # **统计相邻两步的路由重合度 —— 这是「槽位值不值那几 GB」的唯一依据。**
+        #
+        # 规划器解布局时还没跑过前向，所以拿不到它（按 0 处理，等于认为槽位
+        # 无用）。这里在每步结束时把「本步 (layer,expert) 集合」和「上一步的」
+        # 比一次，累积出一个可比值，回填给规划器。
+        #
+        # 重合度 = |本步 ∩ 上步| / |本步|。它直接决定 expert_s：
+        #   1.0 -> 槽位覆盖整步之后零装载
+        #   0.0 -> 每步全换，槽位纯占显存
+        _cur_keys = {(lid, e) for lid, ids in self._last_routing.items()
+                     for e in ids}
+        _prev_keys = getattr(self, "_prev_route_keys", None)
+        if _cur_keys and _prev_keys:
+            _inter = len(_cur_keys & _prev_keys)
+            _reuse = float(_inter) / float(len(_cur_keys))
+            _n = getattr(self, "_route_reuse_n", 0) + 1
+            self._route_reuse_n = _n
+            # 指数滑动平均：路由分布会随 prompt 变化，单次样本不可靠
+            _avg = getattr(self, "_route_reuse_avg", None)
+            _avg = _reuse if _avg is None else (_avg * 0.8 + _reuse * 0.2)
+            self._route_reuse_avg = _avg
+            if _n >= 3 and getattr(self, "_planner", None) is not None:
+                self._planner.cal["route_reuse"] = float(_avg)
+        self._prev_route_keys = _cur_keys
         if self.predictor is not None and tok_now is not None and self._last_routing:
             self.predictor.observe(tok_now, dict(self._last_routing))
         self._last_hidden = h  # [1, T, hc, dim] before collapse (MTP main hidden)
