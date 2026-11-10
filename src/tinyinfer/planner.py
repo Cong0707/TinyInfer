@@ -295,7 +295,19 @@ class Planner:
         # 40 层全常驻就变成 9.68GB（实际 6.96GB），规划器于是永远选不到全常驻
         # —— 而全常驻是唯一能启用 CUDA graph 的布局。
         if lay.resident < self.n_layers:
-            b += self.layer_b
+            # **有流式层时，slab 环要占 3 块。**
+            #
+            # 图/流水线要的「固定地址」只有 slab 能给：整层权重一次 DMA 进
+            # 显存环，环只有 3 块（当前 / 预取中 / 刚 release 还没退）。
+            # 逐层 b.to() 每次换地址，图里固化的地址就失效 —— 那正是
+            # 「图捕获成功、replay 稳定、但 out 全是 NaN」的根因。
+            #
+            # 不把这块算进预算的后果是实测出来的：8GB 卡上按「槽位 242
+            # (4.55GB) + 常驻 10 层」解出来，跑到捕获时 host pool 在 layer 10
+            # 就耗尽（13.7/13.7GB），slab 那 1.4GB 永远拿不到，图这条路直接
+            # 作废。规划器必须和引擎共用同一本账。
+            _SLAB_RING = 3
+            b += _SLAB_RING * max(self.layer_b, self.max_layer_b * 0.5)
         b += 0.20 * GB                                    # workspace
         return b
 
@@ -331,7 +343,27 @@ class Planner:
             return 0
         # 留 25% 给 OS、页缓存、别的进程和 Python 自己。实测本机 33GB 可用时
         # 缓存 12GB 稳定（docs 里记的 10.27GB 配置也在这一档）。
-        return int(avail * 0.35)
+        _budget = int(avail * 0.35)
+        # **扣掉层权重 slab 的份额。**
+        #
+        # slab 和专家缓存从同一个 pinned 主机池里取（_flat_setup 按 signature
+        # 分配 2 块 x 每层权重）。不扣的后果是实测出来的：缓存拿走 11.26GB、
+        # slab 只剩 3.13GB，slab 一层都建不起来（pool exhausted at layer 0），
+        # 于是退回逐 tensor H2D —— 那正是 CUDA graph 拿不到固定地址、
+        # replay 出 NaN 的根源。
+        #
+        # slab 需要多少：流式层按 signature 分组，每组 2 块 x 单层权重。
+        # 组数由模型结构决定（本机 4 组），所以总量 = 组数 x 2 x layer_b。
+        # 拿不到组数时按「全部流式层都各一块 x 2」上界估 —— 宁可缓存小一点，
+        # 也要保证 slab 能建起来，因为 slab 是图的前提。
+        _n_stream = max(0, int(self.n_layers) - int(getattr(self.cal, "resident", 0) or 0))
+        if _n_stream <= 0:
+            # 调用方还没解出 resident，先用保守上界（12 组）
+            _signature_groups = 12
+        else:
+            _signature_groups = 4
+        _slab_b = _signature_groups * 2 * self.layer_b
+        return max(0, _budget - int(_slab_b))
 
     # ---- 求解 -------------------------------------------------------------
 

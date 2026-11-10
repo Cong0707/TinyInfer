@@ -369,6 +369,16 @@ class MoE:
         # 18%。这里用一次异步 D2H + 一个事件，等的时间只有 scan kernel 本身。
         self._miss_cnt_host.copy_(self._miss_cnt_dev, non_blocking=True)
         self._miss_ev.record(_t.cuda.current_stream())
+        # **捕获期不能同步。** `_miss_ev.synchronize()` 会走到
+        # cuStreamSynchronize，而捕获流上那个调用直接抛
+        #   CUDA error: operation not permitted when stream is capturing
+        #   (cudaErrorStreamCaptureUnsupported)
+        # 捕获时的假设是「零缺失」：槽位池已经覆盖整步（规划器按
+        # topk x n_layers 算的槽位数），所以图里每条 (layer,expert) 都在表上。
+        # 真出现缺失是规划器算错了，那种情况该在捕获前的 eager 阶段暴露，
+        # 而不是在图里静默走一条主机分支。
+        if _t.cuda.is_current_stream_capturing():
+            return 0
         self._miss_ev.synchronize()
         _cnt = int(self._miss_cnt_host[0])
         if _cnt > 0:

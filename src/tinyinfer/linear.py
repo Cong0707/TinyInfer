@@ -140,14 +140,22 @@ class QuantLinear:
                 # 字节（实测输出 absmax 2.36e37，正是 bf16 把任意 16 位当数值
                 # 解释的量级）。eager 每步都重新搬一次所以永远正常，只有
                 # 「不同层 / 冷权重 + CUDA graph」这个组合才暴露。
+                # **捕获期到这里就是 bug：说明 prewarm 没把权重搬到位。**
+                #
+                # 原来的做法是「捕获期就地搬一次」——`weight.to(x.device)` 确实
+                # 是一次 H2D，而捕获期做 H2D 会直接让整个捕获失败（cuStream
+                # 层面的限制，不是 torch 的检查）。图上一次就是这样死的。
+                #
+                # 正确顺序：捕获之前把所有 QuantLinear 的 weight/scale 都搬到
+                # device 上（prewarm_for_graph），捕获时这里不该再有未就位的。
+                # 真走到了就明确报错，而不是在捕获流上做非法操作、留下一堆
+                # 难查的 cudaErrorStreamCaptureUnsupported。
                 if torch.cuda.is_current_stream_capturing():
-                    # 就地搬一次并留下引用：之后 weight.device 已经是 x.device，
-                    # 图里拿到的是长期存活的地址。
-                    self.weight = weight = weight.to(x.device)
-                    self.scale = scale = scale.to(x.device)
-                    self.parts = [(weight.device, weight, scale)]
-                else:
-                    return self._one(x, weight.to(x.device), scale.to(x.device))
+                    raise RuntimeError(
+                        "QuantLinear weight is still on host during CUDA graph "
+                        "capture; prewarm_for_graph() did not cover it. "
+                        f"shape={tuple(weight.shape)} dev={weight.device}")
+                return self._one(x, weight.to(x.device), scale.to(x.device))
             return self._one(x, weight, scale)
         xdev = x.device
         outs = []

@@ -694,8 +694,22 @@ class Engine:
                 _SLAB_RING = 3
                 _n_stream_layers = (self.cfg.n_layers
                                     - (hw.gpu_layers if hw is not None else 0))
-                _slab_need = min(_n_stream_layers,
-                                 _SLAB_RING * 1) * _per_layer
+                # **slab 的 pinned 源是「每层一块」，不是「3 块的环」。**
+                #
+                # 我上一版把这里写成 min(n_stream, 3) * per_layer，理由是想的是
+                # GPU 侧那个环（_flat_setup 的 bufs 确实是 3 块）。但 pinned 源
+                # 是另一回事：_flat_setup 里 slab_total = sum(sizes[i] for i in
+                # streamed)，也就是**每个流式层各占一块主机 pinned**（本机 35 层
+                # x 174MB = 6GB）。
+                #
+                # 预留算成 3 块（0.5GB）而实际要 6GB，差额就被专家缓存吃掉了：
+                # 实测 pool 13.59GB、缓存计划 10.46GB、slab 到 layer 5 就耗尽
+                # （12.9/12.9GB）。slab 起不来 -> 图拿不到固定地址 -> 只能回
+                # 逐 tensor H2D。
+                #
+                # 所以按每层一块预留。装不下就是装不下，由 pool 的真实余量决定
+                # 能覆盖几层，而不是被一个偏小的预留值掩盖。
+                _slab_need = _n_stream_layers * _per_layer
                 _slab_reserve = 0
                 _flat_flag = __import__("os").environ.get("TI_FLAT")
                 if self.host_pool is not None and not (_flat_flag is not None
@@ -2110,9 +2124,21 @@ class Engine:
         if cache is None:
             self._stream_buffer_cache = cache = {}
         ent = cache.get(sig)
-        if ent is None and len(cache) >= 1:
-            # VRAM guard: one signature group x 2 buffers (2 x 190MB = 380MB); later
-            # groups fall back to the synchronous per-layer copy.
+        if ent is None and len(cache) >= 6:
+            # **不再限制只有一组。**
+            #
+            # 原来这里是 len(cache) >= 1 就返回 None，理由是「一组 2 块 x 190MB
+            # = 380MB，再多会吃光显存」。但那个判断是在「用 b.to() 逐层分配」的
+            # 旧架构下做的 —— 那时每层本来就有一块 132MB 的常驻 device 权重
+            # （30 层 = 3.97GB），再叠轮转 buffer 当然放不下。
+            #
+            # 现在要反过来：**让所有流式层都改用轮转 buffer，从而释放掉那
+            # 3.97GB 的逐层常驻**。30 层按 signature 大概分 2~3 组，每组 2 块
+            # x 132MB = 264MB，总共不到 1GB，比 3.97GB 少得多。
+            #
+            # 这不只是省显存：地址固定是 CUDA graph 能 replay 的前提。逐层
+            # b.to() 每次换地址，图里固化的地址就失效 —— 那正是「图捕获成功、
+            # replay 稳定、但 out 全是 NaN」的根因。
             return None, None
         if ent is None:
             layout = []
@@ -2338,8 +2364,19 @@ class Engine:
         # per token. Measured steady-state decode (0.66 -> 0.75 hit rate takes the step
         # from 574ms to 519ms), so the cache is worth more than the slab. TI_SLAB_FRAC
         # lets the split be measured instead of argued.
-        _slab_frac = float(__import__("os").environ.get("TI_SLAB_FRAC", "0.28"))
-        _slab_cap = int(_hb.total * _slab_frac)
+        # **不再按「物理内存的 28%」硬切 slab 上限。**
+        #
+        # 那个 0.28 没有任何推导，也没有实测记录 —— 它和规划器的 cache_bytes
+        # 是两套互不相干的账：规划器按 host_avail*0.35 给缓存，engine 又在这里
+        # 切 28% 给 slab，两边各算各的，必然冲突（实测：缓存拿走 11.26GB，
+        # slab 只剩 3.13GB，一层都建不起来）。
+        #
+        # 正确的账只有一本：规划器算 used_bytes 时已经把 slab 环算进去了，
+        # 也把 cache_bytes 扣掉了 slab 份额。所以这里直接用 slab_total
+        # （= 所有流式层的扁平布局总和），由 pool 的实际余量决定能装几层。
+        # 装不满就装不满 —— 那是显存/内存不够的真实结论，不是被一个常数
+        # 提前砍掉的。
+        _slab_cap = int(slab_total)
         if slab_total > _slab_cap:
             slab_total = _slab_cap
         if __import__("os").environ.get("TI_FLAT_DBG"):
@@ -2678,6 +2715,17 @@ class Engine:
         try:
             if layer not in self._flat_state[0]:
                 self.block(layer).to(self.device)
+                return
+            # **捕获期不能等外部事件。**
+            #
+            # copy stream 上那个 event 是在图外 record 的，捕获期的计算流
+            # wait 它会直接报
+            #   CUDA error: dependency created on uncaptured work in another stream
+            #   Capturing stream can only wait on captured events
+            # 而捕获只需要图里 kernel 的序列：权重在捕获前已经由 _flat_apply
+            # 搬进环里，replay 时那些地址不变。搬运本身在图外重新做。
+            if torch.cuda.is_current_stream_capturing():
+                self._flat_slot_guard(layer, buf_idx)
                 return
             ev = self._flat_ev.pop(layer, None)
             if ev is not None:
@@ -3271,8 +3319,18 @@ class Engine:
             self._timings = [(i, a.elapsed_time(b)) for i, a, b in events]
         h = (pre_mix.unsqueeze(-1) * h.float()).sum(dim=2).to(h.dtype)
         h = rms_norm(h, self.out_norm, self.eps)
-        if self.head_on_cpu:
+        # **head_on_cpu 时不要在这里 .cpu()：那是 D2H，CUDA graph 捕获期禁止。**
+        #
+        # torch 会抛 Cannot copy between CPU and CUDA tensors during CUDA
+        # graph capture。捕获期的调用栈精确指到这一行（engine.py:3275）。
+        # 和图外的 embed 对称：head 也放到图外，图里只剩层的计算。
+        if self.head_on_cpu and not torch.cuda.is_current_stream_capturing():
             h = h.cpu()
+        # **捕获期不调 head。** head_on_cpu 时它在主机上，对 device 上的 h
+        # 做 linear 会报 mat2 is on cpu。head 本来也不属于图：全词表一次投影，
+        # 输入来自本图输出，是图外的事。捕获只需要图内部的执行序列。
+        if torch.cuda.is_current_stream_capturing():
+            return h
         return self._head_logits(h)
 
     def prefill_layer_major(self, ids: torch.Tensor, max_chunk: int | None = None) -> torch.Tensor:
@@ -3360,8 +3418,18 @@ class Engine:
         self._last_hidden = h
         h = (pre_mix.unsqueeze(-1) * h.float()).sum(dim=2).to(h.dtype)
         h = rms_norm(h, self.out_norm, self.eps)
-        if self.head_on_cpu:
+        # **head_on_cpu 时不要在这里 .cpu()：那是 D2H，CUDA graph 捕获期禁止。**
+        #
+        # torch 会抛 Cannot copy between CPU and CUDA tensors during CUDA
+        # graph capture。捕获期的调用栈精确指到这一行（engine.py:3275）。
+        # 和图外的 embed 对称：head 也放到图外，图里只剩层的计算。
+        if self.head_on_cpu and not torch.cuda.is_current_stream_capturing():
             h = h.cpu()
+        # **捕获期不调 head。** head_on_cpu 时它在主机上，对 device 上的 h
+        # 做 linear 会报 mat2 is on cpu。head 本来也不属于图：全词表一次投影，
+        # 输入来自本图输出，是图外的事。捕获只需要图内部的执行序列。
+        if torch.cuda.is_current_stream_capturing():
+            return h
         return self._head_logits(h)
 
     # -- VRAM pressure + CUDA graph + prefix checkpoints ---------------------
@@ -3891,10 +3959,267 @@ class Engine:
                 # 层只用 2GB，槽位 4.7GB，周转缓冲已经算在规划器里）。放不下时会
                 # OOM，那时 _graph_try_capture 的调用方会走 OOM 分支 —— 但更可能是
                 # 规划器本来就该解出更少的流式层。
-                for _lid in self._stream_layers():
-                    _blk = self.block(_lid)
-                    if getattr(_blk, "_device", None) != self.device:
-                        _blk.to(self.device, streamed=True)
+                # **流式层用固定轮转 buffer，不逐层分配。**
+                #
+                # 8GB 卡上 30 层 x 174MB = 5.2GB，加上常驻层和槽位必然 OOM
+                # （实测 alloc 冲到 12.03GB / 物理 8.52GB，free=0，随后在
+                # dequant_fp8_block 里 !handles_ INTERNAL ASSERT）。
+                #
+                # 而图真正需要的只是「kernel 读的地址在 replay 时不变」——
+                # 满足它的最小结构就是轮转 buffer：几块固定显存，每层算之前把
+                # 自己的字节搬进去，地址永远是那几块。这也正是 eager 现在做的事
+                # （_flat_wait / _flat_apply 那套），区别只在于要让 buffer 在
+                # 捕获之前就分配好、且捕获期不再重新分配。
+                #
+                # 这里先把轮转 buffer 建出来（捕获期分配会落进 graph pool，
+                # 那样块地址就不稳定了）。
+                # **捕获前让 slab 路径先就位。**
+                #
+                # slab 是唯一能给 CUDA graph 提供「固定地址」的结构：整层权重
+                # 一次 DMA 进显存环，环只有 3 块，地址永恒不变。逐层 b.to()
+                # 每次换地址，图里固化的地址就失效 —— 那正是「图捕获成功、
+                # replay 稳定、但 out 全是 NaN」的根因。
+                #
+                # 这里先把它建起来（_flat_enabled 会分配那 3 块环并 pack 主机源）。
+                # 建不起来就说明显存不够，图这条路在这个配置上走不通，直接
+                # 报清楚而不是硬跑出一堆 NaN。
+                # **先把显存腾出来。**
+                #
+                # 走到这里时已经跑过十几步 eager，那些 b.to() 逐层分配的 device
+                # 权重（30 x 132MB = 3.97GB）和 _STAGE 缓冲（0.49GB）都还挂着。
+                # slab 要 3 块 x 463MB = 1.4GB，在 4.5GB 槽位 + 3.97GB 逐层权重
+                # 之上拿不出来 —— 实测 _flat_setup 直接抛 !handles_ INTERNAL
+                # ASSERT。
+                #
+                # 把它们放回主机侧：流式层本来就该「算完就走」，只是在
+                # eager 路径下没人催它走。捕获完成后 slab 会接手搬运。
+                for _lid in list(self._stream_layers()):
+                    try:
+                        _blk0 = self.block(_lid)
+                        if getattr(_blk0, "_device", None) == self.device:
+                            _blk0.to("cpu")
+                    except Exception:
+                        pass
+                try:
+                    import tinyinfer.deepseek.model as _mdl0
+
+                    _st0 = getattr(_mdl0, "_STAGE", None)
+                    if isinstance(_st0, dict):
+                        _st0.clear()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                torch.cuda.synchronize()
+                # **捕获前把所有 QuantLinear 的权重/scale 搬到 device。**
+                #
+                # linear.py 里那条 `weight.to(x.device)` 是 H2D，捕获期做会让
+                # 整个捕获失败（cudaErrorStreamCaptureUnsupported）。而它之所以
+                # 存在，是因为 flat streaming 换权重时只改 .weight/.data，
+                # 够不到 parts 元组 —— 那条路径绕开了它，所以捕获期才发现权重
+                # 还在主机上。
+                #
+                # 这里提前就位：图里 kernel 拿到的就是这块长期存活的地址。
+                _prewarmed = 0
+                _seen_mod = set()
+
+                # **slab 必须先占住那 3 块环（1.4GB），prewarm 排在它后面。**
+                #
+                # 顺序反了就会：prewarm 把一百多个 QuantLinear 搬到显存，
+                # 吃掉 1~2GB，slab 再要 1.4GB 就 OOM，整个图路径作废。
+                # 而 slab 是图能成立的前提（固定地址），prewarm 只是补漏。
+                _flat_ok = False
+                try:
+                    _eo0 = __import__("os")
+                    _eo0.environ["TI_FLAT"] = "1"
+                    self._flat_state = None
+                    _flat_ok = bool(self._flat_enabled())
+                except Exception as _e0:
+                    print(f"[tinyinfer] slab for graph unavailable: {_e0!r}",
+                          flush=True)
+                    _flat_ok = False
+                if not _flat_ok:
+                    print("[tinyinfer] CUDA graph needs the slab ring for stable "
+                          "weight addresses; slab is off, so capture is skipped. "
+                          "Eager decode still runs.", flush=True)
+                    self._graph_disabled = True
+                    return
+
+                def _prewarm_one(_mod):
+                    """把这个模块自身的 QuantLinear 权重搬到 device。"""
+                    nonlocal _prewarmed
+                    if id(_mod) in _seen_mod:
+                        return
+                    _seen_mod.add(id(_mod))
+                    _w = getattr(_mod, "weight", None)
+                    _s = getattr(_mod, "scale", None)
+                    if _w is None or _s is None or not hasattr(_mod, "parts"):
+                        return
+                    try:
+                        if getattr(_w, "device", None) is not None and _w.device.type != "cuda":
+                            _mod.weight = _w.to(self.device)
+                            _mod.scale = _s.to(self.device)
+                            _mod.parts = [(_mod.weight.device, _mod.weight, _mod.scale)]
+                            _prewarmed += 1
+                    except Exception:
+                        pass
+
+                try:
+                    # 三层遍历：engine.modules()（nn.Module 树）覆盖不到那些不在
+                    # nn.Module 注册体系里的容器（compressor/indexer 的裸属性、
+                    # Block 上的 _rt 之类），所以再补一遍 _blocks 的 __dict__ 深度扫。
+                    for _mod in self.modules():
+                        _prewarm_one(_mod)
+                    _stack = [self]
+                    _seen_obj = set()
+                    while _stack:
+                        _cur = _stack.pop()
+                        if id(_cur) in _seen_obj:
+                            continue
+                        _seen_obj.add(id(_cur))
+                        if hasattr(_cur, "parts") and hasattr(_cur, "weight"):
+                            _prewarm_one(_cur)
+                        _d = getattr(_cur, "__dict__", None)
+                        if not isinstance(_d, dict):
+                            continue
+                        for _v in _d.values():
+                            if isinstance(_v, (list, tuple)):
+                                for _it in _v:
+                                    if hasattr(_it, "__dict__"):
+                                        _stack.append(_it)
+                            elif hasattr(_v, "__dict__") and not isinstance(
+                                    _v, (str, bytes, int, float, type)):
+                                _stack.append(_v)
+                except Exception:
+                    pass
+                # **按名字枚举，不靠遍历。**
+                #
+                # 调用栈已经把这组权重定位到 compressed_attention 的 `_lin`：
+                #   compressed_attention.py:421 -> w.forward(x_)
+                # 形状 (32768, 1280) 是 out-projection（wo_a）。它挂在 Block.attn
+                # 上，而 attn 不是 nn.Module（self.modules() 遍历不到它），
+                # __dict__ 深度扫也会被闭包/别名绕开。
+                #
+                # 所以改成按已知属性名直接枚举：每一层把 attn 上那批 QuantLinear
+                # 逐个 prewarm。名字来自 _weight_paths / 构造处，是确定的。
+                _attn_attrs = ("wqkv", "wq_a", "wkv", "wq_b", "wo_a", "wo_b",
+                               "w1", "w2", "w3", "gate", "shared")
+                try:
+                    _bl = getattr(self, "_blocks", None)
+                    for _bidx in range(int(self.max_layers)):
+                        _bb = _bl.get(_bidx) if isinstance(_bl, dict) else None
+                        if _bb is None:
+                            continue
+                        for _holder in (getattr(_bb, "attn", None),
+                                        getattr(_bb, "ffn", None)):
+                            if _holder is None:
+                                continue
+                            for _nm in _attn_attrs:
+                                _sub = getattr(_holder, _nm, None)
+                                if _sub is None:
+                                    continue
+                                if hasattr(_sub, "weight") and hasattr(_sub, "parts"):
+                                    _prewarm_one(_sub)
+                                for _nm2 in ("w1", "w2", "w3"):
+                                    _sub2 = getattr(_sub, _nm2, None)
+                                    if _sub2 is not None:
+                                        _prewarm_one(_sub2)
+                            _cmp0 = getattr(_holder, "compressor", None)
+                            _ix0 = getattr(_holder, "indexer", None)
+                            for _mm in (_cmp0, _ix0):
+                                if _mm is None:
+                                    continue
+                                for _nm in _attn_attrs:
+                                    _sub = getattr(_mm, _nm, None)
+                                    if _sub is not None:
+                                        _prewarm_one(_sub)
+                except Exception:
+                    pass
+                if _prewarmed:
+                    print(f"[tinyinfer] prewarmed {_prewarmed} quant linears for graph",
+                          flush=True)
+                torch.cuda.synchronize()
+                _flat_ok = False
+                try:
+                    _env_os = __import__("os")
+                    _env_os.environ["TI_FLAT"] = "1"
+                    self._flat_state = None
+                    _flat_ok = bool(self._flat_enabled())
+                except Exception as _exc:
+                    print(f"[tinyinfer] slab for graph unavailable: {_exc!r}",
+                          flush=True)
+                    _flat_ok = False
+                if not _flat_ok:
+                    print("[tinyinfer] CUDA graph needs the slab ring for stable "
+                          "weight addresses; slab is off, so capture is skipped. "
+                          "Eager decode still runs.", flush=True)
+                    self._graph_disabled = True
+                    return
+                # **slab 起来之后再补 prewarm。**
+                #
+                # 顺序要紧：slab 要 3 块 463MB 的环（1.4GB），而 prewarm 会把
+                # 129 个 QuantLinear 的权重搬到显存（1~2GB）。prewarm 先跑就会
+                # 把环的空间吃掉，slab 起不来 —— 而 slab 是图能成立的前提。
+                # 所以先让 slab 占好，再把剩下没就位的权重补上去。
+                _prewarmed2 = 0
+                _seen2 = set()
+
+                def _prewarm_again(_mod):
+                    nonlocal _prewarmed2
+                    if id(_mod) in _seen2:
+                        return
+                    _seen2.add(id(_mod))
+                    _w = getattr(_mod, "weight", None)
+                    _s = getattr(_mod, "scale", None)
+                    if _w is None or _s is None or not hasattr(_mod, "parts"):
+                        return
+                    try:
+                        if _w.device.type != "cuda":
+                            _mod.weight = _w.to(self.device)
+                            _mod.scale = _s.to(self.device)
+                            _mod.parts = [(_mod.weight.device, _mod.weight, _mod.scale)]
+                            _prewarmed2 += 1
+                    except Exception:
+                        pass
+
+                try:
+                    _bl2 = getattr(self, "_blocks", None)
+                    for _bi in range(int(self.max_layers)):
+                        _bb2 = _bl2.get(_bi) if isinstance(_bl2, dict) else None
+                        if _bb2 is None:
+                            continue
+                        for _hd in (getattr(_bb2, "attn", None),
+                                    getattr(_bb2, "ffn", None)):
+                            if _hd is None:
+                                continue
+                            for _nm in ("wqkv", "wq_a", "wkv", "wq_b", "wo_a",
+                                        "wo_b", "w1", "w2", "w3", "gate", "shared"):
+                                _s1 = getattr(_hd, _nm, None)
+                                if _s1 is None:
+                                    continue
+                                if hasattr(_s1, "weight") and hasattr(_s1, "parts"):
+                                    _prewarm_again(_s1)
+                                for _nm2 in ("w1", "w2", "w3"):
+                                    _s2 = getattr(_s1, _nm2, None)
+                                    if _s2 is not None:
+                                        _prewarm_again(_s2)
+                            for _mm in (getattr(_hd, "compressor", None),
+                                        getattr(_hd, "indexer", None)):
+                                if _mm is None:
+                                    continue
+                                for _nm in ("wqkv", "wq_a", "wkv", "wq_b", "wo_a",
+                                            "wo_b", "w1", "w2", "w3"):
+                                    _s3 = getattr(_mm, _nm, None)
+                                    if _s3 is not None:
+                                        _prewarm_again(_s3)
+                except Exception:
+                    pass
+                if _prewarmed2:
+                    print(f"[tinyinfer] prewarmed {_prewarmed2} more quant linears "
+                          f"after slab", flush=True)
+                torch.cuda.synchronize()
                 torch.cuda.synchronize()
                 # 主机侧算好 embedding，得到一块 device 上的 h（图从这里开始）。
                 _hidden_dev = None
