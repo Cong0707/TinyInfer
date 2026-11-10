@@ -42,19 +42,16 @@ from dataclasses import dataclass, field
 GB = 1 << 30
 MB = 1 << 20
 
-# tilelang 的 workspace：固定部分 + 每个 token 的增量。
-# 引擎要用它来给槽位池留运行期余量（拿满 free 会在 activation 上 OOM）。
-# 这个量是「运行时的真实需求」，不是机器常数 —— 它由 kernel 的 tile 形状定，
-# 换模型（行长不同）会变，所以放在规划器里作为可标定项。
-# fits() 判据里显存的可用比例。**只在这里定义一次。**
+# **规划器里不允许常数。**
 #
-# used_bytes 不算 rope 表、KV cache、activation、cuBLAS handle、分配器碎片。
-# 实测：按 0.94（7.46/7.93GB）留 470MB 不够，14 层布局在 rope_cache 里
-# 抛 !handles_ INTERNAL ASSERT。0.85 留 ~1.2GB 够用。
-_FITS_FRACTION = 0.85
-
-WS_BASE = 0.20 * GB
-WS_PER_TOKEN = 0.02 * GB
+# 这里曾经有三个 _FITS_FRACTION = 0.85 / WS_BASE = 0.20GB / WS_PER_TOKEN = 0.02GB。
+# 它们都是某台机器上量出来然后写死的数，注释也承认了来源（实测 7.46/7.93GB）。
+#
+# 正确来源分别应该是：
+#   可用容量  <- 驱动（mem_get_info，在真正分配之前问）
+#   workspace <- 引擎实测（模型构建前后 alloc 之差），回填到 calibrate
+#
+# 拿不到就不解。规划器宁可拒绝，也不拿编造的数字解一个看起来合理的布局。
 
 
 @dataclass
@@ -165,30 +162,110 @@ class Planner:
         # 注意：resident / slots / cache_bytes **不在**这里 —— 它们由目标函数
         # 解出来，不是可调参数。以前把 slots 做成可调导致规划器被上一轮的旧值
         # 永久锁死。
-        import os as _os
-        self.compute_per_layer_s = self._tunable(
-            "compute_per_layer_s", 0.0025, float)
-        self.pin_ratio = self._tunable("pin_ratio", 0.5, float)
-        self.ws_base_gb = self._tunable("ws_base_gb", None, float)
+        # **没有任何可调量带默认值。**
+        #
+        # 这里曾经是 `self.compute_per_layer_s = self._tunable(...)` 配一个
+        # `_tunable(name, default, cast)` —— 名字叫 tunable，实际语义是
+        # 「找不到就退回一个写死的数」。三个默认值（0.0025 秒/层、0.5 的 pin
+        # 比例、None 的 workspace）全都是某台机器上量出来的。
+        #
+        # 现在改成 required：拿不到就抛，让调用方知道必须先测。
+        #
+        # 注意 resident / slots / cache_bytes 从来不在这个列表里 —— 它们由目标
+        # 函数解出来，不是输入。以前把 slots 做成可调导致规划器被上一轮的旧值
+        # 永久锁死。
+        # **这两个量的来源是「引擎启动时自己测」，不是外部预先准备好。**
+        #
+        # 之前的 _required 会抛「先跑 tinyinfer.tune」—— 那等于要求人先做一步。
+        # 而引擎自己就能测：compute_per_layer_s 是一次前向的耗时除以层数，
+        # pin_ratio 是主机内存里能 pin 的比例。让引擎在第一次 resolve() 之前
+        # 调 measure()，比要求使用者先跑训练器合理。
+        #
+        # 仍然保留 calibrate / 环境变量两条覆盖路径（训练器和 A/B 测试要用），
+        # 但**没有默认值** —— 三条来源全都没有就抛。
+        # **惰性读取，不在构造时抛。**
+        #
+        # 这两个量在「解布局」那一步都不是必需的（compute_per_layer_s 对所有
+        # 布局加同一个常数，pin_ratio 只影响缓存里 pin 多少）。构造时就要求它们
+        # 存在，会让引擎在「还没跑前向」时直接起不来。
+        #
+        # 真正用到的那一刻（cost() / used_bytes()）才读，那时引擎已经能测了。
+        self._compute_per_layer_s_raw = None
+        self._pin_ratio_raw = None
 
-    def _tunable(self, name, default, cast):
-        """读一个可调量：环境变量（训练器用）> calibrate > 默认。"""
+
+    @property
+    def compute_per_layer_s(self):
+        return self._required("compute_per_layer_s", float)
+
+    @property
+    def pin_ratio(self):
+        return self._required("pin_ratio", float)
+
+    def measure(self) -> dict:
+        """引擎启动时自己测出解布局所需的全部实测量。
+
+        这些量原来都写死成常数（0.0025 秒/层、0.5 的 pin 比例、0.3 秒的
+        graph 收益……）。它们**不由「资源量 ÷ 单元大小」推出**，所以只能测。
+
+        但「只能测」不等于「必须由外部先测」：引擎自己就有全部条件 ——
+        它知道模型有多少层、能跑一次前向、能问驱动、能读系统内存。
+
+        这个方法在 resolve() 之前被调用一次，返回测到的值，同时写进 self.cal。
+        """
+        import time as _time
+
+        out: dict = {}
+        # 1) 每层计算耗时 = 一次前向 / 层数。需要调用方已把模型放到 device 上。
+        _bench = getattr(self, "_bench_forward", None)
+        if _bench is not None:
+            _n = max(1, int(self.n_layers))
+            _t0 = _time.perf_counter()
+            _bench()
+            if self.has_gpu:
+                import torch
+
+                torch.cuda.synchronize()
+            out["compute_per_layer_s"] = (_time.perf_counter() - _t0) / _n
+
+        # 2) pin 比例 = 主机内存里允许 pin 的比例。由预算器给，不是常数。
+        try:
+            from .budget import budget as _hb
+
+            _room = float(_hb().room())
+            _total = float(getattr(_hb(), "total", 0) or 0)
+            if _total > 0:
+                out["pin_ratio"] = max(0.0, min(1.0, _room / _total))
+        except Exception:
+            pass
+
+        # 3) 本机实测的搬运耗时（引擎在第一次搬层时记录）。
+        _h2d = getattr(self, "measured_h2d_layer_s", None)
+        if _h2d:
+            out["h2d_layer_s"] = float(_h2d)
+        _hex = getattr(self, "measured_h2d_expert_s", None)
+        if _hex:
+            out["h2d_expert_s"] = float(_hex)
+
+        self.cal.update(out)
+        return out
+    def _required(self, name, cast):
+        """读一个**必须存在**的实测值。缺失就抛，没有默认值。
+
+        """
         import os as _os
 
         env_key = "TI_TUNE_" + name.upper()
         v = _os.environ.get(env_key)
         if v not in (None, ""):
-            try:
-                return cast(v)
-            except (TypeError, ValueError):
-                pass
+            return cast(v)
         v = self.cal.get(name)
         if v is not None:
-            try:
-                return cast(v)
-            except (TypeError, ValueError):
-                pass
-        return default
+            return cast(v)
+        raise RuntimeError(
+            f"Planner: {name} has not been measured. The planner does not carry "
+            "defaults — run tinyinfer.tune against this model/machine first, or "
+            "pass it via calibrate.")
 
     # ---- 目标函数 ---------------------------------------------------------
 
@@ -204,13 +281,12 @@ class Planner:
         # 原因是带宽测的是「一块连续内存的 DMA」，而搬一层是 30+ 个张量、
         # 每个都要 set_weight、可能有多个 stream 同步。那个开销不在带宽里。
         #
-        # 所以用 h2d_layer_s（实测「搬一层要几秒」），没有就退回带宽估算。
-        # 实证默认：本机搬一层 474.8MB 要 141ms（= 3.4GB/s 有效）。
-        # 没有实测值时按「字节 / 带宽 x 2.1」估 —— 那个 2.1 是实测出来的
-        # 差距（带宽测的是连续 DMA，搬一层是 30+ 个张量各自 set_weight）。
-        _per_layer_s = self._tunable("h2d_layer_s", None, float)
-        if not _per_layer_s:
-            _per_layer_s = self.layer_b / max(1.0, self.h2d) * 2.1
+        # **用 h2d_layer_s（实测「搬一层要几秒」），必须有值。**
+        #
+        # 曾经写成 `layer_b / h2d * 2.1` —— 那个 2.1 是「连续 DMA 带宽」和
+        # 「一层 30 多个张量各自 set_weight」之间的实测差距。它随模型结构变
+        # （张量个数不同）、随驱动变，写死就是把一台机器的比值当定律。
+        _per_layer_s = self._required("h2d_layer_s", float)
         stream_s = stream * float(_per_layer_s)
 
         # **一步要几个不同的 (layer, expert)，以及「下一步还要重搬多少」。**
@@ -238,7 +314,19 @@ class Planner:
         # 这个数字直接决定「槽位 vs 常驻层」的取舍：按 0.35 算，每步要搬
         # 156 个专家、expert_s=1.85s，规划器就会得出「槽位无用」的结论；
         # 按 0.988 算，每步只搬 3 个、expert_s 接近 0，槽位才显得值那 4.5GB。
-        _reuse = float(self._tunable("route_reuse", 0.988, float) or 0.988)
+        # **实测值。** 它由这份 checkpoint 的路由分布决定，换模型必变。
+        #
+        # 但它在「解布局」这一刻还测不到 —— 要跑两步才知道相邻 token 的路由
+        # 重合多少。所以这里允许「尚未测到」：此时按 0 处理（槽位不留任何
+        # 复用价值，规划器因此不会为了槽位牺牲常驻层），等引擎跑出第一步后
+        # 回填，下次 observe() 重解时就用真实值。
+        #
+        # 这不是兜底：0 是一个明确的「未知」语义，而且它的影响是保守方向
+        # （宁可少给槽位），不是编造一个看起来合理的数。
+        try:
+            _reuse = float(self._required("route_reuse", float))
+        except RuntimeError:
+            _reuse = 0.0
         _reuse = min(1.0, max(0.0, _reuse))
         # **本步要从「槽位之外」装进显存的专家数。**
         #
@@ -278,15 +366,22 @@ class Planner:
             # 槽位省 130ms 只花 4.5GB；按 1.8ms 算，244 个槽位省 430ms —— 但
             # 那 4.5GB 挤掉 9 层常驻，而 9 层 x 141ms = 1.27s。**槽位仍然不划算**，
             # 而且要差 3 倍才看得出来。
-            _per_exp_s = self._tunable("h2d_expert_s", None, float)
-            if not _per_exp_s:
-                # 实证默认值：本机一个专家 blob 的装载开销（含调度，不含 IO）
-                _per_exp_s = 0.0018
+            # **实测值，无默认。** 它含 slot 查表、set_weight、event 同步，
+            # 随槽位池实现和驱动变。
+            _per_exp_s = self._required("h2d_expert_s", float)
             expert_s = uncovered * (float(_per_exp_s) + (0.0 if hit > 0.5
                                                           else self.expert_b / max(1.0, self.disk_rand)))
 
         # 计算：每步都要过全部层，与布局无关。用实测的每层计算耗时。
-        compute_s = float(self.compute_per_layer_s or 0.0025) * n
+        # **每层计算耗时是「每层都要过一遍」的固定开销，与布局无关。**
+        #
+        # 换句话说：它对所有候选布局加的是同一个常数，不改变「哪个布局更好」。
+        # 所以它不必在解布局之前就存在 —— 没有它就用 0（T 少算这一项，但排序
+        # 不变），有它就加上。这样引擎不会因为「还没跑过一次前向」就起不来。
+        try:
+            compute_s = float(self._required("compute_per_layer_s", float)) * n
+        except RuntimeError:
+            compute_s = 0.0
 
         # **全常驻解锁 CUDA graph，这是目标函数里之前漏掉的一整块。**
         #
@@ -302,8 +397,19 @@ class Planner:
         # 所以全常驻的收益不只是「省掉流式搬运」，还有「解锁 graph」。
         # 这一项不进目标函数的话，规划器永远选不到全常驻 —— 而它本该在
         # 「搬 33 层花 0.94s」和「全常驻 + graph」之间做正确取舍。
+        # **全常驻解锁 CUDA graph 的收益，必须实测。**
+        #
+        # 这里曾经写 `graph_gain_s = 0.30` —— 一个「graph 能省 0.3 秒」的
+        # 固定收益。它随模型深度、kernel 数量、主机速度变，写死等于假设
+        # 所有模型都能省同样多。
+        #
+        # 正确来源：同一份布局分别在 graph / eager 下各跑一次，差值就是它。
+        # 没测过就当作 0（保守：不影响布局选择），但绝不编一个数。
         if lay.resident >= n:
-            graph_gain = float(self._tunable("graph_gain_s", 0.30, float) or 0.30)
+            try:
+                graph_gain = float(self._required("graph_gain_s", float))
+            except RuntimeError:
+                graph_gain = 0.0
             compute_s = max(0.0, compute_s - graph_gain)
         return Cost(stream_s=stream_s, expert_s=expert_s, compute_s=compute_s)
 
@@ -348,8 +454,36 @@ class Planner:
             # 就耗尽（13.7/13.7GB），slab 那 1.4GB 永远拿不到，图这条路直接
             # 作废。规划器必须和引擎共用同一本账。
             _SLAB_RING = 3
-            b += _SLAB_RING * max(self.layer_b, self.max_layer_b * 0.5)
-        b += 0.20 * GB                                    # workspace
+            # **环按「最坏一层」开，不乘任何比例。**
+            #
+            # 这里曾经是 max(layer_b, max_layer_b * 0.5) —— 那个 0.5 是
+            # 「按最坏层的一半开环」的估值。环必须装得下最坏的一层，所以就是
+            # max_layer_bytes，不多不少。
+            # **环深度 = 1（当前层）+ 预取提前量，不是外部参数。**
+            #
+            # 环的作用是「让第 k 层的计算和第 k+1 层的 DMA 重叠」。所以块数
+            # 恰好等于「同时在用的层数」：当前这一层 + 预取中的那几层。
+            #
+            # 预取提前量由目标函数里的搬运代价决定（盘越慢越值得提前），
+            # 但至少要 1 块给「当前层」、1 块给「下一层」—— 2 是下界。
+            # 上界由显存给：环太大就挤掉槽位和常驻层。
+            _prefetch_ahead = 1
+            _SLAB_RING = 1 + _prefetch_ahead
+            b += _SLAB_RING * self.max_layer_b
+        # **workspace 由引擎实测回填，规划器不猜。**
+        #
+        # 这里曾经是 `b += 0.20 * GB` —— 一个「cuBLAS handle + 分配器碎片大约
+        # 200MB」的估值。它随 kernel 的 tile 形状、cuBLAS 版本、分配器状态变。
+        #
+        # 来源应该是：引擎构建完、第一次 forward 前后各读一次 memory_allocated，
+        # 差值就是真实的运行时开销，回填到 calib['runtime_overhead_bytes']。
+        _rt = self.cal.get("runtime_overhead_bytes")
+        if _rt is None:
+            raise RuntimeError(
+                "Planner.used_bytes: runtime overhead (workspace, cuBLAS handles, "
+                "allocator slack) has not been measured for this engine build. "
+                "It must be back-filled by the engine; there is no constant.")
+        b += float(_rt)
         # **运行时固定开销：rope 表。**
         #
         # 这是模型常量（1M 位置 x rotary_dim），不是每层权重，但它必须驻留
@@ -361,18 +495,19 @@ class Planner:
         # 这类 OOM 不该在运行期暴露 —— 规划器要么把它算进预算，要么明确
         # 说「这张卡放不下这个模型」。
         #
-        # 按位置数与 rotary 维数估：seq_len x (rotary_dim/2) x complex64。
-        # 拿不到配置时按实测的 0.54GB 兜底。
-        try:
-            _seqlen = int(self.model.get("max_position_embeddings") or 0)
-            _rot = int(self.model.get("rotary_dim") or 0)
-            if _seqlen > 0 and _rot > 0:
-                # 两张表（yarn 与原始各一），complex64 = 8 字节/元素
-                b += 2 * _seqlen * (_rot // 2) * 8
-            else:
-                b += 0.54 * GB
-        except Exception:
-            b += 0.54 * GB
+        # **rope 表的字节由配置算，算不出来就抛。**
+        #
+        # 曾经写成「按 seq_len 和 rotary_dim 算，拿不到配置时按 0.54GB 兜底」——
+        # 那个 0.54GB 是本机实测的两张表之和（各 268.4MB），给别的模型完全不成立。
+        _seqlen = int(self.model.get("max_position_embeddings") or 0)
+        _rot = int(self.model.get("rotary_dim") or 0)
+        if _seqlen <= 0 or _rot <= 0:
+            raise RuntimeError(
+                "Planner.used_bytes: rope table size unknown "
+                f"(max_position_embeddings={_seqlen}, rotary_dim={_rot}). "
+                "It must come from the model config; there is no fallback size.")
+        # 两张表（yarn 与原始各一），complex64 = 8 字节/元素
+        b += 2 * _seqlen * (_rot // 2) * 8
         return b
 
     def fits(self, lay: Layout) -> bool:
@@ -388,8 +523,32 @@ class Planner:
         # 实测：按 0.94 卡（7.46/7.93GB）留下的 470MB 不够，14 层布局在
         # rope_cache.get_table 里 OOM（!handles_ INTERNAL ASSERT）。
         # 按 0.85 留 ~1.2GB，足够这些运行时开销。
-        return self.used_bytes(lay) <= self.vram * _FITS_FRACTION
+        return self.used_bytes(lay) <= self.usable_vram()
 
+    def usable_vram(self) -> float:
+        """这句卡此刻真正能用的字节。问驱动，不用比例。
+
+        规划器原来写的是 vram * 0.85。那是在一台机器上试出来的安全系数，
+        换卡换模型都不成立。正确的量只有一个来源：驱动。
+
+        但它有个先后问题 —— 引擎构建时会占掉一部分（层权重、槽位 arena、
+        workspace），规划器必须知道构建完成后还能用多少。那部分由引擎实测后
+        回填 calibrate（engine_reserved_bytes）。
+        """
+        if not self.has_gpu:
+            raise RuntimeError(
+                'Planner.usable_vram: no GPU detected, there is no VRAM to plan with')
+        try:
+            import torch
+            _cards = getattr(self.hw, 'cards', None) or []
+            _idx = int(_cards[0].index) if _cards else 0
+            free, _total = torch.cuda.mem_get_info(torch.device('cuda', _idx))
+        except Exception as exc:
+            raise RuntimeError(
+                'Planner.usable_vram: cannot query the driver for free VRAM '
+                f'({exc!r}). The planner has no fallback fraction.') from exc
+        _used = float(self.cal.get('engine_reserved_bytes') or 0.0)
+        return float(free) + _used
     def _host_cache_bytes(self, *, n_stream=None, slots=None) -> int:
         """RAM 缓存能给多少字节。**只取决于主机内存，与显存布局无关。**
 
@@ -407,7 +566,14 @@ class Planner:
             return 0
         # 留 25% 给 OS、页缓存、别的进程和 Python 自己。实测本机 33GB 可用时
         # 缓存 12GB 稳定（docs 里记的 10.27GB 配置也在这一档）。
-        _budget = int(avail * 0.35)
+        # **主机缓存的容量由可用内存减掉真实占用算，不乘比例。**
+        #
+        # 这里曾经是 `int(avail * 0.35)` —— 「留 65% 给 OS/页缓存/别的进程」的
+        # 经验值。它在本机看起来是对的，换一台内存更小的机器就会算错。
+        #
+        # 正确的量：物理可用内存 - 已经确定要用的（slab + 槽位）。两者都是
+        # 实实在在的字节数，不需要百分比。
+        _budget = int(avail)
         # **扣掉层权重 slab 的份额。**
         #
         # slab 和专家缓存从同一个 pinned 主机池里取（_flat_setup 按 signature
@@ -467,7 +633,7 @@ class Planner:
                 # < 7.45GB(0.94) 但 > 6.74GB(0.85)，直接被拒，求解器一路
                 # 退到 resident=0 slots=0，引擎于是拿不到 expert_store，
                 # 报 "arena unusable: 0 blocks"。
-                free = self.vram * _FITS_FRACTION - self.used_bytes(probe)
+                free = self.usable_vram() - self.used_bytes(probe)
                 if free < 0:
                     continue
                 _max_slots = (int(free // max(1.0, self.expert_b))
@@ -534,7 +700,12 @@ class Planner:
             # （4层/246槽位 被选为最优，而 8层/240槽位 更便宜）。
             if best is not None:
                 lb = (self.n_layers - resident) * self.layer_b / max(1.0, self.h2d)
-                lb += float(self.cal.get("compute_per_layer_s") or 0.0025) * self.n_layers
+                # 剪枝用的下界：compute 项对所有布局是同一个常数，缺了就不加
+                # （下界更松，只影响剪枝效率，不影响解的 correctness）。
+                try:
+                    lb += float(self._required("compute_per_layer_s", float)) * self.n_layers
+                except RuntimeError:
+                    pass
                 if lb >= best[0].total_s:
                     break
 

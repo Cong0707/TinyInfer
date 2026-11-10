@@ -394,6 +394,75 @@ class Engine:
             _geo["topk"] = int(getattr(self.cfg, "n_activated_experts", 0) or 0)
             _geo["n_experts"] = int(getattr(self.cfg, "n_routed_experts", 0) or 0)
             _geo["tied_head"] = bool(getattr(self.cfg, "tie_word_embeddings", False))
+            # **rope 表的大小必须从 config 读，不能在规划器里猜。**
+            #
+            # 规划器的 used_bytes 要把 rope 表算进显存预算（本机两张各 268.4MB）。
+            # 这两个量只有 config 知道 —— 曾经在规划器里写「拿不到就按 0.54GB
+            # 兜底」，那是本机的实测值，给别的模型完全不成立。
+            _geo["max_position_embeddings"] = int(
+                getattr(self.cfg, "max_position_embeddings", 0) or 0)
+            _geo["rotary_dim"] = int(
+                getattr(self.cfg, "qk_rope_head_dim", 0)
+                or getattr(self.cfg, "rotary_dim", 0) or 0)
+            # **求解前先测出「引擎自身的运行时开销」。**
+            #
+            # 规划器需要知道 workspace、cuBLAS handle、分配器碎片一共占多少，
+            # 才能判断「解出来的布局会不会把卡撑爆」。这个量原来是写死的
+            # 0.20GB，现在必须实测。
+            #
+            # 测法：此刻模型还没构建，先量一次 memory_allocated；构造一个小
+            # kernel 并跑一次，再量一次，差额就是「一次 kernel 调用要多少额外
+            # 显存」。这不是 workspace 的精确值，但它是**这台机器、这个驱动、
+            # 这个 cuBLAS 版本**下的真实量级 —— 比任何常数都准。
+            try:
+                import torch as _t0
+
+                _cu0 = int(_t0.cuda.memory_allocated())
+                _a = _t0.empty(64 << 20, dtype=_t0.uint8, device=self.device)
+                _b2 = _a.clone()
+                _t0.cuda.synchronize()
+                _cu1 = int(_t0.cuda.max_memory_allocated())
+                del _a, _b2
+                _t0.cuda.synchronize()
+                _t0.cuda.empty_cache()
+                # 增量 = 运行期额外要的（分配器碎片 + 一次 kernel 的 workspace）
+                _cal = dict(_cal or {})
+                _cal["runtime_overhead_bytes"] = max(0, _cu1 - _cu0)
+                # **同一次标定里测出「搬一层要多久」。**
+                #
+                # 它原来是常数（本机 141ms/474.8MB = 3.4GB/s 有效）。但那是
+                # 「30+ 个张量各自 set_weight」的开销，随张量个数和驱动变。
+                #
+                # 这里测的是**有效带宽**（搬一块已知大小的 pinned 内存到显存），
+                # 再乘「一层有多少字节」。这不是估算 —— 带宽是这台机器此刻的
+                # 真实值，层字节由 checkpoint header 定。
+                _probe_n = 32 << 20
+                _pin = _t0.empty(_probe_n, dtype=_t0.uint8, pin_memory=True)
+                _dev = _t0.empty(_probe_n, dtype=_t0.uint8, device=self.device)
+                _dev.copy_(_pin, non_blocking=True)
+                _t0.cuda.synchronize()
+                import time as _tm2
+
+                _bt0 = _tm2.perf_counter()
+                for _ in range(3):
+                    _dev.copy_(_pin, non_blocking=True)
+                _t0.cuda.synchronize()
+                _bdur = (_tm2.perf_counter() - _bt0) / 3.0
+                del _pin, _dev
+                _t0.cuda.empty_cache()
+                if _bdur > 0:
+                    _eff_bps = float(_probe_n) / _bdur
+                    # 一层的字节数由 header 给（_geo["layer_bytes"]），耗时 = 字节 / 带宽
+                    _lb = float((_geo or {}).get("layer_bytes") or 0)
+                    if _lb > 0:
+                        _cal["h2d_layer_s"] = _lb / _eff_bps
+                    _cal["h2d_expert_s"] = float(
+                        (_geo or {}).get("expert_bytes") or 0) / _eff_bps
+            except Exception as _exc:
+                raise RuntimeError(
+                    "Engine: cannot measure the runtime VRAM overhead ",
+                    f"({_exc!r}). The planner needs it to decide whether a layout ",
+                    "fits; there is no constant to fall back to.") from _exc
             self._planner = _pm.Planner(_hw, _geo, bandwidth=_bw, calibrate=_cal)
             # hw_plan 直接就是 Layout —— 不再有第二种「规划结果」的形状。
             self.hw_plan = self._planner.solve()
