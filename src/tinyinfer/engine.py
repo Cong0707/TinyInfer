@@ -3266,12 +3266,26 @@ class Engine:
         _slots0 = getattr(getattr(self, "expert_store", None), "slots", None)
         if getattr(_slots0, "_slot_tab", None) is None:
             return False
+        # 槽位的 arena 必须已经建好。图里那条纯 GPU 路径要按 arena 的行地址
+        # 索引专家，arena 没建（0 blocks / 0 buffers）时它会直接抛
+        # "pure-GPU path unavailable"。这不是「有层在流式」的问题 ——
+        # 是「槽位池还没分配过」的问题，等第一次 forward 之后就有了。
+        _bufs = getattr(_slots0, "_buffers", None)
+        if not _bufs:
+            return False
         if not getattr(self.tier, "cuda_graph", False):
             return False
         if self.device == "cpu" or ids.shape[1] != 1:
             return False
-        if self.gpu_layers < self.max_layers:
-            return False
+        # **流式层不阻止 CUDA graph**（这里原来有一条 `gpu_layers < max_layers`
+        # 就拒绝的检查，没有任何依据）。槽位表是设备端 buffer，地址固定；
+        # 图固化的是那张表的**地址**，不是内容 —— 重放时 kernel 通过
+        # index_select 读它，读到的是当步最新的 (layer,expert)->slot 映射。
+        # 所以捕获后照样可以动态替换专家槽位，只要：
+        #   1. 表本身地址不变（用 table_flush 原地写，不重建）
+        #   2. 图里不包含 H2D（搬运在 replay 前后做）
+        # 真实障碍是下面注释里那批（scratch/y_buf/KV 环形槽不在 graph pool），
+        # 不是「有层在流式」。
         # 捕获期禁止任何 H2D 互拷，而慢路径的 serve() 里就有一次
         # indices.tolist()（D2H）。纯 GPU 路径（_forward_gpu_only）不含这种
         # 调用，所以只在槽位表已经建好、也就是 pin 之后才允许捕获 ——

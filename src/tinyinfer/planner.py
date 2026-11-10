@@ -46,6 +46,13 @@ MB = 1 << 20
 # 引擎要用它来给槽位池留运行期余量（拿满 free 会在 activation 上 OOM）。
 # 这个量是「运行时的真实需求」，不是机器常数 —— 它由 kernel 的 tile 形状定，
 # 换模型（行长不同）会变，所以放在规划器里作为可标定项。
+# fits() 判据里显存的可用比例。**只在这里定义一次。**
+#
+# used_bytes 不算 rope 表、KV cache、activation、cuBLAS handle、分配器碎片。
+# 实测：按 0.94（7.46/7.93GB）留 470MB 不够，14 层布局在 rope_cache 里
+# 抛 !handles_ INTERNAL ASSERT。0.85 留 ~1.2GB 够用。
+_FITS_FRACTION = 0.85
+
 WS_BASE = 0.20 * GB
 WS_PER_TOKEN = 0.02 * GB
 
@@ -239,6 +246,24 @@ class Planner:
 
         # 计算：每步都要过全部层，与布局无关。用实测的每层计算耗时。
         compute_s = float(self.compute_per_layer_s or 0.0025) * n
+
+        # **全常驻解锁 CUDA graph，这是目标函数里之前漏掉的一整块。**
+        #
+        # engine._graph_capture_shape 有一条硬条件：`gpu_layers < max_layers`
+        # 就直接返回 False。也就是说只要有层在流式，整个 CUDA graph 都用不了，
+        # 每步都走 eager：40 层 x 几十个 Python kernel 调用、每次 forward 重新
+        # 调度、wall 和 CUDA 汇总之间那 300ms 的空转全在这里。
+        #
+        # 实测（单 token，wall=3065ms）：
+        #   CUDA 汇总 2750ms，空转 ~300ms（graph 关闭时的调度开销）
+        # 全常驻时这 300ms 归零，而且 graph 还能消掉 kernel 之间的 gap。
+        #
+        # 所以全常驻的收益不只是「省掉流式搬运」，还有「解锁 graph」。
+        # 这一项不进目标函数的话，规划器永远选不到全常驻 —— 而它本该在
+        # 「搬 33 层花 0.94s」和「全常驻 + graph」之间做正确取舍。
+        if lay.resident >= n:
+            graph_gain = float(self._tunable("graph_gain_s", 0.30, float) or 0.30)
+            compute_s = max(0.0, compute_s - graph_gain)
         return Cost(stream_s=stream_s, expert_s=expert_s, compute_s=compute_s)
 
     # ---- 资源约束 ---------------------------------------------------------
@@ -262,15 +287,32 @@ class Planner:
             b += self.embed_b
         if not lay.head_on_cpu and not self.tied_head:
             b += self.head_b
-        # 层搬运的周转缓冲：非 flat 路径每层一块（同一时刻一块），flat 路径
-        # 是 BUF_COUNT 块。统一按「最坏一层 + 一个」算。
+        # 层搬运的周转缓冲：同一时刻只有一层在搬，所以一块就够（不是两块）。
+        #
+        # **用 layer_b（每层真正的权重字节）而不是 max_layer_b。**
+        # max_layer_bytes 是「含全部 384 个专家的层总字节」（本机 474.8MB），
+        # 而流式层实际只有 174.0MB 权重（实测 30 个张量）。按 474.8 算，
+        # 40 层全常驻就变成 9.68GB（实际 6.96GB），规划器于是永远选不到全常驻
+        # —— 而全常驻是唯一能启用 CUDA graph 的布局。
         if lay.resident < self.n_layers:
-            b += self.max_layer_b * 2
+            b += self.layer_b
         b += 0.20 * GB                                    # workspace
         return b
 
     def fits(self, lay: Layout) -> bool:
-        return self.used_bytes(lay) <= self.vram * 0.94
+        """这份布局装得下吗。
+
+        **0.85 不是保守，是实测出来的。**
+        """
+        # used_bytes 只算「权重 + 槽位 + workspace」。它不包含：
+        #   - rope 表（每层一份，随 seq len 长）
+        #   - KV cache（本步 seq 长度）
+        #   - activation（每层中间张量，bf16 5120 宽）
+        #   - cuBLAS handle、分配器碎片、torch graph 私有池
+        # 实测：按 0.94 卡（7.46/7.93GB）留下的 470MB 不够，14 层布局在
+        # rope_cache.get_table 里 OOM（!handles_ INTERNAL ASSERT）。
+        # 按 0.85 留 ~1.2GB，足够这些运行时开销。
+        return self.used_bytes(lay) <= self.vram * _FITS_FRACTION
 
     # ---- 求解 -------------------------------------------------------------
 
@@ -288,7 +330,13 @@ class Planner:
             for embed_cpu, head_cpu in ((False, False), (True, False), (True, True)):
                 probe = Layout(resident=resident, slots=0,
                                embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
-                free = self.vram * 0.94 - self.used_bytes(probe)
+                # **算槽位用的余量和 fits() 的判据必须一致。**
+                # 原来这里用 *0.94、fits() 用 *0.85，于是「按 0.94 挤出
+                # 来的最大槽位数」永远通不过 fits -- 14/60 算出 used=6.79GB
+                # < 7.45GB(0.94) 但 > 6.74GB(0.85)，直接被拒，求解器一路
+                # 退到 resident=0 slots=0，引擎于是拿不到 expert_store，
+                # 报 "arena unusable: 0 blocks"。
+                free = self.vram * _FITS_FRACTION - self.used_bytes(probe)
                 if free < 0:
                     continue
                 slots = int(free // max(1.0, self.expert_b)) if self.expert_b > 0 else 0
