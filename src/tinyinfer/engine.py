@@ -2965,9 +2965,10 @@ class Engine:
                                     self._v5_pending[nxt] = self._stream_prefetch(nxt, self._v5_stream)
                     except Exception:
                         self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
-                        b.to(self.device)
+                        b.to(self.device, streamed=True)
                 else:
-                    b.to(self.device)
+                    # streamed 层复用 staging；常驻层独立分配。
+                    b.to(self.device, streamed=True)
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()

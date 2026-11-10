@@ -289,7 +289,7 @@ class Block(HCBlockMixin):
         self._flat_order = order
         self._cpu_refs = {self._wkey(o, n): t for (o, n, t) in paths}
 
-    def to(self, device):
+    def to(self, device, streamed: bool = False):
         """Move/preload this block's weights.
 
         Weights are read-only at inference time: to CPU only swaps the original
@@ -379,11 +379,17 @@ class Block(HCBlockMixin):
                 #
                 # 正确形态：模块级一块，所有 block 共用。同一时刻只有一层在搬
                 # （层是依次算完的），所以一块够；按「见过的最大层」扩容。
-                _wbuf = _stage_buffer(device)
-                if _wbuf.numel() < int(total):
-                    _wbuf = _stage_grow(int(total), device)
-                _wbuf[:int(total)].copy_(st[:total], non_blocking=False)
-                gpu = _wbuf[:int(total)]
+                # 同上：streamed 层复用，常驻层独立。
+                if streamed:
+                    _wbuf = _stage_buffer(device)
+                    if _wbuf.numel() < int(total):
+                        _wbuf = _stage_grow(int(total), device)
+                    _wbuf[:int(total)].copy_(st[:total], non_blocking=False)
+                    gpu = _wbuf[:int(total)]
+                else:
+                    _wbuf = torch.empty(int(total), dtype=torch.uint8, device=device)
+                    _wbuf.copy_(st[:total], non_blocking=False)
+                    gpu = _wbuf
                 for (owner, name, t), o, n in zip(paths, offsets, nbytes):
                     set_weight(owner, name, gpu[o:o + n].view(t.dtype).view(t.shape))
             else:
@@ -399,14 +405,26 @@ class Block(HCBlockMixin):
             #
             # 复用要点：同一时刻只有一层在使用这块缓冲（层是依次算完的），
             # 所以一块就够。但**必须按层尺寸扩容**，不能共用一小块。
+            # **streamed 层复用一块 staging；常驻层各自独立。**
+            #
+            # 两条约束同时成立：
+            #   1. 常驻层的权重必须独立存活（40 层 = 19GB），不能共用。
+            #   2. streamed 层算完就丢，必须复用，否则 33 x 475MB = 15.7GB。
+            #
+            # 所以按「这层是不是 streamed」分流 —— 而不是我之前那样一刀切：
+            # 共享（streamed 层互相覆盖权重 → 数值错）或独立（streamed 层累积
+            # → OOM）。
             _need = 0
             for (_, _, t) in paths:
                 _need = (_need + 255) // 256 * 256
                 _need += t.numel() * t.element_size()
             _need = (_need + 255) // 256 * 256
-            _buf = _stage_buffer(device)
-            if _buf.numel() < int(_need):
-                _buf = _stage_grow(int(_need), device)
+            if streamed:
+                _buf = _stage_buffer(device)
+                if _buf.numel() < int(_need):
+                    _buf = _stage_grow(int(_need), device)
+            else:
+                _buf = torch.empty(int(_need), dtype=torch.uint8, device=device)
             # **逐个张量搬也要走直接 DMA。**
             #
             # copy_ 对「源是 pool 切片」的情况会先做 pageable staging memcpy
