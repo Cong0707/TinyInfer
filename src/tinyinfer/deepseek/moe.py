@@ -135,6 +135,26 @@ def _swiglu2(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor
 _MOE_FUSED: dict = {}
 
 
+def _expert_batches(routes: list[list[int]], capacity: int) -> list[tuple[int, int]]:
+    """Partition rows by their actual expert union without losing contributions."""
+    if capacity <= 0:
+        raise ValueError("expert capacity must be positive")
+    batches = []
+    first = 0
+    active = set()
+    for row_index, row in enumerate(routes):
+        wanted = set(row)
+        if not wanted or len(wanted) > capacity:
+            raise RuntimeError("one routing row exceeds planned expert capacity")
+        if len(active | wanted) > capacity:
+            batches.append((first, row_index))
+            first, active = row_index, set()
+        active.update(wanted)
+    if active:
+        batches.append((first, len(routes)))
+    return batches
+
+
 class Expert:
     """One SwiGLU FFN; routed experts are fp4, the shared expert is fp8."""
 
@@ -523,118 +543,43 @@ class MoE:
         return hit
 
     def _forward_gpu_only(self, x: torch.Tensor, xf: torch.Tensor,
-                          indices: torch.Tensor, weights: torch.Tensor):
-        """整层不碰 CPU 的 decode 路径；走不通返回 None，由调用方回落慢路径。
-        自包含：只吃 x / xf / indices / weights 和槽位表，不引用 forward 后面才定义的
-        任何变量（上一版「挪一处崩一处」正是因为这个）。量化、累加 buffer 都在这里建。
-        """
-        if (__import__("os").environ.get("TI_GPUDBG") == "1"
-                and torch.cuda.is_current_stream_capturing()):
-            print(f"[capt] L{self.layer_id}", flush=True)
+                          indices: torch.Tensor, weights: torch.Tensor, *, route_rows=None):
+        """按真实路由供货，每个计算批次持有完整专家租约。"""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("MoE graph capture requires an external route-resolution stage")
         if not xf.is_cuda:
             raise RuntimeError(f"MoE layer {self.layer_id}: not cuda")
-        # 多行 prefill 分批：整批 6 行要 1440 个 (layer, expert) 槽位，8GB 卡的
-        # 池子撑不住，3 行一批（720）才放得下。这是小卡能跑起来的前提，不能去掉。
-        # 每批之间必须先同步再换参数（见下），否则异步 kernel 会读到被复用的显存。
-        # 分批阈值：**由槽位池容量决定，不写死**。
-        #
-        # 分批的初衷：一次 `rows * topk` 个专家请求如果超出槽位池，池子会在
-        # 这一批里反复覆盖，命中率归零。11 行 x 6 = 66 个请求 vs 8GB 卡的 14 个
-        # 槽位 —— 必须分；L20 的 1359 个槽位 —— 66 个绰绰有余，根本不需要分。
-        #
-        # 而且实测（docs/README.md）：**分批路径有多行 NaN bug**，
-        # 位置随批次大小移动、加任何 hook 就消失（数据竞争，打印法追不到）。
-        # 不分批时 N=8/11/12/16/20 全部正确。
-        #
-        # 所以默认策略是：槽位够就**整批跑**（正确且更快），不够才分批。
-        _env_bs = __import__("os").environ.get("TI_MOE_BATCH")
-        if _env_bs:
-            _moe_bs = max(1, int(_env_bs))
-        else:
-            _rows = int(xf.size(0))
-            _topk = max(1, int(indices.numel()) // max(1, _rows))
-            _sl = getattr(getattr(self, "_expert_store", None), "slots", None)
-            _cap = int(getattr(_sl, "slots", 0) or 0)
-            # 实测（docs/README.md）：8GB 卡**不分批**时能跑
-            # N=20..192 的 prefill，全部不 OOM。
-            #
-            # 试过「槽位不够就按 cap//topk 分批」，**没有改善**（误差从 0.0085
-            # 变成 0.0123）：分批后每批 2 行 x 6 = 12 个专家请求，池子 14 个，
-            # 表面上装得下，但同一层的 urgent 槽位在批次之间仍会互相驱逐
-            # （`layer_begin()` 每批都清 urgent，前一批的槽位立刻变成可抢）。
-            # 要真正修需要「整层一次性占满槽位」，而 8GB 卡只有 14 个、
-            # 一层要 48 个 —— 做不到。
-            #
-            # 因此默认整批。8GB 卡上的 MoE 数值误差是显存容量的物理后果，
-            # 在 L20（1359 槽位）上不存在。
-            _moe_bs = max(_rows, 1)
-        if xf.size(0) > _moe_bs:
-            _outs = []
-            for _s0 in range(0, xf.size(0), _moe_bs):
-                _s1 = min(_s0 + _moe_bs, xf.size(0))
-                # x 一定是 [rows, dim]（forward 里 view(-1, dim) 之后才进来），
-                # 所以按第一维切就行。以前写的是 x[:, a:b]，那是按第二维切 ——
-                # 多行时切错轴，输出形状对不上（shape [2,3,5120] invalid）。
-                _x = x[_s0:_s1] if x.dim() == 2 else x.reshape(-1, x.shape[-1])[_s0:_s1]
-                _o = self._forward_gpu_only(_x, xf[_s0:_s1],
-                                            indices[_s0:_s1], weights[_s0:_s1])
-                if _o is None:
-                    raise RuntimeError(
-                        f"MoE layer {self.layer_id}: rows {_s0}-{_s1} unavailable "
-                        f"[{getattr(self, '_gpu_fail', '?')}]")
-                # 顺序要紧：**先同步，再 clone**。
-                # _o 是 _gpu_y_buf 的 view（.to(bf16) 对 bf16 是 no-op），而写它的
-                # kernel 是异步 launch 的。之前写成 clone 在前、synchronize 在后，
-                # 克隆到的可能是写了一半的数据 —— 实测证据：同一份 11 行输入，
-                # 批次 3/4/6 出现 NaN（位置随批次移动：3->[10]、4->[8,9]、6->[10]），
-                # 而批次 2/8/11 完全干净。这是「跨批共享 buffer + 竞态」的典型指纹。
-                torch.cuda.synchronize()
-                # 下一批会覆盖 _sids_buf / _launch_keep：driver-API 的 kernel 不
-                # 认 Python 引用，这里的等待也是所有跨批共享状态的唯一屏障。
-                # 换形状会重建并释放 _gpu_y_buf，所以必须在这里就把数据拷走。
-                _outs.append(_o.clone())
-            # 每批的形状是 [rows_i, dim]（x 在 forward 里已经 view(-1, dim)），
-            # 所以按第 0 维拼回 [rows, dim]。以前写的是 dim=1（那是 [b, s, d]
-            # 时代的形状），多行时直接 RuntimeError: Sizes of tensors must match。
-            _cat = torch.cat(_outs, dim=0)
-            # 还原成调用方给的形状：forward 里 xf = x.view(-1, dim)，但上层
-            # （hc_post 等）按四维 [b, s, hc, d] 处理 residual/x，形状不一致
-            # 会抛 "size of tensor a (2) must match ... (4)"。
-            return _cat.view(x.shape[:-1] + (_cat.shape[-1],))
-        sl = getattr(getattr(self, "_expert_store", None), "slots", None)
-        if sl is not None and not getattr(sl, "_arena", None):
-            try:
-                sl._ensure()
-                if not getattr(sl, "_arena", None):
-                    raise RuntimeError(f"MoE layer {self.layer_id}: slots _ensure did not build arena")
-            except Exception as _exc:
-                # 不要静默吞掉：arena 分配失败是「这块卡再也放不下专家」的唯一信号，
-                # 吞掉之后下游只会看到一句 line 375。
-                import os as _os
-                if _os.environ.get("TI_SLOT_DEBUG") == "1" or not getattr(self, "_arena_warned", False):
-                    self._arena_warned = True
-                    print(f"[arena] layer {self.layer_id}: slots={getattr(sl, 'slots', '?')} "
-                          f"buffers={len(getattr(sl, '_buffers', []) or [])} "
-                          f"blob={getattr(sl, 'blob_bytes', '?')} exc={_exc!r}", flush=True)
-        tab = getattr(sl, "_slot_tab", None) if sl is not None else None
-        arena = getattr(sl, "_arena", None) if sl is not None else None
-        # **arena 现在是多块的，判据从「恰好一块」改成「有块且每块都在」**
-        #
-        # 槽位池原先一次性 torch.empty((n, blob)) 申请；超过约 1GB 会撞上 c10 的
-        # "!handles_.at(i) INTERNAL ASSERT FAILED"，于是 180/200/240 个槽位全部
-        # 建不起来，而显存其实够。现在按每块 32 个槽位分多块申请。
-        #
-        # 这条判断原来写的是 len(arena) != 1，分块之后恒为真，于是每个 MoE 层
-        # 都立刻退化成 "pure-GPU path unavailable [line 375]" —— 分块本身是对的，
-        # 是这里把「一块」当成了「槽位池存在」的同义词。
-        _arena_ok = bool(arena) and all(a is not None for a in arena)
-        if not _arena_ok or not getattr(sl, "_buffers", None):
-            self._gpu_fail = "line 375 (arena unusable: %d blocks, %d buffers)" % (
-                len(arena or []), len(getattr(sl, "_buffers", []) or []))
-            return None
-        if tab is None:
-            # 表是懒建的。warmup 阶段还没有路由统计，先建全 -1，miss 分支会填。
-            tab = sl.slot_table(int(getattr(self, "_n_layers_hint", 40) or 40), 384)
+        # gemv_row consumes complete warp tiles: 32 lanes, eight values per lane.
+        reduction_tile = 32 * 8
+        if self.cfg.dim % reduction_tile or self.cfg.moe_inter_dim % reduction_tile:
+            raise ValueError("fused MoE reduction dimensions must be multiples of 256")
+        sl = getattr(self._expert_store, "slots", None)
+        if sl is None:
+            raise RuntimeError("MoE requires a planned expert slot pool")
+        sl._ensure()
+        arena = sl._arena
+        if (len(arena) != 1 or arena[0].device != xf.device
+                or arena[0].shape != (sl.slots, sl.blob_bytes)):
+            raise RuntimeError("fused MoE requires one contiguous arena on the compute device")
+        routes = indices.tolist() if route_rows is None else route_rows
+        if len(routes) != xf.shape[0] or not routes:
+            raise ValueError("MoE routing rows must match the input")
+        wanted = sorted({int(expert) for row in routes for expert in row})
+        if any(expert < 0 or expert >= self.cfg.n_routed_experts for expert in wanted):
+            raise ValueError("MoE route is outside the model's expert range")
+        batches = _expert_batches(routes, sl.slots)
+        if len(batches) > 1:
+            outputs = []
+            for first, last in batches:
+                out = self._forward_gpu_only(xf[first:last], xf[first:last],
+                                             indices[first:last], weights[first:last],
+                                             route_rows=routes[first:last])
+                outputs.append(out.clone())
+                # Native launches retain raw pointers; complete each slice before resizing scratch.
+                torch.cuda.current_stream(xf.device).synchronize()
+            return torch.cat(outputs, dim=0).view(x.shape)
+        mgr = self._tier_manager()
+        lease = None
         try:
             from ..kernels import native
             from ..kernels.quant import act_quant as _act_q
@@ -644,102 +589,29 @@ class MoE:
             # inplace 必须是 False —— inplace=True 返回的是「量化后再还原的 bf16」，
             # 只有一个值；这里要的是 (fp8 张量, scale) 这一对。
             aq, asc = _act_q(xf, 32, "ue8m0", torch.float8_e8m0fnu, False)
-            # 路由计数（pin 用）。原来在 serve() 里更新，那条路删掉后这里补上：
-            # 只在还没 pin 的时候统计，pin 之后路由恒定，不必再花这次 D2H。
-            if (not getattr(self, "_all_pinned", False)
-                    and not torch.cuda.is_current_stream_capturing()):
-                _rc = self._route_counts
-                for _e in indices.view(-1).tolist():
-                    _rc[int(_e)] = _rc.get(int(_e), 0) + 1
-            if __import__("os").environ.get("TI_GPUDBG") == "1":
-                print(f"[idx] L{self.layer_id} max={int(indices.max())} "
-                      f"shape={tuple(indices.shape)}", flush=True)
-            # 写进持久 buffer：index_select 每次新建张量，driver-API 的 kernel 只拿裸
-            # 指针，函数返回后这批显存会被 allocator 立刻复用（多行 prefill 时就是
-            # slot_ids 读到 INT_MAX、权重地址偏 4e16 的来源）。原地写同一块 buffer，
-            # 生命周期就不再依赖 Python 引用。
-            _sn = int(indices.numel())
-            _sb = getattr(self, "_sids_buf", None)
-            if _sb is None or _sb.device != xf.device or _sb.numel() < _sn:
-                _sb = torch.empty(max(4096, _sn), dtype=torch.int32, device=xf.device)
-                self._sids_buf = _sb
-            sids = _sb[:_sn]
-            torch.index_select(tab[self.layer_id], 0,
-                               indices.view(-1).clamp_(0, 383), out=sids)
-            _mgr = self._tier_manager()
-            # 本层开始：它要用的专家从这一刻起不许被别的层顶掉，直到本层算完。
-            # 否则同一层的 6 个专家会互相覆盖（实测 hits=0，每步重搬 768 次）。
-            if not torch.cuda.is_current_stream_capturing():
-                _mgr.layer_begin()
-            _async = self._async_experts()
-            # GPU 侧一次性完成「检查缺谁 + 发布请求 + 等 CPU 备好」。
-            # 主机在这里不做任何同步：不 item()、不 tolist()、不拿中间产物。
-            # 这是用户要的「买家下单，卖家发货，买家自己等货」—— 以前每层
-            # 要把 miss 计数拉回主机（40 层 x 3.3ms = 130ms/token）。
-            # 判断缺谁：GPU 侧扫（kernel），但**不在 GPU 上等** ——
-            # 自旋等待会和主线程的 commit 互相等死（GPU 等就绪，就绪要 commit，
-            # commit 排在自旋后面）。所以这里只取回「缺了哪几个」（一次小 D2H，
-            # 只有真有缺失时才发生），由主线程备货后放行。
-            _nmiss = 0
-            if (not getattr(self, "_all_pinned", False)
-                    and not torch.cuda.is_current_stream_capturing()):
-                _nmiss = self._miss_scan(sids, indices, int(indices.numel()))
-            # **缺失队列长度要能被观测，它是调优的对象。**
-            #
-            # GPU 侧扫出来「本层缺哪些专家」，CPU 侧按这个队列轮流填充。队列多长
-            # 直接决定了这一步要等多久的 IO —— 太长说明槽位不够或预取不够积极，
-            # 太短说明槽位/预取过剩、白占显存。autotune 的 PID 用它做反馈量。
-            #
-            # 记两个数：
-            #   last   本层这一跳的缺失数（瞬时）
-            #   total  本步累计（跨层），用来算「一步要搬多少个专家」
-            # 只在槽位池存在时记，否则没有意义。
-            if sl is not None:
-                try:
-                    _st = _mgr.stats if _mgr is not None else None
-                    if isinstance(_st, dict):
-                        _st["queue_last"] = int(_nmiss)
-                        _st["queue_total"] = int(_st.get("queue_total", 0)) + int(_nmiss)
-                        _st["queue_layers"] = int(_st.get("queue_layers", 0)) + 1
-                        _peak = int(_st.get("queue_peak", 0))
-                        if _nmiss > _peak:
-                            _st["queue_peak"] = int(_nmiss)
-                except Exception:
-                    pass
-            if _nmiss:
-                _miss = sorted(self._miss_ids_host[:_nmiss].tolist())
-                if _miss:
-                    # **need() 要的是「本层全部想用的专家」，不是「已经确认缺失的」。**
-                    # 它内部自己做 `miss = [e for e in want if 不在槽位]`，然后
-                    # `stats["vram_hit"] += len(want) - len(miss)`。
-                    #
-                    # 以前这里传的是 _miss 本身，于是 len(want) == len(miss)，
-                    # vram_hit 恒等于 0 —— 观测上表现为「槽位搬了 2600 多次，
-                    # 显存命中率 0%」，而实际命中是有的。
-                    #
-                    # want 用本步路由到的全部专家（_last_ids 是去重后的），
-                    # 这样 vram_hit 才等于「本来就够用、不需要搬」的专家个数。
-                    # want 用本步路由到的全部专家（_last_ids 是去重后的）。
-                    #
-                    # **不要改成 _miss。** 我试过，成绩从 8624ms 掉到 19998ms。
-                    # 原因：_last_ids 装得宽，是为了让槽位**预先覆盖多个 token 的
-                    # 专家集合**；下一 token 路由到其中任何一个都是命中。改成只装
-                    # 当前缺失的，等于每步都从零开始装，槽位永远没有预热。
-                    #
-                    # 852~896 次装载是「宽装」的代价，也是「下步命中」的来源。
-                    _want = getattr(self, "_last_ids", None) or _miss
-                    _mgr.need(self.layer_id, _want)
-                    _mgr.commit(self.layer_id)
-                    _mgr.ready(self.layer_id, _miss)
-            tab = sl._slot_tab   # 池子自有的 device 表，下面立刻索引用
-            torch.index_select(tab[self.layer_id], 0,
-                               indices.view(-1).clamp_(0, 383), out=sids)
-            # 把本层路由告诉卖家，让它提前备下一层要用的（不阻塞）。
-            # 这里不再主动「还槽位」。
-            # 原来按「池子装不下整步（40 层 x topk）」判断，小卡每步把整层用过的
-            # 专家全扔回去 —— 于是每一步每一层都要重读 4.5GB，8GB 卡永远在
-            # 1 tok/s 上趴着。槽位池本来就是覆盖式的：空槽用完就按游标覆盖最老
-            # 的那个，用不到的专家自然被顶掉，不需要谁专门去释放。
+            for row in routes:
+                for expert in row:
+                    self._route_counts[expert] = self._route_counts.get(expert, 0) + 1
+            mgr.layer_begin()
+            try:
+                staged = mgr.need(self.layer_id, wanted)
+                mgr.commit(self.layer_id)
+                lease = mgr.ready(self.layer_id, wanted)
+            except BaseException:
+                sl.cancel_request(self.layer_id, wanted)
+                raise
+            mgr.stats["queue_last"] = staged
+            mgr.stats["queue_total"] = mgr.stats.get("queue_total", 0) + staged
+            mgr.stats["queue_layers"] = mgr.stats.get("queue_layers", 0) + 1
+            mgr.stats["queue_peak"] = max(mgr.stats.get("queue_peak", 0), staged)
+            tab = mgr.table()
+            sl.table_flush(self.layer_id)
+            count = indices.numel()
+            slot_ids = getattr(self, "_sids_buf", None)
+            if slot_ids is None or slot_ids.device != xf.device or slot_ids.numel() < count:
+                slot_ids = self._sids_buf = torch.empty(count, dtype=torch.int32, device=xf.device)
+            sids = slot_ids[:count]
+            torch.index_select(tab[self.layer_id], 0, indices.reshape(-1), out=sids)
             _nrows = int(xf.size(0))
             n_exp = int(indices.numel())   # 多行时 = rows * topk
             nmid = int(self.cfg.moe_inter_dim)
@@ -834,7 +706,10 @@ class MoE:
                 print(f"[gpufail] {_exc!r}", flush=True)
                 _tb.print_exc()
             self._gpu_fail = f"exc {_exc!r}"
-            return None
+            raise
+        finally:
+            if lease is not None:
+                mgr.release(self.layer_id, lease)
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
                  max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
@@ -1014,32 +889,10 @@ class MoE:
         # compatible with input tensor's size and stride"。这一次整理很便宜。
         if not indices.is_contiguous():
             indices = indices.contiguous()
-        # 只记「本层这一步路由到哪几个专家」（引擎统计路由频率要用）。
-        # 槽位怎么回收不归这里管：池子是「空槽优先 + 环形游标覆盖」，
-        # 不存在需要专门去释放的对象，也就没有「忘了释放」这种 bug。
-        if not torch.cuda.is_current_stream_capturing():
-            self._last_ids = sorted({int(v) for v in indices.view(-1).tolist()})
-        # 整层不碰 CPU 的 decode 路径：槽位表齐了就接管，否则返回 None 回落慢路径。
-        _lid = getattr(self, "_last_ids", None)
-        _gpu_only = self._forward_gpu_only(x, xf, indices, weights)
-        # 本层算完了，把引用还回池子：release() 只把 refs 减到 0、state 打回
-        # STAGED，数据仍然留着（下一步路由到同一个专家就是命中）。只有池子
-        # 真的要用这一格时才会被覆盖，而覆盖前 loading 的 DMA 会 wait 下面
-        # 记的这个事件 —— kernel 是异步 launch 的。表不清：专家还住着。
-        if (_lid and not torch.cuda.is_current_stream_capturing()):
-            _slr = getattr(getattr(self, "_expert_store", None), "slots", None)
-            if _slr is not None:
-                for _se in _lid:
-                    if _slr._by_key.get((self.layer_id, _se)) is not None:
-                        _slr.release(self.layer_id, _se)
-        if _gpu_only is not None:
-            # official model.py:905 `y += self.shared_experts(x)` —— 每个 token 都过一遍
-            # shared expert，它和 routed 部分是相加关系。之前这条累加在纯 GPU 路径里
-            # 整段缺失，每层都少一个专家的贡献。
-            _sh = self.shared.forward(xf).reshape(_gpu_only.shape)
-            return (_gpu_only.float() + _sh.float()).to(x.dtype)
-        # eager / serve 路径已整段删除：MoE 只有纯 GPU 这一条路。
-        raise RuntimeError(
-            f"MoE layer {self.layer_id}: pure-GPU path unavailable "
-            f"[{getattr(self, '_gpu_fail', '?')}] "
-            f"(cuda={xf.is_cuda} rows={xf.size(0)})")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("MoE graph capture requires an external route-resolution stage")
+        routes = indices.tolist()
+        self._last_ids = sorted({int(expert) for row in routes for expert in row})
+        routed = self._forward_gpu_only(x, xf, indices, weights, route_rows=routes)
+        shared = self.shared.forward(xf).reshape(routed.shape)
+        return (routed.float() + shared.float()).to(x.dtype)

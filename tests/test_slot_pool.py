@@ -21,11 +21,12 @@ def pool():
     cache = VramSlotCache(8, BLOB, device="cuda", dtype=torch.uint8,
                           pin_staging=True, slot_arena=True)
     cache._ensure()
-    return cache
+    yield cache
+    cache.synchronize()
 
 
 def _loader(layer, want):
-    return {int(e): bytes([int(e) & 0xFF]) * BLOB for e in want}
+    return {int(e): bytearray([int(e) & 0xFF]) * BLOB for e in want}
 
 
 def test_coverage_allocation_never_wedges(pool):
@@ -37,8 +38,8 @@ def test_coverage_allocation_never_wedges(pool):
         for e in want:
             idx = pool._by_key.get((0, e))
             assert idx is not None and 0 <= idx < pool.slots
-        # 一层算完：它的槽位降级成「历史」，可以被下一层覆盖
-        pool.clear_urgent()
+        pool.wait_ready(pool.acquire_ready(0, want))
+        # 一层算完后归还本次读租约，数据仍可缓存。
         for e in want:
             pool.release(0, e)
 
@@ -68,6 +69,7 @@ def test_resident_experts_are_not_reloaded(pool):
 def test_release_keeps_the_slot_resident(pool):
     """release 只把引用还给池子，槽位和数据都还在（覆盖时才真的换人）。"""
     pool.ensure(0, [5, 6], _loader)
+    pool.wait_ready(pool.acquire_ready(0, [5, 6]))
     for e in (5, 6):
         pool.release(0, e)
     assert pool._by_key[(0, 5)] is not None

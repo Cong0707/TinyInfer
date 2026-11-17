@@ -145,35 +145,26 @@ class ShardStore:
         # adding ~17GB of private transients on top of it.
         pool = getattr(self, "build_pool", None)
         slot = pool.alloc(nbytes) if pool is not None else None
-        if slot is not None:
-            with path.open("rb") as f:
-                f.seek(data_start + start)
-                got = f.readinto(slot)
-            if got != nbytes:
-                raise ValueError(f"tensor {name} is truncated in {shard} (download incomplete)")
-            flat = torch.frombuffer(slot, dtype=torch.uint8)
-            out = flat.view(dtype).reshape(tuple(entry["shape"]))
-            # Remember which pool slice this tensor IS. The flat-streaming setup uses
-            # this to check whether a whole layer already sits in one contiguous pool
-            # region (it allocates 4096-aligned, so usually not); when it does, the layer
-            # is streamed from its own bytes and the pinned slab never makes a second
-            # copy, which is the 5GB that currently starves it.
-            out._tiny_pool_mv = slot
-            # 记录在池子里的绝对偏移，好让常驻层上显存之后把这段还回去。
-            # 不用「池子上次分配的位置」这种跨线程变量 —— alloc 会被多个构建
-            # 线程并发调用，那个值会串号。直接拿这块内存的地址减池子基址，
-            # 这才是这块 slice 自己的身份。
+        if pool is not None:
+            if slot is None:
+                raise MemoryError(f"planned host pool cannot load {name}: {nbytes} bytes")
+            import ctypes
+            offset = ctypes.addressof(ctypes.c_char.from_buffer(slot)) - pool._base
             try:
-                import ctypes as _ct
-
-                _addr = _ct.addressof(_ct.c_char.from_buffer(slot))
-                _base = getattr(pool, "_base", None)
-                out._tiny_pool_off = (int(_addr - _base)
-                                      if _base is not None else -1)
+                with path.open("rb") as f:
+                    f.seek(data_start + start)
+                    got = f.readinto(slot)
+                if got != nbytes:
+                    raise ValueError(f"tensor {name} is truncated in {shard} (download incomplete)")
+                flat = torch.frombuffer(slot, dtype=torch.uint8)
+                out = flat.view(dtype).reshape(tuple(entry["shape"]))
+                out._tiny_pool_mv = slot
+                out._tiny_pool_off = offset
+                out._tiny_pool_len = int(nbytes)
+                return out
             except Exception:
-                out._tiny_pool_off = -1
-            out._tiny_pool_len = int(nbytes)
-            return out
+                pool.release(offset, nbytes)
+                raise
         with path.open("rb") as f:
             f.seek(data_start + start)
             raw = f.read(nbytes)

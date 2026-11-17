@@ -43,6 +43,8 @@ def test_states_always_sum_to_capacity():
             p.acquire(layer, e)
         s = p.snapshot()
         assert sum(s["states"].values()) == s["slots"], s
+        for e in range(4):
+            p.release(layer, e)
 
 
 def test_occupied_matches_bookkeeping():

@@ -38,6 +38,8 @@ class ExpertTierManager:
         self.n_experts = int(n_experts)
         self.device = device
         self._lock = threading.Lock()
+        self._source_pending: dict[tuple[int, int], int] = {}
+        self._source_flights: list[tuple[tuple[int, int], Any]] = []
         # 每一级命中一次就记一次：这几个计数是「引擎到底在干什么」的唯一证据，
         # 出问题时不看代码看数字。
         self.stats = {"vram_hit": 0, "ram_hit": 0, "disk": 0,
@@ -64,89 +66,106 @@ class ExpertTierManager:
 
     # -- 备货 -------------------------------------------------------------
     def _provide(self, layer: int, experts: list[int]) -> dict[int, Any]:
-        """按 内存 -> 磁盘 的顺序把字节找出来；能进内存的顺手进内存。"""
-        out: dict[int, Any] = {}
-        missing: list[int] = []
-        for e in experts:
-            data = None
-            if self.ram is not None:
-                try:
-                    data = self.ram.get(layer, e, blocking=False)
-                except Exception:
-                    data = None
-            if data is not None:
-                out[e] = data
+        """明确区分缓存命中与磁盘读取，任何已选路径失败都直接抛出。"""
+        out = {}
+        missing = []
+        for expert in experts:
+            data = self.ram.get(layer, expert, blocking=False) if self.ram is not None else None
+            if data is None:
+                missing.append(expert)
+            else:
+                out[expert] = data
                 self.stats["ram_hit"] += 1
-            else:
-                missing.append(e)
-        if not missing:
-            return out
-        # 内存里没有：CPU 去盘上取（批量 pread，一个专家一次读）。
-        #
-        # **读的时候直接读进 pool**：以前用 `read_many` 返回 bytearray，再调
-        # `ram.admit` 把每个 18.8MB 的 bytearray 又 `slot[:] = data` 拷进 pool ——
-        # 每个专家两份 18.8MB 的内存搬运。40 层 x 240 专家 = 9600 次 x 37.6MB
-        # ≈ 361GB 的 CPU 拷贝，全部在主线程上。py-spy 三次采样全落在
-        # `_insert_locked` 的 `slot[:] = data` 那一行，就是这个原因：
-        # prefill 114 秒、decode 每步 300-1900ms，GPU 利用率 0-16%。
-        #
-        # `_read_many_pooled` 直接把字节读进 pool 的 slot，返回 memoryview，
-        # admit 见到 memoryview 就不再拷第二遍（见 _insert_locked 的注释）。
-        try:
-            blobs = [self.index.expert_blob(layer, e) for e in missing]
+        if missing:
+            blobs = [self.index.expert_blob(layer, expert) for expert in missing]
             pooled = getattr(self.ram, "_read_many_pooled", None)
-            if pooled is not None:
-                datas = pooled(blobs)
-            else:
-                datas = self.reader.read_many(blobs)
-        except Exception:
-            return out
-        for e, d in zip(missing, datas):
-            if d is None:
-                continue
-            out[e] = d
-            self.stats["disk"] += 1
-            if self.ram is not None:
-                try:
-                    self.ram.admit(layer, e, d)
-                except Exception:
-                    pass
+            data = pooled(blobs) if pooled is not None else self.reader.read_many(blobs)
+            if len(data) != len(missing) or any(value is None for value in data):
+                raise RuntimeError(f"layer {layer}: expert source read returned incomplete data")
+            for expert, value in zip(missing, data):
+                out[expert] = value
+                self.stats["disk"] += 1
+                if self.ram is not None:
+                    self.ram.admit(layer, expert, value)
         return out
 
     def need(self, layer: int, experts: Iterable[int], *, urgent: bool = True) -> int:
-        """备货（可以在任何线程）：把缺失的专家字节取出来、挑好槽位。
-
-        只做主机侧的事：查内存、读盘、挑槽位、把字节拷进 pinned 中转区。
-        **不发任何 CUDA 调用** —— 卖家线程跨线程发 CUDA 会和主线程互等死锁。
-
-        urgent=False 是预取：**只在有空槽位时**才占位，绝不为它覆盖别人正在用的
-        槽位。这一条是必须的 —— 预取和当前层抢槽位时，输的必须是预取：实测
-        不加区分地预取会让当前层自己都装不进去（"still not resident"）。
-        """
+        """供货整个实际请求，同时持有缓存源直到 H2D 完成。"""
+        want = list(dict.fromkeys(int(expert) for expert in experts))
+        if not want:
+            return 0
         if self.slots is None or not self.slots.slots:
-            return 0
-        want = [int(e) for e in experts]
-        miss = [e for e in want if (layer, e) not in self.slots._by_key]
-        self.stats["vram_hit"] += len(want) - len(miss)
-        if not miss:
-            return 0
-        self.stats["miss"] += len(miss)
-        data = self._provide(layer, miss)
-        if not data:
-            return 0
-        staged = self.slots.stage(
-            layer, list(data.keys()),
-            lambda lay, want_e: {e: data[e] for e in want_e if e in data},
-            urgent=urgent)
-        self.stats["placed"] += int(staged)
-        return int(staged)
+            raise RuntimeError(f"layer {layer}: expert supply requires a planned slot pool")
+        with self._lock:
+            self._drain_sources_locked(wait=False)
+            with self.slots._lock:
+                resident = sum((layer, expert) in self.slots._by_key for expert in want)
+            self.stats["vram_hit"] += resident
+            self.stats["miss"] += len(want) - resident
+            held = []
+
+            def provide(lay, missing):
+                if self.ram is not None:
+                    for expert in missing:
+                        key = (lay, expert)
+                        self.ram.lease(key, 1)
+                        held.append(key)
+                return self._provide(lay, missing)
+
+            try:
+                staged = self.slots.stage(layer, want, provide, urgent=urgent)
+            except BaseException:
+                for key in held:
+                    self.ram.lease(key, -1)
+                raise
+            with self.slots._lock:
+                for key in held:
+                    index = self.slots._by_key.get(key)
+                    if index is not None and index in self.slots._stage_bufs:
+                        self._source_pending[key] = index
+                    else:
+                        self.ram.lease(key, -1)
+            self.stats["placed"] += staged
+            return staged
 
     def commit(self, layer: int | None = None) -> int:
-        """把备好的货发出去（主线程调，只在本线程 stream 上）。"""
+        """提交 DMA 后按实际完成事件保留源缓存租约，包括异常退出。"""
         if self.slots is None:
-            return 0
-        return int(self.slots.commit(layer))
+            raise RuntimeError("expert commit requires a planned slot pool")
+        with self._lock:
+            try:
+                return self.slots.commit(layer)
+            finally:
+                for key, index in list(self._source_pending.items()):
+                    if layer is None or key[0] == layer:
+                        self._source_flights.append((key, self.slots._copy_events[index]))
+                        del self._source_pending[key]
+                self._drain_sources_locked(wait=False)
 
+    def _drain_sources_locked(self, *, wait: bool) -> None:
+        index = 0
+        while index < len(self._source_flights):
+            key, event = self._source_flights[index]
+            if event is not None and wait:
+                event.synchronize()
+            if event is None or wait or event.query():
+                self.ram.lease(key, -1)
+                self._source_flights.pop(index)
+            else:
+                index += 1
+
+    def drain_sources(self, *, wait: bool = False) -> None:
+        with self._lock:
+            self._drain_sources_locked(wait=wait)
+
+    def close(self) -> None:
+        self.stop_warm()
+        with self._lock:
+            for key in list(self._source_pending):
+                self.slots.cancel_request(key[0], [key[1]])
+                self.ram.lease(key, -1)
+                del self._source_pending[key]
+            self._drain_sources_locked(wait=True)
 
     # -- 给 MoE 的薄接口：它不该知道池子的内部结构 -----------------------
     @property
@@ -161,8 +180,7 @@ class ExpertTierManager:
 
     def layer_begin(self) -> None:
         """一层开始：它要用的专家从这一刻起不许被别的层顶掉。"""
-        if self.slots is not None:
-            self.slots.clear_urgent()
+        # 请求的保护在 ready/release 或取消事务时解除，不随层切换清空。
         # 告诉预热线程「我在忙」：它会在下一个 chunk 之前让路。
         # 注意不在每层结束时清掉 —— 层间没有真正的空档，一轮 40 层连着跑，
         # 清了就等于没让路。真正的空闲是「两次 forward 之间」，由 engine 清。
@@ -170,6 +188,7 @@ class ExpertTierManager:
 
     def idle(self) -> None:
         """整轮 forward 结束：预热线程可以去做「没事干时该做的事」了。"""
+        self.drain_sources()
         self._busy.clear()
 
     def capabilities(self) -> dict:
@@ -207,27 +226,28 @@ class ExpertTierManager:
             "can_hold_a_layer": bool(_slots >= _one_layer),
         }
 
-    def ready(self, layer: int, experts: Iterable[int]) -> None:
-        """让 compute stream 等这批专家的 DMA。已落地的槽位不插等待。"""
+    def ready(self, layer: int, experts: Iterable[int]) -> list[int]:
+        """完整请求一次取得读租约，再让计算流等待各自的 DMA。"""
+        wanted = list(dict.fromkeys(int(expert) for expert in experts))
+        if not wanted:
+            return []
         if self.slots is None:
-            return
-        idxs = []
-        for e in experts:
-            idx = self.slots._by_key.get((layer, int(e)))
-            if idx is not None:
-                idxs.append(idx)
-        if idxs:
-            self.slots.wait_ready(idxs)
+            raise RuntimeError(f"layer {layer}: requested experts have no slot pool")
+        indices = self.slots.acquire_ready(layer, wanted)
+        try:
+            self.slots.wait_ready(indices)
+        except BaseException:
+            self.slots.release_many(layer, wanted)
+            raise
+        return wanted
 
     def release(self, layer: int, experts: Iterable[int]) -> None:
-        """本层算完归还引用（槽位与数据仍留着，下一步命中免搬）。"""
+        """本层算完在消费者流记完成点，再归还读租约。"""
         if self.slots is None:
-            return
-        for e in experts:
-            try:
-                self.slots.release(layer, int(e))
-            except Exception:
-                pass
+            raise RuntimeError(f"layer {layer}: releasing experts without a slot pool")
+        wanted = list(dict.fromkeys(int(expert) for expert in experts))
+        if wanted:
+            self.slots.release_many(layer, wanted)
 
     # -- 空闲预热 ---------------------------------------------------------
     def start_warm(self, threads: int = 2) -> bool:
@@ -302,6 +322,9 @@ class ExpertTierManager:
 
     def stop_warm(self) -> None:
         self._warm_stop.set()
+        thread = self._warm_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
 
     def warm_progress(self) -> float:
         if self.ram is None:

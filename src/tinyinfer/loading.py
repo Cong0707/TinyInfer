@@ -932,10 +932,7 @@ class ShardIndex:
         return blob
 
     def expert_blob_bytes(self, layer: int = 0, expert: int = 0) -> int:
-        try:
-            return self.expert_blob(layer, expert).total_bytes
-        except Exception:
-            return ModelGeometry().expert_bytes()
+        return self.expert_blob(layer, expert).total_bytes
 
     def layer_of_shard(self, shard: str) -> int | None:
         for name in self.weight_map:
@@ -2155,14 +2152,10 @@ class VramSlotCache:
         self._key: list[tuple[int, int] | None] = [None] * self.slots
         self._refs = [0] * self.slots
         self._event: list[Any] = [None] * self.slots
+        self._consumer_events: list[dict[tuple[str, int], Any]] = [{} for _ in range(self.slots)]
+        self._dma_sources: list[tuple[Any, Any, Any]] = []
         self._by_key: dict[tuple[int, int], int] = {}
         self._lru: list[int] = []
-        # 被收回、但 kernel 可能还在读的槽位 -> 归还时刻的 compute stream 事件。
-        # 只有这些槽位在下次 DMA 覆盖前需要 wait；用 _event 不行，那个字段每个
-        # 槽位都有值（publish 时写的），等于每次拷贝都插一个跨 stream 同步点。
-        self._dirty: set[int] = set()
-        # 冷度时间戳（见 _claim_slot_locked）：每个槽位最后一次被用到是什么时候。
-        self._last_used: list[float] = []
         # 覆盖式分配：空槽位按 LIFO 取，取空之后环形游标扫一个「没人在用」的
         # 直接覆盖。这里刻意没有「释放」这个动作 —— 槽位在池子里转，覆盖即回收。
         # decode 稳态只要 40x6=240 个槽位，池子按 1359 开，绝大多数时候是 O(1)
@@ -2210,362 +2203,176 @@ class VramSlotCache:
 
     # -- infrastructure ---------------------------------------------------
     def _ensure(self):
-        if self._buffers or getattr(self, "_paused", False):
+        """按规划容量一次分配；同一卡上的 arena 必须连续。"""
+        if self._buffers:
             return
-        if self.slots <= 0:
-            # 槽位池是唯一路径，0 个槽位没法走到任何地方。原来这里是静默 return，
-            # 于是引擎一路跑到「专家不进显存」，谁都没发现。
-            raise RuntimeError(
-                "VRAM slot pool has 0 slots; the planner must reserve at least one "
-                "(TI_SLOTS overrides)")
+        if self._paused:
+            raise RuntimeError("expert slot pool is paused")
+        if self.slots <= 0 or self.blob_bytes <= 0:
+            raise ValueError("expert slot geometry must be positive")
         import torch
-        self._torch = torch
-        # 记下 planner 给的保守值，reinit 失败时用它回退
-        self._planner_slots = max(1, int(self.slots))
-
-        # 槽位数按「分配这一刻芯片上真实剩下的显存」决定，而不是按启动前的静态估算。
-        # planner 只能估：它不知道核函数 workspace、cuBLAS handle、KV 实际大小这些
-        # 运行时开销，所以在 44GB 的卡上它给 1359 个槽位、实际只用掉 41GB，留下 3.6GB
-        # 白放着；换一张 96GB 或 141GB 的卡，它又会估小。这里第一次真正要用槽位时
-        # （此时模型、KV、workspace 都已就位）直接问驱动还剩多少，按 blob 大小整除。
-        # 换机器不需要任何手动参数。
-        # 注意：这里**不**按 free 自动扩容。_ensure 可能在任何一次 fetch 时被
-        # 触发，那时层权重未必全部就位，free 会偏大（实测按它算出 1823 个槽位，
-        # 加模型直接 OOM）。真正的自动扩容在模型就位之后由 try_grow() 完成。
+        devices = list(self.devices or [torch.device(self.device)])
+        if len(devices) == 1:
+            counts = [self.slots]
+        else:
+            capacities = list(self.device_caps or [])
+            if len(capacities) != len(devices) or any(value < 0 for value in capacities) or sum(capacities) <= 0:
+                raise ValueError("multi-device slot pool requires planned device capacities")
+            total = sum(capacities)
+            counts = [self.slots * value // total for value in capacities]
+            order = sorted(range(len(devices)), key=lambda i: self.slots * capacities[i] % total, reverse=True)
+            for index in order[:self.slots - sum(counts)]:
+                counts[index] += 1
+        arenas, buffers, slot_devices, streams = [], [], [], {}
         dtype = self._dtype or torch.uint8
-        dev = torch.device(self.device)
-        # Multi-GPU: slots are spread over the devices in self.devices, proportional to
-        # each card's free VRAM. One arena per card and every slot remembers which card
-        # it lives on, so a fetch writes to the right memory and a consumer reads from it.
-        # With one device this is exactly the old single-arena layout (one entry covering
-        # every slot), so the single-GPU path allocates the same bytes as before.
-        _devs = list(getattr(self, "devices", None) or [dev])
-        _caps = list(getattr(self, "device_caps", None) or [1] * len(_devs))
-        try:
+        for device_index, (device, count) in enumerate(zip(devices, counts)):
+            if not count:
+                continue
             if self.slot_arena:
-                # Split the slot budget by capacity, then give each card one contiguous
-                # arena. Contiguity is kept per card so a grouped kernel can still walk
-                # one card's slots; spanning all cards is impossible anyway.
-                _tot = float(sum(_caps)) or 1.0
-                _per = [max(0, int(round(self.slots * c / _tot))) for c in _caps]
-                _left = self.slots - sum(_per)
-                if _left:
-                    _big = max(range(len(_caps)), key=lambda i: _caps[i])
-                    _per[_big] += _left
-                # 按算出来的数量分配，失败就收缩再试。真机上 free 会随加载进度变化
-                # （_ensure 可能在任何时刻被第一次 fetch 触发，那时层权重还没全就位），
-                # 一次算准不现实；缩到能放下为止比让服务起不来强。
-                _try = int(_per[0]) if len(_per) == 1 else 0
-                while True:
-                    self._arena = []
-                    self._buffers = []
-                    self._slot_dev = []
-                    try:
-                        if len(_per) == 1:
-                            _n = max(0, _try)
-                            if _n > 0:
-                                # **分多块，不要一次 torch.empty 一大块。**
-                                #
-                                # 单块申请在超过约 1GB 时会撞上 PyTorch allocator 的
-                                # "!handles_.at(i) INTERNAL ASSERT FAILED"（c10 分配器
-                                # 状态断言），而显存其实够 —— 实测 180/200/240 个槽位
-                                # （3.4/3.8/4.5GB 单块）全部失败，24 个（451MB）正常。
-                                #
-                                # 分块没有代价：槽位本来就是按行独立索引的
-                                # （_buffers 里存的是每行视图），谁来装数据都一样。
-                                # 每块 32 个槽位（约 600MB），远在安全线内。
-                                _CHUNK = 32
-                                _left = _n
-                                while _left > 0:
-                                    _take = min(_CHUNK, _left)
-                                    _a = torch.empty((_take, self.blob_bytes), dtype=dtype,
-                                                     device=_devs[0])
-                                    self._arena.append(_a)
-                                    for _s in range(_take):
-                                        self._buffers.append(_a[_s])
-                                        self._slot_dev.append(0)
-                                    _left -= _take
-                        else:
-                            for _i, _n in enumerate(_per):
-                                if _n <= 0:
-                                    continue
-                                _CHUNK = 32
-                                _left = _n
-                                while _left > 0:
-                                    _take = min(_CHUNK, _left)
-                                    _a = torch.empty((_take, self.blob_bytes), dtype=dtype,
-                                                     device=_devs[_i])
-                                    self._arena.append(_a)
-                                    for _s in range(_take):
-                                        self._buffers.append(_a[_s])
-                                        self._slot_dev.append(_i)
-                                    _left -= _take
-                        if self._buffers:
-                            break
-                        raise RuntimeError("no slot arena could be allocated")
-                    except Exception:
-                        for _b in list(self._buffers):
-                            del _b
-                        self._arena = []
-                        self._buffers = []
-                        self._slot_dev = []
-                        if len(_per) == 1 and _try > 16:
-                            _try = int(_try * 0.85)   # 收缩 15% 再试
-                            torch.cuda.empty_cache()
-                            continue
-                        raise
-                if len(_per) == 1:
-                    self.slots = len(self._buffers)
-                    self._state = [self.FREE] * self.slots
-                    # 冷度时间戳：越小越冷。选 victim 用它，而不是游标轮转。
-                    self._last_used = [0.0] * self.slots
-                    self._key = [None] * self.slots
-                    self._refs = [0] * self.slots
-                    self._event = [None] * self.slots
+                arena = torch.empty((count, self.blob_bytes), dtype=dtype, device=device)
+                arenas.append(arena)
+                buffers.extend(arena[index] for index in range(count))
             else:
-                self._arena = None
-                self._slot_dev = [0] * self.slots
-                self._buffers = [torch.empty(self.blob_bytes, dtype=dtype, device=dev)
-                                 for _ in range(self.slots)]
-        except Exception as _exc:
-            # 不清零、不降级。slots=0 会让每个 routed expert 每 token 都从主机内存
-            # 走一次 H2D（240 次/token），decode 从「显存直读」退成「主机中转」，
-            # 而整个降级只有 TI_SLOT_DEBUG=1 才可见。分配失败就报错。
-            raise RuntimeError(
-                f"VRAM expert slot arena allocation failed "
-                f"(slots={self.slots}, blob={self.blob_bytes}B): {_exc!r}") from _exc
-        if __import__("os").environ.get("TI_SLOT_DEBUG") == "1":
-            print(f"[slots] self.slots={self.slots} buffers={len(self._buffers)} "
-                  f"state={len(self._state)} devs={getattr(self,'devices',None)}",
-                  flush=True)
-        # 空槽位队列：LIFO，从后往前弹，避免和前面分配的槽位争同一段
-        self._free = list(range(len(self._buffers) - 1, -1, -1))
-        self._cur = 0
-        if self.pin_staging and dev.type == "cuda":
-            self._staging = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
-            self._staging_b = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
-            # 每张卡一条 copy stream。多卡时槽位分片在不同卡上，DMA 必须发到
-            # **目标卡自己的 stream** 上：往 cuda:0 的 stream 里排一个目标是
-            # cuda:1 的 copy，驱动要么报错要么按错卡解析地址。
-            self._copy_streams = {}
-            for _d in (getattr(self, "devices", None) or [str(dev)]):
-                try:
-                    self._copy_streams[_d] = torch.cuda.Stream(device=_d)
-                except Exception:
-                    pass
-            self._copy_stream = self._copy_streams.get(str(dev))
-            if self._copy_stream is None and self._copy_streams:
-                self._copy_stream = next(iter(self._copy_streams.values()))
-            self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
+                buffers.extend(torch.empty(self.blob_bytes, dtype=dtype, device=device) for _ in range(count))
+            slot_devices.extend([device_index] * count)
+            if torch.device(device).type == "cuda":
+                stream = torch.cuda.Stream(device=device)
+                stream.wait_stream(torch.cuda.current_stream(device=device))
+                streams[device] = stream
+        self._torch = torch
+        self._arena = arenas
+        self._buffers = buffers
+        self._slot_dev = slot_devices
+        self._copy_streams = streams
+        self._copy_stream = streams.get(devices[0])
+        self._copy_events = [None] * self.slots
+        self._free = list(range(self.slots))
+        self._last_used = [0.0] * self.slots
+
+    def synchronize(self) -> None:
+        """在显式销毁或迁移前完成所有 DMA 和消费者，不替换存储。"""
+        for event in self._copy_events:
+            if event is not None:
+                event.synchronize()
+        for events in self._consumer_events:
+            for event in events.values():
+                event.synchronize()
+        self._dma_sources.clear()
 
     def _copy_blocking(self, idx: int, data: Any, event: Any = None):
-        """Copy data bytes into slot idx; returns the completion CUDA event (or None)."""
+        """读者结束 -> 覆写 DMA -> 就绪事件；失败不切换复制实现。"""
         import torch
-        if isinstance(data, (bytearray, memoryview)):
-            # memoryview comes from the claimed pool: wrap it, never copy it. bytearray
-            # wrapping was zero-copy already; routing memoryview through bytearray() made
-            # every expert a pageable copy (lost the async DMA path entirely).
-            cpu = torch.frombuffer(data, dtype=torch.uint8)
-        elif isinstance(data, bytes):
-            cpu = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-        else:
-            cpu = data
+        if isinstance(data, bytes):
+            data = bytearray(data)
+        cpu = torch.frombuffer(data, dtype=torch.uint8) if isinstance(data, (bytearray, memoryview)) else data
         buf = self._buffers[idx]
-        if cpu.dtype != buf.dtype:
-            cpu = cpu.view(buf.dtype)
-        if idx in self._dirty:
-            # 这一格刚被别人交还，可能还有 kernel 在读。
-            #
-            # **但不能用 non_blocking=False。** 那个参数的含义是「主机阻塞到拷贝
-            # 完成」，不是「排在前面 kernel 的后面」。在同一个 stream 上发的
-            # 异步拷贝本来就按提交顺序执行，所以正确做法是：发 async copy，让
-            # stream 自己保证顺序，主机立刻返回。
-            #
-            # 原来写同步拷贝，理由是「靠 stream 内顺序排在上一个 kernel 后面」——
-            # 顺序确实有，但代价是每步 240 次装载里有一部分要串行等 18.8MB 的
-            # 显存写入（每次约 2.4ms）。cProfile 里 _copy_blocking 4 步累计
-            # 2.30s，就是这一条。
-            self._dirty.discard(idx)
-            _cs = self.slot_stream(idx) if hasattr(self, "slot_stream") else self._copy_stream
-            if _cs is not None:
-                ev = torch.cuda.Event()
-                with torch.cuda.stream(_cs):
-                    # **这里也要走 _async_h2d，不能用 buf.copy_。**
-                    #
-                    # 这条路是「槽位刚被别人交还、可能还有 kernel 在读」时走的，
-                    # 在 24 个槽位对 240 个需求的池子里它是**绝大多数**（实测
-                    # 每步 240 次装载全部命中这里）。而原来的 buf.copy_(cpu) 有
-                    # 个致命问题：cpu 是 torch.frombuffer(pool memoryview) 来的，
-                    # torch 不认它是 pinned（实测 is_pinned()==False），于是
-                    # copy_ 自己先做一次 pageable memcpy 到内部 staging 再发 DMA ——
-                    # 观测到的「7.8GB/s」就是这一步，不是 PCIe 的上限（26GB/s）。
-                    #
-                    # _async_h2d 直接对 pool 的内存地址发 cudaMemcpyAsync，
-                    # 绕开 torch 的 pinned 判断，一个 18.8MB 的块一次 DMA 到位。
-                    _ok = False
-                    try:
-                        if isinstance(data, memoryview):
-                            # **必须提交到当前流，不能用 _cs（copy stream）。**
-                            #
-                            # 我第一版用了 _cs，理由是「和槽位所在卡的 stream 对齐」。
-                            # 但这里有个致命前提：消费者要在同一流上排在自己后面，
-                            # 或者显式 wait_event。而 MoE 那条路径**从不调
-                            # wait_event**（grep 过，moe.py 里一次都没有），它只靠
-                            # "拷贝和 kernel 排在同一条流上"来保证顺序。
-                            #
-                            # 提交到 copy stream 就断了这个前提 —— 计算可能在拷贝
-                            # 完成前就读到槽位内容。症状不是报错，是结果不确定：
-                            # 同一段输入三次跑出 15.6 / 20.4 / NaN。
-                            #
-                            # 用当前流：DMA 和后面的 kernel 天然有序，ev 只用于
-                            # 记录（wait_event 在同流上是 no-op，安全）。
-                            _ok = _async_h2d(buf, data, int(buf.numel()))
-                    except Exception:
-                        _ok = False
-                    if not _ok:
-                        buf.copy_(cpu, non_blocking=True)
-                    ev.record(_cs)
-                return ev
-            buf.copy_(cpu, non_blocking=True)
+        if cpu.device.type != "cpu" or not cpu.is_contiguous():
+            raise ValueError("expert source must be contiguous host storage")
+        nbytes = buf.numel() * buf.element_size()
+        if cpu.numel() * cpu.element_size() < nbytes:
+            raise ValueError("expert source is smaller than its planned slot")
+        if buf.device.type != "cuda":
+            buf.view(torch.uint8).reshape(-1).copy_(cpu.view(torch.uint8).reshape(-1)[:nbytes])
             return None
-        # prefetch thread uses the second staging buffer so it never blocks a fetch copy
-        use_b = threading.current_thread().name.startswith("vram-prefetch")
-        lock = self._staging_lock_b if use_b else self._staging_lock
-        staging = self._staging_b if use_b and self._staging_b is not None else self._staging
-        # A host-pool slice IS pinned (cudaHostAlloc) but torch.frombuffer() does not say
-        # so, which sent it down the pageable path: an 18.8MB host memcpy on the fetch
-        # thread (measured 18ms/layer) and then an async DMA out of the SHARED staging
-        # buffer. The next expert's memcpy can overwrite a transfer that is still in
-        # flight -- exactly the disagreement two identical greedy runs showed. Issue the
-        # DMA against the pool slice itself: no staging, no race, 13.3GB/s.
-        # Direct DMA from the pool slice (1.08s/token vs 1.27s through staging). The
-        # staging path also produced " 2023-1-1 20:" for a capital question with the same
-        # slots: one shared staging buffer is reused while an earlier async DMA out of it
-        # may still be in flight.
-        # 多卡：这块槽位的 DMA 必须发到它所在卡的 stream 上，
-        # 否则驱动按错卡的地址空间解析目标指针。
-        cs = self.slot_stream(idx) if hasattr(self, "slot_stream") else self._copy_stream
-        if isinstance(data, memoryview) and cs is not None:
-            ev = event if event is not None else torch.cuda.Event()
-            with torch.cuda.stream(cs):
-                if _async_h2d(buf, data, int(buf.numel()), stream=cs):
-                    ev.record(cs)
-                    return ev
-        # Pinned sources go straight to the device as an async DMA (26GB/s, six in
-        # parallel). Routing them through the single shared staging buffer serialised
-        # them through one 18.8MB host memcpy (measured 18ms/layer). Pageable sources
-        # cannot be async, so they copy synchronously.
-        if cpu.is_pinned():
-            if cs is None:
-                buf.copy_(cpu, non_blocking=True)
-                return None
-            # Copy on the dedicated copy stream. A pinned H2D queued on the compute
-            # stream makes every later host sync (the per-layer routing bincount) wait
-            # for the whole 18.8MB transfer: measured 12.7ms/layer of pure stall.
-            ev = event if event is not None else torch.cuda.Event()
-            with torch.cuda.stream(cs):
-                buf.copy_(cpu, non_blocking=True)
-                ev.record(cs)
-            return ev
-        # 非 pinned 源（我们的大池子是 mmap，pageable）：原来的路径先
-        # staging.copy_(cpu) 同步拷到 pinned staging，再异步 H2D —— 那次同步拷贝
-        # 把主线程钉在原地等 18.8MB，一个 token 240 次就是几十毫秒的纯阻塞，
-        # 期间 GPU 完全空转（实测推理时 GPU 0-27% 反复跳）。
-        # pageable 源直接 non_blocking=True 交给驱动：驱动会自己分块暂存，
-        # 慢一点但**不阻塞调用者**，主线程可以继续发下一层的 kernel。
-        if staging is None or cs is None:
-            buf.copy_(cpu, non_blocking=True)
-            return None
-        ev = event if event is not None else torch.cuda.Event()
-        with torch.cuda.stream(cs):
-            # 同一份 pageable 源，驱动内部会做暂存；把这块也放到 copy stream 上，
-            # 就不会占住计算流的排序点。
-            buf.copy_(cpu, non_blocking=True)
-            ev.record(cs)
-        return ev
+        stream = self.slot_stream(idx)
+        if stream is None:
+            raise RuntimeError("expert slot has no copy stream")
+        done = event if event is not None else torch.cuda.Event()
+        with self._staging_lock:
+            self._dma_sources = [item for item in self._dma_sources if not item[0].query()]
+            with torch.cuda.device(buf.device), torch.cuda.stream(stream):
+                previous = self._copy_events[idx]
+                if previous is not None:
+                    stream.wait_event(previous)
+                for consumer in self._consumer_events[idx].values():
+                    stream.wait_event(consumer)
+                if not _async_h2d(buf, cpu, nbytes, stream=stream):
+                    raise RuntimeError(f"expert slot {idx}: asynchronous H2D submission failed")
+                done.record(stream)
+            self._copy_events[idx] = done
+            self._consumer_events[idx].clear()
+            self._dma_sources.append((done, data, cpu))
+        return done
 
     def wait_ready(self, idxs) -> None:
-        """让当前（compute）stream 等这些槽位的 DMA 落地。
-
-        只对还在飞的插等待：已完成的事件不插，避免每层几十个空的
-        cudaStreamWaitEvent（那个开销实测和真等差不多）。这就是「GPU 自己等
-        数据」—— CPU 已经把搬运命令发出去了，不必陪着等。
-        """
-        t = self._torch
-        cs = getattr(self, "_copy_stream", None)
-        if t is None or cs is None:
-            return
-        for i in idxs:
-            ev = self._event[i]
-            if ev is not None and not ev.query():
-                # 等这块槽位**自己所在卡**的 compute stream：多卡时它可能在
-                # 另一张卡上，往这张卡的流里插等待没有意义。
-                devs = list(getattr(self, "devices", None) or [])
-                didx = self.slot_device(i)
-                if devs and 0 <= didx < len(devs):
-                    try:
-                        with t.cuda.device(devs[didx]):
-                            t.cuda.current_stream().wait_event(ev)
-                        continue
-                    except Exception:
-                        pass
-                t.cuda.current_stream().wait_event(ev)
+        """在每个目标设备的计算流上等待已提交的 DMA。"""
+        if self._torch is None:
+            raise RuntimeError("expert slot pool is not initialized")
+        for index in idxs:
+            if self._state[index] in (self.FREE, self.RESERVED):
+                raise RuntimeError(f"expert slot {index}: data transfer has not been submitted")
+            event = self._event[index]
+            if self._state[index] == self.COPYING and event is None:
+                raise RuntimeError(f"expert slot {index}: copying without a completion event")
+            if event is not None and not event.query():
+                with self._torch.cuda.device(self._buffers[index].device):
+                    self._torch.cuda.current_stream().wait_event(event)
 
     def stage(self, layer: int, experts, loader, *, urgent: bool = True) -> int:
-        """只做主机侧：挑槽位、记归属、把字节拷到 pinned staging。**不碰 CUDA**。
-
-        为什么拆成两段：卖家线程跨线程发 CUDA 调用会和主线程的 cuModuleLoad /
-    cuLaunchKernel 争同一把连接锁，实测直接死锁（faulthandler 抓到
-    _copy_blocking 和 native.module 互等）。CUDA 只有主线程碰，卖家线程负责
-    把字节准备好 —— 这也正是「CPU 备货」该做的事。
-
-        loader(layer, [expert, ...]) -> {expert: bytes-like}。
-        返回本次新占用的槽位数。
-        """
-        miss = [int(e) for e in experts if (layer, int(e)) not in self._by_key]
-        if not miss:
+        """保护整个请求，在提交与 ready 之间保留命中项和新预约。"""
+        wanted = list(dict.fromkeys(int(expert) for expert in experts))
+        with self._lock:
+            if self._paused or not self._buffers:
+                raise RuntimeError("expert slot pool must be initialized before staging")
+            previous = set(self._urgent)
+            if urgent:
+                self._protect_locked(layer, wanted)
+            missing = [expert for expert in wanted if (layer, expert) not in self._by_key]
+        if not missing:
             return 0
-        if getattr(self, "_staging", None) is None:
-            return 0
-        data_map = loader(layer, miss) or {}
-        staged = 0
-        for e in miss:
-            data = data_map.get(e)
-            if data is None:
-                continue
+        reserved = []
+        try:
+            data_map = loader(layer, missing)
+            if urgent and any(data_map.get(expert) is None for expert in missing):
+                raise RuntimeError(f"layer {layer}: source data is missing for requested experts")
+            sources = {}
+            for expert in missing:
+                data = data_map.get(expert)
+                if data is None:
+                    continue
+                source = memoryview(data).cast("B")
+                if source.nbytes != self.blob_bytes:
+                    raise ValueError("expert source does not match the planned slot size")
+                sources[expert] = source
             with self._lock:
                 if urgent:
-                    # 当前层：可以覆盖非 urgent 的槽位（预取/历史），但优先空槽。
-                    idx = self._reserve_locked((layer, e), protect_urgent=True)
-                else:
-                    # 预取：只吃真正空着的槽位。缓存命中（已在池里）直接跳过，
-                    # 绝不能为它把别人正在用的槽位顶掉 —— 当前层才是必须的。
-                    idx = self._free.pop() if self._free else None
-                    if idx is not None:
-                        self._key[idx] = (int(layer), int(e))
-                        self._by_key[(int(layer), int(e))] = idx
-                        self._gen += 1
-                        self._lru.append(idx)
-                        self.loads += 1
-                        self._tab_dirty.append((int(layer), int(e), int(idx)))
-                if idx is None:
-                    continue
-                self._refs[idx] = 1
-                self._state[idx] = self.RESERVED
-                if urgent:
-                    self._urgent.add(idx)
-            # 不再往中转区拷一份：RAM 缓存里的字节本来就是 pinned 的
-            # memoryview，DMA 可以直接从它读。原先把每个 18.8MB 的 blob 再
-            # memcpy 一遍（每层 6 次 = 113MB/token，还是串行的），实测 stage
-            # 每步 175ms，而真正的 DMA 只要 63ms。
-            try:
-                self._stage_bufs[idx] = memoryview(data)[: self.blob_bytes]
-            except Exception:
-                with self._lock:
-                    self._evict_locked(idx)
-                continue
-            staged += 1
-        return staged
+                    self._protect_locked(layer, wanted)
+                for expert, source in sources.items():
+                    if (layer, expert) in self._by_key:
+                        continue
+                    if not urgent and not self._free:
+                        continue
+                    index = self._reserve_locked((layer, expert))
+                    if index is None:
+                        raise RuntimeError("expert slot pool has no unowned slot")
+                    reserved.append(index)
+                    if urgent:
+                        self._urgent.add(index)
+                    self._stage_bufs[index] = source
+            return len(reserved)
+        except BaseException:
+            with self._lock:
+                for index in reserved:
+                    self._evict_locked(index)
+                for expert in wanted:
+                    index = self._by_key.get((layer, expert))
+                    if index is not None and index not in previous:
+                        self._urgent.discard(index)
+                self._cond.notify_all()
+            raise
+
+    def _protect_locked(self, layer: int, wanted) -> None:
+        """装入缺项以前保护所有命中项，容量不足不驱逐请求。"""
+        requested = {self._by_key[(layer, expert)] for expert in wanted
+                     if (layer, expert) in self._by_key}
+        missing = len(wanted) - len(requested)
+        available = sum(self._state[index] == self.FREE or (
+            self._state[index] == self.STAGED and not self._refs[index]
+            and index not in self._urgent and index not in requested
+            and self._key[index] not in self._pinned) for index in range(self.slots))
+        if missing > available:
+            raise RuntimeError(f"layer {layer}: complete expert request exceeds available slots")
+        self._urgent.update(requested)
 
     def clear_urgent(self) -> None:
         """一层算完了：它的槽位降级成「历史」，可以被后续层覆盖。"""
@@ -2573,172 +2380,77 @@ class VramSlotCache:
             self._urgent.clear()
 
     def reset_counts(self) -> None:
-        """只清缓存和计数，不动槽位（热重启时用）。
-
-        实测（8GB，14 槽位，8 层）：一步里 loads=768 evict=754 hits=0 —— 因为
-        8 层 x 6 个专家要 48 个位，池子只有 14 个，谁先到谁占，下一个来了就
-        覆盖，必然 0 命中。而相邻 token 的路由重合 42%（实测 L0 40% / L1 50%
-        / L2 38% / L3 38%）—— 只要保住那些，下一步就能省掉 42% 的 DMA。
-        """
+        """计数清零不改变未完成供货、读租约或事件依赖。"""
         with self._lock:
             self.loads = 0
             self.evictions = 0
-            self._urgent.clear()
-            self._stage_bufs.clear()
-            self._tab_dirty.clear()
-            self._dirty.clear()
-
 
     def commit(self, layer: int | None = None) -> int:
-        """主线程：把 staged 的槽位 DMA 上去并发布，然后写表。
-
-        只在本线程的 stream 上操作，不跨线程，所以不会和别的 CUDA 调用互等。
-        """
-        import torch
-
-        if not self._stage_bufs:
-            self.table_flush(layer)
-            return 0
-        # 批量提交：先把要发的都挑出来（一次锁），发完再一次锁把状态推上去。
-        # 原来每个专家单独取一次锁 + 一次 notify_all，14 个专家就是 28 次锁竞争，
-        # 而锁的持有者还可能正被别的线程抢 —— 实测 commit 每步 144ms，
-        # 而同样 14 次 DMA 纯发只要 37ms。
+        """仅发布已成功提交 DMA 的事务，任一失败直接报错。"""
         with self._lock:
-            todo = [(idx, buf) for idx, buf in self._stage_bufs.items()
-                    if self._key[idx] is not None
-                    and (layer is None or self._key[idx][0] == layer)]
-        done = []
-        failed = []
-        done = []
-        failed = []
-        for idx, buf in todo:
-            try:
-                ev = self._copy_blocking(idx, buf)
-            except Exception:
-                failed.append(idx)
-                continue
-            self._event[idx] = ev
-            done.append(idx)
-        with self._lock:
-            _now = time.perf_counter()
-            for idx in done:
-                if self._state[idx] in (self.RESERVED, self.IN_USE):
-                    self._state[idx] = self.STAGED
-                # 刚装进来的就是最热的，刷新冷度时间戳。
-                if idx < len(self._last_used):
-                    self._last_used[idx] = _now
-                self._stage_bufs.pop(idx, None)
-            for idx in failed:
-                self._evict_locked(idx)
-                self._stage_bufs.pop(idx, None)
-            if done or failed:
+            todo = [(index, source) for index, source in self._stage_bufs.items()
+                    if layer is None or self._key[index][0] == layer]
+            for index, _ in todo:
+                if self._state[index] != self.RESERVED:
+                    raise RuntimeError("expert transfer is already being committed")
+                self._state[index] = self.COPYING
+        done = 0
+        try:
+            for index, source in todo:
+                event = self._copy_blocking(index, source)
+                self.publish(index, event)
+                with self._lock:
+                    self._stage_bufs.pop(index)
+                done += 1
+        except BaseException:
+            with self._lock:
+                for index, _ in todo[done:]:
+                    self._evict_locked(index)
                 self._cond.notify_all()
+            raise
         self.table_flush(layer)
-        return len(done)
+        return done
 
     def ensure(self, layer: int, experts, loader) -> tuple[int, int]:
-        """同线程版本：stage + commit 一次做完（没有异步卖家时用）。"""
-        n = self.stage(layer, experts, loader)
-        placed = self.commit(layer)
-        return n, placed
+        """只完成供货；读取必须另行 acquire_ready，不能无租约 release。"""
+        self._ensure()
+        wanted = list(dict.fromkeys(int(expert) for expert in experts))
+        try:
+            staged = self.stage(layer, wanted, loader)
+            placed = self.commit(layer)
+            return staged, placed
+        finally:
+            self.cancel_request(layer, wanted)
 
-    def _claim_slot_locked(self, *, protect_urgent: bool = False,
-                           want_layer: int = -1) -> int | None:
-        """拿一个槽位：先掏空的，掏不到就环形覆盖一个没人在用的。
+    def cancel_request(self, layer: int, experts) -> None:
+        """取消未交给读者的保护，不改变仍被读租约持有的槽位。"""
+        with self._lock:
+            for expert in experts:
+                index = self._by_key.get((layer, int(expert)))
+                if index is not None and not self._refs[index]:
+                    if self._state[index] == self.COPYING:
+                        raise RuntimeError("cannot cancel a transfer being submitted")
+                    if self._state[index] == self.RESERVED:
+                        self._evict_locked(index)
+                    else:
+                        self._urgent.discard(index)
+            self._cond.notify_all()
 
-        这里没有「释放」这个动作 —— 槽位在池子里转圈，被覆盖即回收。
-        每层每步扫一遍全池找 victim（原来的做法）是纯 Python 的 O(slots)
-        循环，池子 1359 个就是每层一千多次解释器迭代；改成游标之后是摊还 O(1)。
-        """
+    def _claim_slot_locked(self) -> int | None:
+        """只回收没有读者、没有供货事务且不属于当前请求的槽位。"""
         while self._free:
-            i = self._free.pop()
-            if self._state[i] == self.FREE and self._key[i] is None:
-                return i
-        n = self.slots
-        if n <= 0:
+            index = self._free.pop()
+            if self._state[index] == self.FREE:
+                return index
+        candidates = [index for index in range(self.slots)
+                      if self._state[index] == self.STAGED and self._refs[index] == 0
+                      and index not in self._urgent and self._key[index] not in self._pinned]
+        if not candidates:
             return None
-        def _evictable(i: int) -> bool:
-            # 关键：refs==0 只说明 Python 侧没人引用了，**不说明读这个槽位的 kernel
-            # 已经跑完**。kernel 是异步 launch 的，release() 把 refs 减到 0 时，
-            # 那个 kernel 很可能还在 SM 上读这块显存。此时覆盖它的 DMA 会与读重叠，
-            # 读到的就是新专家的字节 —— 数值乱，且不报错。
-            # 实测：5 层模型跑出的 NaN 有 129280 个元素（整个最后一行），
-            # 而在同一处加一个 torch.cuda.synchronize() 就完全正常 → 竞态确认。
-            # 覆盖前必须等这个槽位上一次的 kernel 落地。
-            return (self._refs[i] == 0
-                    and self._state[i] != self.COPYING
-                    and self._key[i] not in self._pinned)
-
-        # 两轮扫描：第一轮只碰「非 urgent」的（别的层已算完的、历史专家），
-        # 这样同一层刚搬进来的 6 个专家不会被它自己的下一个请求顶掉 ——
-        # 那是 hits=0 的直接原因。第一轮找不到才退一步允许覆盖 urgent，
-        # 否则池子一到紧急状态就整个卡死（没有兜底时实测会 still not resident）。
-        # 三轮优先级：
-        #   1. 空槽（上面已经找过）
-        #   2. 别的层的槽位 —— 本层要的专家优先抢别人的，绝不抢自己的
-        #   3. 本层但已算完的（非 urgent）
-        #   4. 兜底：urgent 也抢（否则池子一到紧急状态就整个卡死）
-        # 「本层不抢自己」是关键：一层 6 个专家互相顶掉就是 hits=0 的直接原因。
-        # **按「最冷」选 victim，不是按游标轮转。**
-        #
-        # 槽位的语义是两条互斥的队列：
-        #   demand（_urgent）  GPU 这层要用的，绝不能被换出
-        #   cold              GPU 已消费、短期不打算再用的，CPU 从最冷的开始换
-        # 一个 (layer, expert) 同时出现在两边就说明它其实不冷 —— 那是 bug，
-        # 所以下面每一轮都先排除 _urgent，最后一档兜底才允许动它（并计数）。
-        #
-        # 「最冷」用 _last_used 时间戳判断：每次命中或装入都刷新它。选本轮窗口
-        # 内时间戳最小的那个，窗口从游标位置起限长 _SCAN，保证每层是 O(1) 而不是
-        # O(slots)（池子 1359 个时全池扫是每层一千多次解释器迭代，那正是当年改成
-        # 游标的原因；但纯游标丢掉了「冷」这个判据，退化成谁先到谁被换）。
-        _SCAN = min(n, 64)
-        for mode in ("other", "stale", "any"):
-            _best_i = -1
-            _best_t = None
-            for k in range(_SCAN):
-                i = self._cur + k
-                if i >= n:
-                    i %= n
-                if not _evictable(i):
-                    continue
-                key = self._key[i]
-                if mode == "other":
-                    if protect_urgent and i in self._urgent:
-                        continue
-                elif mode == "stale":
-                    if i in self._urgent:
-                        continue
-                    if key is not None and key[0] == want_layer:
-                        continue
-                else:
-                    # mode == "any"：兜底，连 urgent 也抢。这是必要的（否则池子
-                    # 爆掉时整个卡死），但**它会破坏正在计算的层的正确性**：
-                    # 那层的 kernel 正在读被抢走的槽位，之后读到的是新专家的字节。
-                    # 实测：8 行 batch 需要 48 个槽位、池子只有 14 个，
-                    # 跑完之后 6 个专家里只剩 1 个还在，MoE 输出偏差 20%。
-                    # 这里记下次数，让上层能知道「这一层可能算歪了」。
-                    if i in self._urgent:
-                        self.urgent_evictions += 1
-                # 冷度：时间戳越小越冷（None 视为最冷，从没被访问过）
-                _t = self._last_used[i] if i < len(self._last_used) else None
-                if _best_t is None or _t is None or (_t is not None and _t < _best_t):
-                    _best_i, _best_t = i, _t
-            if _best_i >= 0:
-                self._cur = (_best_i + 1) % n
-                return _best_i
-        return None
-
-
-    def _find_victim_locked(self) -> int | None:
-        for idx in range(self.slots):
-            if self._state[idx] == self.FREE:
-                return idx
-        for idx in range(self.slots):   # 扫全池：_lru 可能缺掉早先的槽位
-            if self._state[idx] in (self.STAGED, self.IN_USE) and self._refs[idx] == 0:
-                if self._key[idx] in self._pinned:
-                    continue          # 热点专家：永不淘汰
-                return idx
-        return None
+        index = min(candidates, key=self._last_used.__getitem__)
+        self._evict_locked(index)
+        self._free.remove(index)
+        return index
 
     def pin(self, layer: int, expert: int) -> bool:
         """把已在槽位里的专家固定住；之后的 evict 会跳过它。"""
@@ -2798,7 +2510,7 @@ class VramSlotCache:
             "urgent_evictions": int(getattr(self, "urgent_evictions", 0)),
             "pinned": self.pinned_count(),
             "urgent": len(self._urgent),
-            "dirty": len(self._dirty),
+            "pending_consumers": sum(bool(events) for events in self._consumer_events),
         }
 
     def slot_table(self, n_layers: int, n_experts: int):
@@ -2820,49 +2532,18 @@ class VramSlotCache:
         return tab
 
     def table_flush(self, layer: int | None = None) -> int:
-        """把排队的槽位号一次刷进 device 表（只在调用方线程的 stream 上）。
-
-        **以池子的 _by_key 为准，pending 只是候选。**
-
-        pending 里的一条 (layer, expert, slot) 只有在「此刻该 key 仍占着
-        slot」时才可写：reserve 之后这个槽位可能已经被 evict 给别人，
-        evict 又把表写成 -1 —— 谁先谁后完全取决于提交顺序，旧的那条会把
-        表复活成一个指向别人字节的编号。实测每层 6~46 条这种陈旧条目，
-        内核按表读到的专家是错的（不报错，只是数值不对）。
-
-        layer 参数保留但**不再用于过滤**：pending 里混着预取路径
-        （need(urgent=False)）为本层之外的层挑的槽位，按层过滤会让它们
-        永远刷不进去，device 表与池子从此长期不一致。
-        """
-        if not self._tab_dirty:
-            return 0
+        """仅发布当前已提交的身份，供货线程不访问 CUDA 槽位表。"""
         tab = getattr(self, "_slot_tab", None)
         if tab is None:
-            self._tab_dirty.clear()
             return 0
         with self._lock:
-            pending = self._tab_dirty
-            self._tab_dirty = []
-            live = dict(self._by_key)
-        n = 0
-        for (lay, exp, slot) in pending:
-            cur = live.get((lay, exp))
-            if cur != slot:
-                # 陈旧条目：该 key 已被驱逐（cur 为 None）或被换了槽位。
-                # 驱逐的那种要落一条 -1，否则表里永远留着已失效的编号。
-                if cur is None:
-                    try:
-                        tab[lay, exp] = -1
-                        n += 1
-                    except Exception:
-                        pass
-                continue
-            try:
-                tab[lay, exp] = int(slot)
-                n += 1
-            except Exception:
-                pass
-        return n
+            keys = list(dict.fromkeys((layer, expert) for layer, expert, _ in self._tab_dirty))
+            for layer, expert in keys:
+                index = self._by_key.get((layer, expert))
+                ready = index is not None and self._state[index] in (self.STAGED, self.IN_USE)
+                tab[layer, expert] = index if ready else -1
+            self._tab_dirty.clear()
+            return len(keys)
 
     def table_set(self, layer: int, expert: int, slot: int) -> None:
         tab = getattr(self, "_slot_tab", None)
@@ -2894,7 +2575,8 @@ class VramSlotCache:
         with self._lock:
             host = _np.full((tab.size(0), tab.size(1)), -1, dtype=_np.int32)
             for (layer, expert), idx in self._by_key.items():
-                if layer < host.shape[0] and expert < host.shape[1]:
+                if (layer < host.shape[0] and expert < host.shape[1]
+                        and self._state[idx] in (self.STAGED, self.IN_USE)):
                     host[layer, expert] = idx
         # host 是 pageable 的 numpy，.to(device) 走默认 stream 的 H2D，而读这张表
         # 的 kernel 在 compute stream 上 —— 两者之间没有同步，表可能还没落地就被读了。
@@ -2909,204 +2591,184 @@ class VramSlotCache:
         tab.copy_(_p.to(tab.device, non_blocking=True))
 
     def _evict_locked(self, idx: int) -> None:
+        if self._refs[idx]:
+            raise RuntimeError("cannot evict an expert with an active read lease")
         key = self._key[idx]
         if key is not None:
-            # 槽位一被收走，device 上的槽位表必须同时置 -1：否则下一层路由到
-            # 同一个专家时会从这一格读到「现在住在这儿的别人的权重」，不报错，
-            # 数值是错的。
-            _tab = getattr(self, "_slot_tab", None)
-            if _tab is not None:
-                try:
-                    _tab[int(key[0]), int(key[1])] = -1
-                except Exception:
-                    pass
-            self._by_key.pop(key, None)
+            self._by_key.pop(key)
+            self._tab_dirty.append((key[0], key[1], -1))
             self._gen += 1
             self._pinned.discard(key)
             self._key[idx] = None
+            self.evictions += 1
         if idx in self._lru:
             self._lru.remove(idx)
         self._state[idx] = self.FREE
-        self._refs[idx] = 0
         self._event[idx] = None
-        # 这块显存里的权重可能还有 kernel 在读（launch 是异步的）。不建 event
-        # （240 次/token 的对象创建本身就贵），只打个脏标记：下一次往这一格
-        # 拷数据时改走 compute stream 的同步拷贝，靠 stream 内的顺序保证
-        # 「上一个读它的 kernel 先跑完」。
-        self._dirty.add(idx)
-        self.evictions += 1
+        self._stage_bufs.pop(idx, None)
+        self._urgent.discard(idx)
+        if idx not in self._free:
+            self._free.append(idx)
+        # DMA 和消费者事件属于存储，不能随专家身份清除。
 
-    def _reserve_locked(self, key: tuple[int, int], *,
-                        protect_urgent: bool = False) -> int | None:
+    def _reserve_locked(self, key: tuple[int, int]) -> int | None:
         if key in self._by_key:
             return self._by_key[key]
-        idx = self._claim_slot_locked(protect_urgent=protect_urgent,
-                                      want_layer=int(key[0]))
-        if idx is None:
+        index = self._claim_slot_locked()
+        if index is None:
             return None
-        if self._state[idx] != self.FREE:
-            self._evict_locked(idx)
-        self._key[idx] = key
-        self._by_key[key] = idx
+        self._key[index] = key
+        self._by_key[key] = index
         self._gen += 1
-        self._state[idx] = self.RESERVED
-        self._lru.append(idx)
+        self._state[index] = self.RESERVED
+        self._lru.append(index)
         self.loads += 1
-        # 表由池子自己维护 —— 但**不能在这里直接写 GPU 上的表**：
-        #   - reserve 会在卖家线程里被调用，那是跨线程发 kernel；
-        #   - 主线程同时在 cuModuleLoad 时，两个线程争 primary context 的锁，
-        #     实测直接死锁（faulthandler 抓到 loading.py:2689 和 native.py:96）。
-        # 所以这里只记在 Python 侧的一份「待写」列表里，由调用方在 GPU 侧
-        # 一次批量刷（table_flush），刷的过程只碰自己的 stream，不跨线程。
-        self._tab_dirty.append((int(key[0]), int(key[1]), int(idx)))
-        return idx
+        return index
 
-    # -- prefetch path ----------------------------------------------------
     def preload(self, layer: int, expert: int, data: Any) -> bool:
-        """Reserve, copy and publish an expert for a later acquire() (background safe)."""
+        """只在 DMA 完成事件已经记录之后发布可消费的映射。"""
         self._ensure()
         key = (layer, expert)
         with self._lock:
             if key in self._by_key:
                 return False
-            idx = self._reserve_locked(key)
-            if idx is None:
+            index = self._reserve_locked(key)
+            if index is None:
                 return False
-            self._state[idx] = self.COPYING
-        import torch
-        ev = torch.cuda.Event()
-        with self._lock:
-            self._event[idx] = ev  # published before the copy so acquire() can wait on it
+            self._state[index] = self.COPYING
         try:
-            self._copy_blocking(idx, data, event=ev)
+            event = self._copy_blocking(index, data)
+            self.publish(index, event)
         except BaseException:
             with self._lock:
-                self._evict_locked(idx)
+                self._evict_locked(index)
                 self._cond.notify_all()
             raise
-        with self._lock:
-            if self._state[idx] == self.COPYING:
-                self._state[idx] = self.STAGED
-            self._cond.notify_all()
         return True
 
-    # -- fetch path -------------------------------------------------------
     def acquire(self, layer: int, expert: int) -> tuple[int, bool]:
-        """Return (slot, ready). ready=False means the caller must copy_in + publish."""
+        """取得已发布读租约或待填充预约，尚未发布的复制不算命中。"""
         self._ensure()
         key = (layer, expert)
         with self._cond:
             while True:
-                idx = self._by_key.get(key)
-                if idx is not None:
-                    st = self._state[idx]
-                    if st in (self.STAGED, self.IN_USE):
-                        self._refs[idx] += 1
-                        self._state[idx] = self.IN_USE
-                        return idx, True
-                    if st == self.COPYING:
-                        # consume immediately; the compute stream waits on the slot event
-                        self._refs[idx] += 1
-                        self._state[idx] = self.IN_USE
-                        return idx, True
-                    # RESERVED: prefetch has not started the copy yet; wait for publish
-                    if not self._cond.wait(timeout=5.0):
-                        raise RuntimeError(f"VRAM slot prefetch stalled for {key} state={self._NAMES[st]}")
-                    continue
-                idx = self._reserve_locked(key)
-                if idx is None:
-                    # 池子满了且暂时没有可淘汰的槽位（全部 refs>0 或 pinned）。
-                    # 返回 (-1, False) 是这里的**约定**，不是退化：调用方
-                    # （loading.py 的 get/fetch）拿到 -1 会抛出一句带层号/专家号的
-                    # 错误，比在这里盲等 30 秒再报「别人占着槽位」有用得多。
-                    # 需要阻塞语义的地方（prefetch、后台搬运）自己应带重试；
-                    # acquire 本身是同步接口，不替调用方决定要不要等。
-                    return -1, False
-                self._refs[idx] = 1
-                self._state[idx] = self.IN_USE
-                return idx, False
+                index = self._by_key.get(key)
+                if index is None:
+                    index = self._reserve_locked(key)
+                    if index is None:
+                        raise RuntimeError("expert slot pool has no unowned slot")
+                    self._refs[index] = 1
+                    return index, False
+                if self._state[index] in (self.STAGED, self.IN_USE):
+                    self._refs[index] += 1
+                    self._state[index] = self.IN_USE
+                    return index, True
+                self._cond.wait()
 
-    def acquire_many(self, layer: int, experts: list[int]) -> list[tuple[int, bool] | None]:
-        """Batch acquire: one lock for the whole expert list (decode fetches 6/ layer).
+    def acquire_ready(self, layer: int, experts) -> list[int]:
+        """完整校验后一次取得请求的读租约，失败不取得部分租约。"""
+        wanted = list(dict.fromkeys(int(expert) for expert in experts))
+        with self._lock:
+            missing = [expert for expert in wanted if (layer, expert) not in self._by_key]
+            if missing:
+                raise RuntimeError(f"layer {layer}: requested experts are not resident: {missing}")
+            indices = [self._by_key[(layer, expert)] for expert in wanted]
+            if any(self._state[index] not in (self.STAGED, self.IN_USE) for index in indices):
+                raise RuntimeError(f"layer {layer}: requested transfer has not been published")
+            for index in indices:
+                self._refs[index] += 1
+                self._state[index] = self.IN_USE
+                self._urgent.add(index)
+            return indices
 
-        Returns per-expert (slot, ready) or None when the caller should fall back to
-        the single acquire() path (RESERVED slots that a prefetch is still filling).
-        """
+    def acquire_many(self, layer: int, experts: list[int]) -> list[tuple[int, bool]]:
+        """完整请求在一次锁内预约，调用者须先提交正在供货的项。"""
         self._ensure()
-        out: list[tuple[int, bool] | None] = []
-        with self._cond:
-            for expert in experts:
+        wanted = list(dict.fromkeys(int(expert) for expert in experts))
+        if len(wanted) != len(experts):
+            raise ValueError("batch acquire requires unique expert identities")
+        with self._lock:
+            if any(self._state[self._by_key[(layer, expert)]] not in (self.STAGED, self.IN_USE)
+                   for expert in wanted if (layer, expert) in self._by_key):
+                raise RuntimeError("expert batch includes an unpublished transfer")
+            self._protect_locked(layer, wanted)
+            out = {}
+            for expert in wanted:
                 key = (layer, expert)
-                idx = self._by_key.get(key)
-                if idx is not None:
-                    st = self._state[idx]
-                    if st == self.RESERVED:
-                        out.append(None)  # prefetch in flight: let acquire() wait
-                        continue
-                    self._refs[idx] += 1
-                    self._state[idx] = self.IN_USE
-                    out.append((idx, True))
-                    continue
-                idx = self._reserve_locked(key)
-                if idx is None:
-                    # 批量路径不能阻塞（它被 decode 的热路径调用）：把整批交给
-                    # 单条 acquire()，由那条路径等待并重试。
-                    out.append(None)
-                    continue
-                self._refs[idx] = 1
-                self._state[idx] = self.IN_USE
-                out.append((idx, False))
-        return out
+                ready = key in self._by_key
+                index = self._by_key[key] if ready else self._reserve_locked(key)
+                if index is None:
+                    raise RuntimeError("expert slot reservation violated capacity check")
+                self._refs[index] += 1
+                if ready:
+                    self._state[index] = self.IN_USE
+                self._urgent.add(index)
+                out[expert] = (index, ready)
+            return [out[int(expert)] for expert in experts]
 
     def copy_in(self, slot: int, data: Any):
+        with self._lock:
+            if self._state[slot] != self.RESERVED:
+                raise RuntimeError("expert copy requires an unpublished reservation")
+            self._state[slot] = self.COPYING
         return self._copy_blocking(slot, data)
 
     def publish(self, slot: int, event: Any = None) -> None:
         with self._lock:
-            if event is not None:
-                self._event[slot] = event
-            if self._state[slot] == self.COPYING:
-                self._state[slot] = self.STAGED
+            if not self._buffers or self._key[slot] is None:
+                raise RuntimeError("expert publication requires initialized, reserved storage")
+            if self._state[slot] not in (self.RESERVED, self.COPYING):
+                raise RuntimeError("expert slot has no unpublished transfer")
+            if self._buffers[slot].device.type == "cuda" and event is None:
+                raise RuntimeError("CUDA expert transfer needs a recorded completion event")
+            self._event[slot] = event
+            self._state[slot] = self.IN_USE if self._refs[slot] else self.STAGED
+            self._last_used[slot] = time.perf_counter()
+            key = self._key[slot]
+            self._tab_dirty.append((key[0], key[1], slot))
             self._cond.notify_all()
 
     def event(self, slot: int):
-        """The DMA event for a slot (None once its data is resident).
-
-        原来这里无条件返回 self._event[slot]，而 publish() 从不清它 —— 于是槽位早已
-        STAGED（数据落位）之后，调用方仍然每层对同一批专家各 wait 一次已经完成的
-        事件。实测每层 6 次 cudaStreamWaitEvent、每 token 240 次，全是空等。
-        """
-        if self._state[slot] == self.STAGED:
-            return None
+        """发布表示 DMA 已提交，不表示设备已经完成。"""
         return self._event[slot]
 
     def wait_event(self, slot: int) -> None:
-        ev = self._event[slot]
-        if ev is not None:
-            self._torch.cuda.current_stream().wait_event(ev)
+        self.wait_ready([slot])
 
     def release(self, layer: int, expert: int) -> None:
-        key = (layer, expert)
+        self.release_many(layer, [expert])
+
+    def release_many(self, layer: int, experts) -> None:
+        """先记录所有消费者事件，全部成功才归还 CPU 读租约。"""
+        wanted = list(dict.fromkeys(int(expert) for expert in experts))
         with self._lock:
-            idx = self._by_key.get(key)
-            if idx is None:
-                return
-            if self._refs[idx] > 0:
-                self._refs[idx] -= 1
-            if self._refs[idx] == 0 and self._state[idx] == self.IN_USE:
-                self._state[idx] = self.STAGED
-            # **刷新冷度时间戳。** 不刷的话「最冷」退化成「轮转指针」：
-            # _claim_slot_locked 用 _last_used 选 victim，而这个时间戳原来只在
-            # commit() 里写一次，之后无论命中多少次、释放多少次都不再更新。
-            # 于是刚用完的专家（下一步最可能要用的那个）时间戳最旧，被优先淘汰 ——
-            # 实测 loads=789 evictions=765、vram_hit=0.0%，几乎全部装载立刻被
-            # 驱逐，正是这个原因。
-            if idx >= len(self._last_used):
-                # _last_used 是延迟初始化的（__init__ 里只是空列表，_ensure() 才
-                # 铺开成 [0.0]*slots）。这里必须同样补齐，否则 idx < 0 长度时
-                # 那行赋值被静默跳过，「最冷」永远停留在初始状态。
-                self._last_used = list(self._last_used) + [0.0] * (idx + 1 - len(self._last_used))
-            self._last_used[idx] = time.perf_counter()
+            indices = [self._by_key.get((layer, expert)) for expert in wanted]
+            if any(index is None or self._refs[index] <= 0 for index in indices):
+                raise RuntimeError(f"layer {layer}: releasing an expert without a read lease")
+            stream_events, consumers = {}, {}
+            for index in indices:
+                if self._state[index] in (self.STAGED, self.IN_USE):
+                    device = self._buffers[index].device
+                    if device.type == "cuda":
+                        stream = self._torch.cuda.current_stream(device=device)
+                        key = (str(device), int(stream.cuda_stream))
+                        if key not in stream_events:
+                            event = self._torch.cuda.Event()
+                            event.record(stream)
+                            stream_events[key] = event
+                        consumers[index] = key
+            for index in indices:
+                if index in consumers:
+                    key = consumers[index]
+                    self._consumer_events[index][key] = stream_events[key]
+                self._refs[index] -= 1
+                if not self._refs[index]:
+                    if self._state[index] in (self.STAGED, self.IN_USE):
+                        self._state[index] = self.STAGED
+                        self._urgent.discard(index)
+                    else:
+                        self._evict_locked(index)
+                self._last_used[index] = time.perf_counter()
             self._cond.notify_all()
 
     def drop(self, layer: int, expert: int) -> bool:
@@ -3146,26 +2808,19 @@ class VramSlotCache:
         return get
 
     def set_devices(self, devices, caps) -> None:
-        """Spread the slot arenas over several cards (multi-GPU only).
-
-        Called before the first fetch, because the arenas are allocated on first use and
-        their layout is fixed afterwards. A single device is the default and allocates
-        exactly as before.
-        """
-        # 只在设备布局真的变化时才丢弃已分配的 arena。原来每次调用都清空
-        # _buffers，而引擎在加载/放置层的过程中会反复调它：槽位被释放又重建，
-        # 第二次分配时显存已经被第一次占住，于是 buffers 归零、slots 却还留着，
-        # 后续 self._buffers[slot] 直接 IndexError（实测 slots=1824 buffers=0）。
-        _new_devs = list(devices)
-        _new_caps = [max(0, int(c)) for c in caps]
-        if self._buffers and _new_devs == list(self.devices or []) and _new_caps == list(self.device_caps or []):
+        """设备布局是存储身份的一部分，分配后只允许显式迁移。"""
+        import torch
+        new_devices = [torch.device(device) for device in devices]
+        new_caps = [int(capacity) for capacity in caps]
+        if not new_devices or len(new_devices) != len(new_caps) or any(value < 0 for value in new_caps):
+            raise ValueError("invalid planned expert device layout")
+        if self._buffers:
+            current = [torch.device(device) for device in (self.devices or [self.device])]
+            if new_devices != current or (self.device_caps is not None and new_caps != self.device_caps):
+                raise RuntimeError("allocated expert storage requires an explicit migration")
             return
-        self.devices = _new_devs
-        self.device_caps = _new_caps
-        self._buffers = []
-        self._arena = None
-        self._slot_dev = []
-        self.slots = int(self.slots)
+        self.devices = new_devices
+        self.device_caps = new_caps
 
     def slot_device(self, slot: int) -> int:
         """Which card this slot's memory lives on (0 when everything is on one card).
@@ -3714,12 +3369,25 @@ class ExpertStore:
         return read
 
     def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
-        import time as _t
-        _t0 = _t.perf_counter()
+        started = time.perf_counter()
+        wanted = [int(expert) for expert in experts]
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("expert fetch requires unique identities")
+        held = []
         try:
-            return self._fetch_inner(layer, experts, cache=cache)
+            for expert in wanted:
+                key = (layer, expert)
+                self.ram.lease(key, 1)
+                held.append(key)
+            return self._fetch_inner(layer, wanted, cache=cache)
+        except BaseException:
+            if self.slots is not None:
+                self.slots.synchronize()
+            for key in held:
+                self.ram.lease(key, -1)
+            raise
         finally:
-            self._fetch_ms = getattr(self, "_fetch_ms", 0.0) + (_t.perf_counter() - _t0) * 1e3
+            self._fetch_ms = getattr(self, "_fetch_ms", 0.0) + (time.perf_counter() - started) * 1e3
             self._fetch_calls = getattr(self, "_fetch_calls", 0) + 1
 
     def _fetch_inner(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
@@ -3854,27 +3522,19 @@ class ExpertStore:
                 except Exception as exc:
                     if __import__("os").environ.get("TI_CACHE_TRACE") == "1":
                         print(f"[fetch] admit path failed: {exc!r}", flush=True)
-        # batch the slot reservations under one lock (decode fetches 6 experts/layer)
-        acquired = None
-        # 同样不能加 and cache：acquire_many 对「已经在槽位里」的专家只是加引用，
-        # 不涉及 admit；被 cache=False 挡掉的后果是 decode 每层六个专家全部走到
-        # _materialize 重新 H2D 一遍，每次都带回一个 cudaEvent，于是每层多六次
-        # cudaStreamWaitEvent（实测 6/层、240/token）。
-        if len(experts) > 1:
-            acquired = self.slots.acquire_many(layer, experts)
-        by_expert = {b.key[1]: d for b, d in zip(blobs, datas)} if blobs and datas else {}
+        acquired = self.slots.acquire_many(layer, experts)
+        by_expert = {blob.key[1]: data for blob, data in zip(blobs, datas)} if blobs and datas else {}
         records = []
-        for i, expert in enumerate(experts):
-            have = by_expert.get(expert)
-            if acquired is not None and acquired[i] is not None:
-                slot, ready = acquired[i]
+        try:
+            for expert, (slot, ready) in zip(experts, acquired):
                 records.append(self._materialize(layer, expert, cache=cache, slot=slot,
-                                                 ready=ready, data=have))
-            else:
-                records.append(self._materialize(layer, expert, cache=cache, data=have))
-            with self._lock:
+                                                 ready=ready, data=by_expert.get(expert)))
+        except BaseException:
+            self.slots.release_many(layer, experts)
+            raise
+        with self._lock:
+            for expert in experts:
                 self._open[(layer, expert)] += 1
-            self.ram.lease((layer, expert), 1)
         return records
 
     def prefetch_to_vram(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> int:
@@ -3985,8 +3645,7 @@ class ExpertStore:
         ids = [int(e) for e in experts]
 
         def run():
-            # inference_mode is thread-local: the slot buffers were allocated under it
-            # on the calling thread, so the copy must happen under it here too
+            # inference_mode is thread-local.
             import torch as _t
             with _t.inference_mode():
                 return self.fetch(layer, ids, cache=cache)
@@ -3994,67 +3653,49 @@ class ExpertStore:
         return self._fetch_pool.submit(run)
 
     def drop_slots(self) -> None:
-        """Release the VRAM slot pool; _ensure() re-creates it on the next acquire.
-
-        A prefill wave allocates a tilelang workspace that alone needs more than the slot
-        pool leaves free on an 8GB card (measured: 64 slots = 1.2GB -> CUDA OOM inside
-        the first chunk). Decode is what the slots are for, so prefill hands the VRAM back
-        and decode gets it again lazily.
-        """
+        """显式清空存储但不缩容，活跃读者或生产者存在时拒绝销毁。"""
         slots = self.slots
         if slots is None:
             return
-        _prev = int(getattr(slots, "slots", 0))
-        if getattr(slots, "_buffers", None):
-            with slots._lock:
-                for idx in range(slots.slots):
-                    slots._state[idx] = slots.FREE
-                    slots._key[idx] = None
-                    slots._refs[idx] = 0
-                    slots._event[idx] = None
-                slots._by_key.clear()
-                slots._gen += 1
-                try:
-                    slots._lru.clear()
-                except Exception:
-                    pass
-                slots._buffers = []
-                slots._arena = None
-                slots._dirty.clear()
-        # 不放 _paused：下一次 acquire 必须能自己重建。但要用更小的尺寸 ——
-        # 这一档刚刚在这张卡上 OOM 掉了，原样重建只会再 OOM 一次。8GB 上
-        # 减半两三次就落到「放得下」的那一档，不需要人工写死数字。
-        if _prev > 0:
-            _n = max(8, _prev // 2)
-            slots.slots = _n
-            with slots._lock:
-                slots._state = [slots.FREE] * _n
-                slots._key = [None] * _n
-                slots._refs = [0] * _n
-                slots._event = [None] * _n
-                slots._free = list(range(_n - 1, -1, -1))
-                slots._cur = 0
+        with slots._lock:
+            if any(slots._refs) or any(state in (slots.RESERVED, slots.COPYING) for state in slots._state):
+                raise RuntimeError("cannot release expert storage with active readers or producers")
+            slots._paused = True
+            slots.synchronize()
+            slots._state = [slots.FREE] * slots.slots
+            slots._key = [None] * slots.slots
+            slots._event = [None] * slots.slots
+            slots._consumer_events = [{} for _ in range(slots.slots)]
+            slots._by_key.clear()
+            slots._gen += 1
+            slots._lru.clear()
+            slots._urgent.clear()
+            slots._stage_bufs.clear()
+            slots._tab_dirty.clear()
+            slots._free.clear()
+            slots._buffers = []
+            slots._arena = []
+            slots._slot_dev = []
+            slots._slot_tab = None
+            slots._copy_streams = {}
+            slots._copy_stream = None
+            slots._copy_events = []
             slots._paused = False
-        try:
-            import torch
-
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
 
     def resume_slots(self) -> None:
-        """Let the slot pool allocate itself again (the next acquire does it lazily)."""
         if self.slots is not None:
             self.slots._paused = False
 
     def release(self, records: Iterable[ExpertRecord]) -> None:
         for rec in records:
             layer, expert = rec.key
-            with self._lock:
-                self._open[(layer, expert)] = max(0, self._open[(layer, expert)] - 1)
-            self.ram.lease((layer, expert), -1)
+            if rec.event is not None and not rec.event.query():
+                rec.event.synchronize()
             if self.slots is not None:
                 self.slots.release(layer, expert)
+            with self._lock:
+                self._open[(layer, expert)] -= 1
+            self.ram.lease((layer, expert), -1)
 
     @contextmanager
     def experts(self, layer: int, experts: Iterable[int], *,

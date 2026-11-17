@@ -1,98 +1,28 @@
-"""Host memory budget: the single place that decides how much RAM may be pinned.
+"""主机内存分配与记账。
 
-Every large host allocation (the pinned layer slab, the pinned expert cache) asks here
-first and gets whatever is safe *right now*, so the same code runs unchanged on a 16GB
-laptop, a 47GB workstation or a 512GB server. Nothing in the engine may assume a
-machine: if a request cannot be honoured the caller degrades (pageable bytes, streaming
-instead of pinning) instead of paging the box into the ground, which is what an
-un-budgeted 16GB slab + 6GB pinned cache did on a 47GB box.
-
-The accounting is deliberately stateless about our own allocations: Windows and Linux
-both subtract a fresh allocation from "available" immediately, so re-reading available
-on every request already accounts for everything we (and every other process) hold.
+HostPool 管理已申请存储中的切片、对齐和回收，不决定容量。
+HostBudget 执行容量申请；锁页申请失败时不缩容或改用可换出存储。
 """
 from __future__ import annotations
 
-import os
-import sys
 import threading
 
 GB = 1 << 30
 
 
+def _memory_snapshot() -> tuple[int, int]:
+    """读取操作系统的物理内存总量与可用量；读取失败必须上抛。"""
+    import psutil
+
+    memory = psutil.virtual_memory()
+    total, available = int(memory.total), int(memory.available)
+    if total <= 0 or not 0 <= available <= total:
+        raise RuntimeError("invalid physical memory snapshot")
+    return total, available
+
+
 def physical_available() -> int:
-    """**真实可用的物理内存字节数。**
-
-    这个函数只有一个职责：回答「现在还能真的装进内存多少字节」。它返回的数
-    必须能直接兑现成物理页，不能含任何靠硬盘兜底的成分。
-
-    口径：
-      - Windows: GlobalMemoryStatusEx 的 **ullAvailPhys**。
-        **不能用 ullAvailPageFile**：那是「物理 + 页文件」的可用 commit 额度，
-        把它当内存用等于让硬盘冒充内存 —— 申请下来的一部分页会落在
-        pagefile 里，访问时 swap-in 比读盘还慢，而大块 pinned 申请还会把整机
-        commit 拖干净（实测把一个 47GB 的机器压到 VirtualAlloc 失败，
-        连 DSH 自己的执行进程都起不来）。
-      - Linux: /proc/meminfo 的 **MemAvailable**（内核估算的可回收 + 空闲，
-        已经扣掉了不可回收的页缓存，是可以安全分配的量）。
-
-    平台拿不到就返回 0，调用方据此跳过夹取（而不是当成「无限」）。
-    """
-    try:
-        if os.name == "nt":
-            import ctypes
-
-            class _MEMSTATUS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-            st = _MEMSTATUS()
-            st.dwLength = ctypes.sizeof(_MEMSTATUS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
-                return int(st.ullAvailPhys)
-        else:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        return int(line.split()[1]) * 1024
-    except Exception:
-        pass
-    return 0
-
-
-# 旧名字保留一段时间以免外部脚本炸，但语义已经改成物理可用量。
-# 它以前返回 ullAvailPageFile，那是错的。
-available_commit = physical_available
-
-
-def _physical_ram() -> int:
-    """Physical RAM without importing anything heavy (psutil can fail under pressure)."""
-    try:
-        if os.name == "nt":
-            import ctypes
-
-            class _MEMSTATUS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-            st = _MEMSTATUS()
-            st.dwLength = ctypes.sizeof(_MEMSTATUS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
-                return int(st.ullTotalPhys)
-        else:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        return int(line.split()[1]) * 1024
-    except Exception:
-        pass
-    return 0
+    return _memory_snapshot()[1]
 
 
 _CUDART = None
@@ -284,602 +214,249 @@ def _pinned_pool(nbytes: int):
     return PinnedBuffer(addr, dp.value, n)
 
 
-def _touch_pages(buf, n: int) -> None:
-    """Commit every 4KB page of a host allocation right now.
-
-    The C loop below is a single strided numpy write, which is ordered and therefore
-    single-threaded: on a 300GB claim that is 78M page faults on one core (measured:
-    the whole start-up sat in this function, one core at 100%, for tens of seconds).
-    The faults themselves are independent per range, so split the buffer into
-    cpu_count() chunks and touch them from threads -- the page-fault work is in the
-    kernel, so it scales with cores.
-
-    MADV_POPULATE_WRITE (Linux >= 5.14) does the same thing in one syscall; try it
-    first and fall back to the threaded walk.
-    """
-    import os as _os
-    try:
-        import ctypes as _ct
-
-        _libc = _ct.CDLL("libc.so.6", use_errno=True)
-        _rc = _libc.madvise(_ct.c_void_p(_ct.addressof(_ct.c_char.from_buffer(buf))),
-                            _ct.c_size_t(n), 23)  # MADV_POPULATE_WRITE
-        if _rc == 0:
-            return
-    except Exception:
-        pass
-
-    ncpu = max(1, min(32, (_os.cpu_count() or 4)))
-    if n < (1 << 20) or ncpu == 1:
-        try:
-            import numpy as np
-
-            np.frombuffer(buf, dtype=np.uint8)[::4096] = 1
-            return
-        except Exception:
-            pass
-        for off in range(0, n, 4096):
-            buf[off] = b"\x01"
-        return
-
-    step = (n + ncpu - 1) // ncpu
-    step -= step % 4096
-    ranges = [(o, min(n, o + step)) for o in range(0, n, step)]
-
-    def _do(lo_hi):
-        lo, hi = lo_hi
-        try:
-            import numpy as _np
-
-            _np.frombuffer(buf, dtype=_np.uint8, offset=lo, count=hi - lo)[::4096] = 1
-        except Exception:
-            for off in range(lo, hi, 4096):
-                buf[off] = b"\x01"
-
-    from concurrent.futures import ThreadPoolExecutor as _TPE
-
-    with _TPE(max_workers=ncpu, thread_name_prefix="tinyinfer-touch") as _ex:
-        list(_ex.map(_do, ranges))
-
-
 class HostPool:
-    """One big host allocation that every pageable buffer carves from.
-
-    Rationale: the engine knows its whole footprint at start-up. Allocating it once and
-    sub-allocating keeps every byte inside memory the process already owns, so a later
-    cache fill cannot fail (or push the box to the page file) because some other program
-    took the RAM in between -- the failure mode seen in practice.
-
-    Also usable as a pinned pool by passing the buffer reported by a CUDA host alloc.
-    """
+    """已分配主机内存的子分配器；配额由规划器决定，余量由活跃切片决定。"""
 
     def __init__(self, total: int):
-        self.total = max(0, int(total))
+        self.total = int(total)
+        if self.total < 0:
+            raise ValueError("host pool capacity cannot be negative")
         self._view = None
-        self._off = 0
-        self._lock = threading.Lock()
         self._owner = None
-        # 回收区。纯 bump 分配器在这里是不行的：启动时权重会从池子里切出去
-        # （weights.ShardStore.get 走 build_pool），而常驻层的 host 副本在权重
-        # 上显存之后就没用了（engine 里明确 b._cpu_refs = None）。那些字节如果
-        # 不回池子，就白白占着——实测启动后 9.53GB / 1246 次分配躺在那里，
-        # 池子的 39% 是死的，专家缓存只能拿到 13GB 而不是 22GB。
-        # 用简单 free list（首次适配）就够了：分配/释放都发生在启动期，量不大。
-        self._free: list[tuple[int, int]] = []
+        self._base = None
+        self._lock = threading.Lock()
+        self._free = [(0, self.total)] if self.total else []
+        self._allocations: dict[int, int] = {}
+        self._used = 0
 
     @classmethod
     def from_claimed(cls, buffer, nbytes: int) -> "HostPool":
-        pool = cls(nbytes)
-        view = memoryview(buffer)
-        try:
-            view = view.cast("B")
-        except (TypeError, ValueError):
-            pass
-        pool._view = view[: int(nbytes)]
-        pool._owner = buffer          # keep the allocation alive
-        # Absolute address of byte 0: a tensor built from a pool slice can be located by
-        # data_ptr() - _base, which is what the flat-streaming setup uses to prove a whole
-        # layer already lies in one contiguous region and skip the copy.
-        try:
-            import ctypes
+        import ctypes
 
-            pool._base = int(ctypes.addressof(buffer))
-        except Exception:
-            pool._base = None
+        pool = cls(nbytes)
+        view = memoryview(buffer).cast("B")
+        if view.readonly:
+            raise ValueError("host pool backing must be writable")
+        if view.nbytes < pool.total:
+            raise ValueError("host pool backing is smaller than its declared capacity")
+        pool._view = view[:pool.total]
+        pool._owner = buffer
+        if pool.total:
+            pool._base = ctypes.addressof(ctypes.c_char.from_buffer(pool._view))
         return pool
 
     def slice_at(self, offset: int, n: int):
-        """Pool bytes [offset, offset+n) as a memoryview, or None when out of range."""
+        """借用已持有内存的视图，不创建新的分配记录。"""
         if self._view is None or offset < 0 or n <= 0 or offset + n > self.total:
             return None
         return self._view[offset:offset + n]
 
     @property
     def used(self) -> int:
-        return self._off
+        with self._lock:
+            return self._used
 
     @property
     def free(self) -> int:
-        return max(0, self.total - self._off)
+        with self._lock:
+            return self.total - self._used
 
     def release(self, offset: int, n: int) -> None:
-        """把一段还回池子（合并相邻空闲块）。
-
-        只用于「确定不再有人引用」的字节 —— 例如常驻层的 host 副本在权重已经
-        复制到显存之后。调用方负责保证没有 tensor 还指向这段内存，否则就是
-        悬空指针。
-        """
-        n = int(n)
-        off = int(offset)
-        if n <= 0 or off < 0 or off + n > self.total:
-            return
+        """归还完整分配；调用方必须先解除所有持有该切片的引用。"""
+        off, size = int(offset), int(n)
         with self._lock:
-            self._free.append((off, n))
+            if self._allocations.get(off) != size or size <= 0:
+                raise ValueError(f"unknown host allocation: offset={off}, bytes={size}")
+            del self._allocations[off]
+            self._used -= size
+            self._free.append((off, size))
             self._free.sort()
-            merged: list[tuple[int, int]] = []
-            for o, sz in self._free:
-                if merged and merged[-1][0] + merged[-1][1] >= o:
-                    mo, msz = merged[-1]
-                    merged[-1] = (mo, max(mo + msz, o + sz) - mo)
+            merged = []
+            for start, length in self._free:
+                if merged and merged[-1][0] + merged[-1][1] == start:
+                    previous, previous_size = merged[-1]
+                    merged[-1] = (previous, previous_size + length)
                 else:
-                    merged.append((o, sz))
+                    merged.append((start, length))
             self._free = merged
 
-    def alloc(self, n: int, align: int = 4096) -> memoryview | None:
-        """Carve n bytes (4096-aligned by default). Returns None when full.
+    def alloc(self, n: int, align: int | None = None) -> memoryview | None:
+        """按空闲区首次适配；对齐产生的前后碎片仍归池所有。"""
+        import mmap
 
-        优先满足 free list（启动期权重回收出来的区域），否则从顶部 bump。
-        两套一起用：bump 保证顺序分配的效率，free list 保证回收的字节能被下一次
-        分配真正用上，而不是变成顶部永远越不过去的高水位。
-        """
-        n = int(n)
-        if n <= 0 or self._view is None:
+        size = int(n)
+        alignment = mmap.PAGESIZE if align is None else int(align)
+        if size <= 0 or alignment <= 0:
+            raise ValueError("allocation size and alignment must be positive")
+        if self._view is None:
             return None
         with self._lock:
-            for idx, (fo, fsz) in enumerate(self._free):
-                if fsz < n:
+            for idx, (off, length) in enumerate(self._free):
+                start = (self._base + off + alignment - 1) // alignment * alignment - self._base
+                end = start + size
+                if end > off + length:
                     continue
-                self._free.pop(idx)
-                if fsz > n + align:
-                    self._free.append((fo + n, fsz - n))
-                    self._free.sort()
-                return self._view[fo:fo + n]
-            start = (self._off + align - 1) // align * align
-            if start + n > self.total:
-                return None
-            self._off = start + n
-            return self._view[start:start + n]
+                fragments = []
+                if start > off:
+                    fragments.append((off, start - off))
+                if end < off + length:
+                    fragments.append((end, off + length - end))
+                self._free[idx:idx + 1] = fragments
+                self._allocations[start] = size
+                self._used += size
+                return self._view[start:end]
+        return None
 
-    def tensor(self, n: int, align: int = 4096):
-        """Carve n bytes out of the pool as a writable uint8 torch tensor.
-
-        The pool is created by cudaHostAlloc, so the slice is pinned and can be used
-        as the source of an async H2D. torch.frombuffer keeps the buffer alive itself,
-        but the memoryview is stored on the tensor too so the export cannot be dropped
-        while the layer still points at it.
-        """
+    def tensor(self, n: int, align: int | None = None):
+        """创建带回收身份的 uint8 视图；不另分配主机存储。"""
         mv = self.alloc(n, align=align)
         if mv is None:
             return None
+        import ctypes
         import torch
 
-        t = torch.frombuffer(mv, dtype=torch.uint8)
-        t._tiny_pool_mv = mv
-        return t
+        offset = ctypes.addressof(ctypes.c_char.from_buffer(mv)) - self._base
+        try:
+            tensor = torch.frombuffer(mv, dtype=torch.uint8)
+        except Exception:
+            self.release(offset, n)
+            raise
+        tensor._tiny_pool_mv = mv
+        tensor._tiny_pool_off = offset
+        tensor._tiny_pool_len = int(n)
+        return tensor
 
     def reset(self) -> None:
+        """调用方解除全部视图后，重置整个池的分配记录。"""
         with self._lock:
-            self._off = 0
+            self._free = [(0, self.total)] if self.total else []
+            self._allocations.clear()
+            self._used = 0
 
 
 class HostBudget:
-    def __init__(self, reserve_gb: float | None = None):
+    def __init__(self):
         self._lock = threading.Lock()
-        self.total = 0
-        self._avail0 = 0
-        try:
-            import psutil
-
-            vm = psutil.virtual_memory()
-            self.total = int(vm.total)
-            self._avail0 = int(vm.available)
-        except Exception:
-            pass
-        if not self.total:
-            # Under memory pressure an import can fail; fall back to the OS so the
-            # budget never silently collapses to zero (which is what turned every slab
-            # grant into "0 bytes available" and dropped the engine to per-tensor H2D).
-            self.total = _physical_ram()
-        # Budget a fixed FRACTION OF PHYSICAL RAM, not "available". On Windows
-        # psutil.available excludes the standby list while every shard we read fills it,
-        # so after loading the model "available" reads 7GB on a 47GB box and every grant
-        # came back short -- the slab fell back to per-tensor copies, the box swapped to
-        # C: and decode collapsed to 17s/token. A share of total RAM is stable no matter
-        # what the page cache is doing.
-        if reserve_gb is not None:
-            self.reserve = int(float(reserve_gb) * GB)
-        else:
-            # **不预留。** 这个池子是「进程申请下来、自己切分」的，申请量本来就
-            # 由 claim() 的成败决定：cudaHostAlloc 拿不到就自动缩 10% 再试，
-            # 一直缩到能成功为止。再叠加一个 15% 的预备量只会让每台机器都少
-            # 用一块内存 —— 47GB 的机器上白扔 7GB，371GB 的机器上白扔 55GB，
-            # 而那个数没有任何依据，纯属「留一点心里踏实」。
-            self.reserve = 0
-        # what this process may hand out in total (weights + slab + expert cache)
-        self.limit = max(0, self.total - self.reserve)
-        # **再夹一次「此刻真的能用」。**
-        #
-        # total 是物理总量，不含 pagefile，这一点是对的；但它也不知道桌面和其它进程
-        # 已经占走多少。本机 47.2GB 里桌面常占 10~14GB，按 total 算出的 40.1GB 上限
-        # 就会把缺口推进 pagefile —— pinned 页一旦落到 swap，专家访问变成 swap-in，
-        # 比读盘还慢，而且大块 cudaHostRegister 会直接失败。
-        #
-        # 只在这个方向夹：available 更大时不抬上限（那是页缓存的浮动，不该让计划跟着飘）。
-        # 不再按「可用减 6GB」夹。那种常数在每台机器上都错：47GB 的机器上
-        # 减 6GB 只剩一点，371GB 的机器上减 6GB 又几乎没约束。
-        # claim() 自己会处理失败（cudaHostAlloc 缩 10% 重试），那才是可靠的边界。
-        _av = self.available()
-        if _av:
-            self.limit = min(self.limit, int(_av))
-        if os.environ.get("TI_RAM_FRACTION"):
-            self.limit = int(self.total * float(os.environ["TI_RAM_FRACTION"]))
+        self.total, self.limit = _memory_snapshot()
         self.granted = 0
+        self._held = []
 
     def available(self) -> int:
-        """此刻真实可用的物理内存。
+        return physical_available()
 
-        优先用 physical_available()：它的口径是固定的（Windows ullAvailPhys /
-        Linux MemAvailable），不随 psutil 版本和平台浮动。psutil 只作为兜底，
-        因为它在 Windows 上取的本来就是 ullAvailPhys，结果一致。
-        """
-        _real = physical_available()
-        if _real:
-            return int(_real)
-        try:
-            import psutil
-
-            return int(psutil.virtual_memory().available)
-        except Exception:
-            return self._avail0
-
-    def claim(self, nbytes: int, real: bool = False) -> bool:
-        """Reserve the whole planned footprint up front (one measurement, one decision).
-
-        The planner sizes every buffer from a single measurement taken at start-up. When
-        allocation is lazy, other processes eat that memory in the meantime and the
-        numbers the plan was built on are gone: grants come back short and the box ends up
-        swapping. claim() books the planned bytes once so `room()` no longer has to consult
-        live `available()` (which is exactly what made the plan drift).
-
-        `real=True` also allocates and touches the pages so the OS commits them; that is
-        the strongest guarantee but it doubles the footprint while the caches are still
-        lazily filled, so it is opt-in (TI_CLAIM_REAL=1) until the caches allocate from
-        the claimed pool.
-        """
-        nbytes = max(0, int(nbytes))
+    def set_limit(self, nbytes: int) -> None:
+        """把额度固定为规划时的那一份物理余量，此后不再重新采样。"""
+        nbytes = int(nbytes)
         if nbytes <= 0:
-            return False
+            raise ValueError("host budget limit must be positive")
         with self._lock:
-            if self.granted + nbytes > self.limit:
-                return False
-            if real:
-                try:
-                    got = self._commit(nbytes)
-                except MemoryError:
-                    got = 0
-                if not got:
-                    return False
-                # book what was really taken, not what was asked for: the caches are
-                # then sized from the pages we actually own
-                nbytes = int(got)
+            if self.granted or self._held:
+                raise RuntimeError("cannot change a host budget that already owns memory")
+            self.limit = nbytes
+
+    def claim(self, nbytes: int) -> int:
+        """精确申请真实锁页内存；和只做额度登记的 grant 不同。"""
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            raise ValueError("host pool claim must be positive")
+        with self._lock:
+            if nbytes > self.room():
+                raise MemoryError(f"host claim exceeds budget: requested={nbytes}")
+            got = self._commit(nbytes)
+            if got != nbytes:
+                raise RuntimeError(f"host allocator returned {got} bytes for an exact {nbytes}-byte claim")
             self.granted += nbytes
-            self._claimed = True
-            # Return the bytes we really own (callers size their buffers from this and
-            # copy into the claimed range; a bare True silently became 1 byte).
             return nbytes
 
-    def _commit(self, nbytes: int) -> bool:
-        """Commit nbytes of address space so no other process can take it.
-
-        Windows VirtualAlloc(MEM_COMMIT) reserves *and* charges the commit limit in
-        kernel time (measured: 19GB in 0.000s), unlike bytearray(), which zero-fills and
-        costs ~1.7s per 19GB. This is the "claim it up front, in under a second" primitive.
-        """
-        if sys.platform != "win32":
-            return self._commit_posix(nbytes)
-        try:
-            import ctypes
-
-            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            k32.VirtualAlloc.restype = ctypes.c_void_p
-            k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
-                                         ctypes.c_ulong, ctypes.c_ulong]
-            k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
-            # VirtualAlloc alone only charges the commit limit; the physical pages stay
-            # unowned until written, which is why Task Manager showed a slow climb and the
-            # box could still page. Touch one byte per 4KB page, in 2GB batches, so a huge
-            # single allocation cannot be cut short under memory pressure; whatever was
-            # really taken is what we book. Single-threaded on purpose: this runs once at
-            # start-up and correctness matters more than shaving a second.
-            # One contiguous block, retried at half size: the cache slices its entries
-            # out of this single range, so it must not be a chain of separate mappings.
-            n = int(nbytes)
-            held = getattr(self, "_held", None)
-            if held is None:
-                held = self._held = []
-            # Preferred path: CUDA host (pinned) memory. It is DMA-able (the layer slab and
-            # the expert cache both feed async H2D from it), and pinned pages cannot be
-            # paged out at all -- which is exactly what "claimed" has to mean. Measured:
-            # cudaHostAlloc(8GB) returns in 0.6s.
-            pinned = None
-            try:
-                pinned = _cudart()
-            except Exception:
-                pinned = None
-            if pinned is not None and n >= (256 << 20):
-                # Retry at half size before giving up: cudaHostAlloc fails as a whole when
-                # the request is larger than what the driver will pin, and falling
-                # straight to ordinary pages would hand the cache memory the OS is free
-                # to page out -- exactly the failure this pool exists to prevent. A
-                # smaller pinned pool still is DMA-able; a larger pageable one is not.
-                # Step down by 10% rather than halving: the driver's pinned ceiling sits
-                # somewhere below physical RAM, and halving throws away up to half of it
-                # (28GB refused -> 14GB taken, when 26GB would have worked). Ten percent
-                # converges in a handful of tries and keeps the expert cache, which is
-                # sized from what we actually get, as large as the driver allows.
-                want = int(n)
-                while want >= (256 << 20):
-                    ptr = ctypes.c_void_p()
-                    rc = pinned.cudaHostAlloc(ctypes.byref(ptr), want, 0)
-                    if rc == 0 and ptr.value:
-                        # No VirtualLock here: cudaHostAlloc pages are already
-                        # non-pageable, and locking 20GB into the working set only
-                        # burns the PFN database / non-paged quota, which on Windows
-                        # showed up as later cudaMalloc calls failing with OOM.
-                        held = getattr(self, "_held", None)
-                        if held is None:
-                            held = self._held = []
-                        view = (ctypes.c_char * want).from_address(ptr.value)
-                        # commit the physical pages NOW: cudaHostAlloc reserves the
-                        # range, the pages land on first touch
-                        _touch_pages(view, want)
-                        held.append(("pinned", pinned, ptr.value, want, view))
-                        self._claim_buf = view
-                        self._claim_bytes = want
-                        self._claim_pinned = True
-                        if want < n:
-                            print(f"[tinyinfer] host pool: cudaHostAlloc shrank "
-                                  f"{n/2**30:.1f}GB -> {want/2**30:.1f}GB", flush=True)
-                        return want
-                    # 10% steps, not halving: the driver's pinned ceiling sits somewhere
-                    # below physical RAM, and halving throws away up to half of it (28GB
-                    # refused -> 14GB taken when 26GB would have worked). The expert
-                    # cache is sized from what we actually get, so a better probe is
-                    # worth more than a fast one.
-                    want = int(want * 0.9)
-            while n >= (256 << 20):
-                # Prefer large pages: their pages cannot be trimmed by the memory
-                # manager, which is the only way to keep the cache resident for the
-                # whole run (normal pages were observed leaving the working set mid-run
-                # even after VirtualLock). Needs SeLockMemoryPrivilege (admin) and a
-                # size that is a multiple of the 2MB large-page granularity; fall back
-                # to ordinary committed pages when the privilege is absent.
-                try:
-                    k32.GetLargePageMinimum.restype = ctypes.c_size_t
-                    gran = int(k32.GetLargePageMinimum() or 0)
-                except Exception:
-                    gran = 0
-                ptr = 0
-                if gran:
-                    big = (n // gran) * gran
-                    if big >= gran:
-                        ptr = k32.VirtualAlloc(None, big,
-                                               0x20000000 | 0x1000 | 0x2000, 0x04)
-                if not ptr:
-                    ptr = k32.VirtualAlloc(None, n, 0x1000 | 0x2000, 0x04)
-                if ptr:
-                    try:
-                        buf = (ctypes.c_char * n).from_address(ptr)
-                        _touch_pages(buf, n)
-                    except Exception:
-                        k32.VirtualFree(ptr, 0, 0x8000)
-                        ptr = None
-                if ptr:
-                    # hold the array OBJECT, not just the pointer: after a pointer is
-                    # stored the underlying pages can be reclaimed (observed as the working
-                    # set falling from 22.7GB to 11.1GB mid-run)
-                    # Lock the pages in the working set as well: touching alone makes
-                    # them resident, but the OS may still trim them under pressure, which
-                    # showed up as the working set falling 22.6GB -> 10.5GB mid-run. A
-                    # locked page cannot be trimmed, which is what "claimed" has to mean
-                    # for the cache to stay in RAM.
-                    try:
-                        k32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-                        k32.VirtualLock.restype = ctypes.c_int
-                        k32.VirtualLock(ptr, n)
-                    except Exception:
-                        pass
-                    held.append((k32, ptr, n, buf))
-                    self._claim_buf = buf
-                    self._claim_bytes = n
-                    return n
-                n //= 2
-            return 0
-        except Exception:
-            return False
-
-    def _commit_posix(self, nbytes: int) -> int:
-        """mmap + touch: the POSIX counterpart of VirtualAlloc + faulting the pages in.
-
-        Same contract as the Windows path: one contiguous anonymous mapping, every 4KB
-        page written so the pages are really owned, halving on failure, and the bytes that
-        were actually taken are what gets booked. mlock is attempted but not required --
-        a container or an ordinary user shell usually has RLIMIT_MEMLOCK far below what a
-        model slab needs, and refusing the pool over that would be worse than a pool the
-        kernel may page out under pressure.
-        """
+    def _commit(self, nbytes: int) -> int:
+        """精确申请所需字节；锁页失败不缩容，也不改用可换出的内存。"""
         import ctypes
-        import mmap
 
-        n = int(nbytes)
-        held = getattr(self, "_held", None)
-        if held is None:
-            held = self._held = []
-        # 一次 mmap 到位。失败就直接报出来，不要减半重试：300GB 拿不到时
-        # 150GB 也拿不到，而每次重试都要重新 mmap + touch，纯属浪费时间。
-        # 池子小了引擎会静默降级（缓存变小、每 token 重新读盘），那种"能跑但慢
-        # 十倍"的结果比启动失败更难查。
-        # 专家权重留在硬盘，只有热点进显存槽位 —— 引擎的主体工作就是这个。
-        # 主存池只是「换入换出」的中间层，用 mmap 就够，不需要 pin：
-        #   1) 275GB 全 pin 会把可用内存吃到只剩 3GB（实测 ssh 都被挤掉），
-        #   2) L20 的 UnifiedAddressing=0，pageable 内存本来也没有可用的 device
-        #      指针，pin 了也只是把「谁在显存里」这件事挪个地方，没有收益。
-        # 真正让 CPU 退出 decode 的是「热点专家常驻显存槽位」（VramSlotCache.pin），
-        # 命中时 _materialize 直接返回显存 tensor，不碰 host、不等 CPU。
+        runtime = _cudart()
+        if runtime is None:
+            raise RuntimeError("CUDA runtime is required for the pinned host pool")
+        ptr = ctypes.c_void_p()
+        rc = runtime.cudaHostAlloc(ctypes.byref(ptr), nbytes, 0)
+        if rc != 0 or not ptr.value:
+            raise MemoryError(f"cannot allocate pinned host pool: bytes={nbytes}, CUDA error={rc}")
         try:
-            buf = mmap.mmap(-1, n)
-        except (OSError, MemoryError, ValueError) as exc:
-            raise MemoryError(
-                f"cannot reserve {n / (1 << 30):.1f}GB host pool: {exc}. "
-                f"Lower TI_HOST_POOL_GB / TI_RAM_FRACTION, or free memory."
-            ) from exc
-        # 逐页 touch 的唯一目的是"保证这些页真的属于我"，代价是内核要在启动时
-        # 做 n/4KB 次缺页（300GB = 7800 万次），即使分到多线程也是十几秒的纯等待，
-        # 而此刻 GPU 已经在空转。池子是个马上要被写满的缓存：专家读进来就写在
-        # 上面，页迟早会被 fault 进来，所以默认交给内核按需填充（mmap 本来就是
-        # lazy）。要"启动即锁定"用 TI_CLAIM_TOUCH=1。
-        if __import__("os").environ.get("TI_CLAIM_TOUCH", "0") == "1":
-            try:
-                _touch_pages(buf, n)
-            except Exception as exc:
-                try:
-                    buf.close()
-                except Exception:
-                    pass
-                raise MemoryError(f"cannot fault in {n / (1 << 30):.1f}GB pool: {exc}") from exc
-        if True:
-            # 不 mlock。mlock 要求内核把每一页都装进物理内存并锁住，280GB 意味着
-            # 一次强制 populate 7000 万页 —— 这是启动单核 100% 的真正来源，
-            # 而且默认的 RLIMIT_MEMLOCK 通常只有几十 MB 到几 GB，280GB 必然失败，
-            # 只是失败之前已经白干了。池子里的页在被写时会自然 fault 进来，锁不锁
-            # 对正确性没有影响；真要锁用 TI_CLAIM_MLOCK_GB 指定一个合理上限。
-            _mlock_gb = __import__("os").environ.get("TI_CLAIM_MLOCK_GB")
-            if _mlock_gb:
-                try:
-                    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-                    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-                    addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-                    _mn = min(n, int(float(_mlock_gb) * (1 << 30)))
-                    libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(_mn))
-                except Exception:
-                    pass
-            held.append(("mmap", buf, n))
-            self._claim_buf = buf
-            self._claim_bytes = n
-            self._claim_pinned = False
-            return n
-        return 0
+            view = (ctypes.c_char * nbytes).from_address(ptr.value)
+            if getattr(self, "_held", None) is None:
+                self._held = []
+            self._held.append(("pinned", runtime, ptr.value, nbytes, view))
+        except Exception:
+            runtime.cudaFreeHost(ptr)
+            raise
+        self._claim_buf = view
+        self._claim_bytes = nbytes
+        self._claim_pinned = True
+        return nbytes
 
     def close(self) -> int:
-        """释放本预算占住的所有大块内存，返回释放的字节数。
-
-        **这是原来缺失的那一环。** `_commit` 把 cudaHostAlloc / VirtualAlloc 拿到
-        的块都塞进 self._held 里只为「别让 GC 过早回收」，但从来没有对应的释放
-        路径 —— 进程活着内存就一直在。对一个会重载模型的服务来说，每换一次模型
-        就多一份池子，这是实打实的泄漏。
-
-        释放顺序和分配相反（后进先出）：pinned 块用 cudaFreeHost，VirtualAlloc
-        块用 VirtualFree(MEM_RELEASE)。任何一个失败都不影响后面的，最后一律清空
-        列表并把记账归零 —— 只有记账和真实现状一致，下一次 claim 才不会算出
-        一个「看起来还有空间」的假账。
-        """
+        """释放真实持有的分配；失败的分配仍保留身份和记账，允许稍后重试。"""
         import ctypes
 
         freed = 0
+        errors = []
         with self._lock:
-            held = getattr(self, "_held", None) or []
-            _pinned = None
-            try:
-                _pinned = _cudart()
-            except Exception:
-                _pinned = None
-            # 三种记账格式并存，按形状分别释放：
-            #   ("pinned", cudart, ptr, nbytes, view)      cudaHostAlloc
-            #   (k32, ptr, nbytes, buf)                     VirtualAlloc
-            #   ("mmap", buf, nbytes)                       POSIX mmap
-            for item in reversed(held):
-                if not item:
-                    continue
-                _n = 0
-                _ok = False
+            remaining = []
+            for item in reversed(getattr(self, "_held", [])):
                 try:
-                    _head = item[0]
-                    if isinstance(_head, str) and _head == "pinned":
-                        _lib = item[1] if item[1] is not None else _pinned
-                        _ptr, _n = item[2], int(item[3])
-                        if _lib is not None:
-                            _ok = (_lib.cudaFreeHost(ctypes.c_void_p(_ptr)) == 0)
-                    elif isinstance(_head, str) and _head == "mmap":
-                        _n = int(item[2])
-                        item[1].close()
-                        _ok = True
+                    if item[0] == "pinned":
+                        _, runtime, ptr, nbytes, view = item
+                        rc = runtime.cudaFreeHost(ctypes.c_void_p(ptr))
+                        if rc != 0:
+                            raise RuntimeError(f"cudaFreeHost failed: CUDA error={rc}")
                     else:
-                        # (k32, ptr, nbytes, buf)
-                        _k32, _ptr, _n = _head, item[1], int(item[2])
-                        _k32.VirtualFree(ctypes.c_void_p(_ptr), 0, 0x8000)
-                        _ok = True
-                except Exception:
-                    _ok = False
-                if _ok:
-                    freed += _n
-            held.clear()
-            self.granted = 0
-            self._claimed = False
-            self._claim_buf = None
-            self._claim_bytes = 0
-            self._claim_pinned = False
+                        raise RuntimeError("unknown host allocation kind")
+                    freed += nbytes
+                except Exception as exc:
+                    remaining.append(item)
+                    errors.append(str(exc))
+            self._held = list(reversed(remaining))
+            self.granted -= freed
+            if self._held:
+                last = self._held[-1]
+                self._claim_pinned = True
+                self._claim_buf = last[4]
+                self._claim_bytes = last[3]
+            else:
+                self._claim_buf = None
+                self._claim_bytes = 0
+                self._claim_pinned = False
+        if errors:
+            raise RuntimeError("host pool release incomplete: " + "; ".join(errors))
         return freed
 
     def room(self) -> int:
-        """Bytes we may still hand out from our share of physical RAM.
-
-        Deliberately NOT derived from psutil.available(): on Windows that number drops
-        as the file cache fills with shard data we just read, so after loading the model
-        it reads 7GB on a 47GB box and every large grant failed (the slab fell back to
-        per-tensor copies and the box swapped to C:). Our share of *total* RAM is the
-        stable quantity; the standby list is reclaimable by the OS on demand.
-        """
-        if getattr(self, "_claimed", False):
-            # claimed up front: the plan's own arithmetic is authoritative, live
-            # available() would just make it drift with whatever else is running
-            return max(0, self.limit - self.granted)
-        if not self.limit:
-            return max(0, self.available() - self.reserve)
-        # Both bounds matter: our share caps the total we hand out, and the live
-        # available number stops us when other allocations (model weights, page cache)
-        # already used the memory. Taking only the share caused an 8GB card to try a
-        # 23GB slab and take the box to its page file.
-        return max(0, min(self.available() - self.reserve, self.limit - self.granted))
+        """未占用的额度；额度是规划时固定下来的那份余量。"""
+        return max(0, self.limit - self.granted)
 
     def grant(self, want: int) -> int:
-        """Ask for want bytes; returns how much is safe to take now (0..want)."""
-        want = max(0, int(want))
+        """登记精确的外部分配额度；不足时不返回一个缩水的数字。"""
+        want = int(want)
+        if want < 0:
+            raise ValueError("host grant cannot be negative")
         with self._lock:
-            got = min(want, self.room())
-            self.granted += got
-            return got
+            if want > self.room():
+                raise MemoryError(f"host grant exceeds budget: requested={want}")
+            self.granted += want
+            return want
 
     def release(self, nbytes: int) -> None:
-        """Give back a grant that was not (fully) used, e.g. a failed allocation."""
+        """归还外部分配额度；真实持有的锁页块必须经 close 释放。"""
+        nbytes = int(nbytes)
         with self._lock:
-            self.granted = max(0, self.granted - max(0, int(nbytes)))
+            owned = sum(item[3] for item in self._held)
+            if nbytes < 0 or nbytes > self.granted - owned:
+                raise ValueError("release does not match an outstanding host grant")
+            self.granted -= nbytes
 
     def stats(self) -> dict:
         return {
-            "total_gb": round(self.total / GB, 1),
-            "avail_gb": round(self.available() / GB, 1),
-            "reserve_gb": round(self.reserve / GB, 1),
-            "granted_gb": round(self.granted / GB, 1),
+            "total_gb": self.total / GB,
+            "avail_gb": self.available() / GB,
+            "granted_gb": self.granted / GB,
         }
 
 
@@ -890,7 +467,5 @@ def budget() -> HostBudget:
     """Process-wide budget (created on first use)."""
     global _BUDGET
     if _BUDGET is None:
-        import os
-
-        _BUDGET = HostBudget(os.environ.get("TI_RAM_RESERVE_GB"))
+        _BUDGET = HostBudget()
     return _BUDGET

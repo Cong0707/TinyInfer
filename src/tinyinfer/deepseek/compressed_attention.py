@@ -247,10 +247,11 @@ class MLACompressedAttention:
                 setattr(self, name, mod.to(device))
         for name in ("q_norm", "kv_norm", "sink"):
             setattr(self, name, getattr(self, name).to(device))
-        self.freqs_cis = self.freqs_cis.to(device)
+        self.freqs_cis = get_table(self._rope_key, self._rope_factory, device)
         if self.compressor is not None:
             self.compressor.to(device)
         if self.indexer is not None:
+            self.indexer.freqs_cis = self.freqs_cis
             self.indexer.to(device)
         return self
 
@@ -414,6 +415,8 @@ class MLACompressedAttention:
         # one shared table per (dim, seqlen, yarn args): resolving it through the cache
         # (rather than .to() per instance) keeps a single device copy instead of 40
         self.freqs_cis = get_table(self._rope_key, self._rope_factory, x.device)
+        if self.indexer is not None:
+            self.indexer.freqs_cis = self.freqs_cis
         freqs = self.freqs_cis[start_pos:start_pos + s]
 
         def _lin(w, x_):

@@ -320,6 +320,7 @@ def model_profile(index: Any) -> dict:
             "from the checkpoint itself.")
     prof: dict = {}
     per_layer: dict[int, int] = {}
+    packed_layers: dict[int, int] = {}
     for name in wm:
         # Layer tensors are "the ones a layer needs per token". Rather than hardcode a
         # naming scheme (this used to check for attn./ffn.gate./hc_, which is
@@ -360,6 +361,8 @@ def model_profile(index: Any) -> dict:
         except Exception:
             continue
         per_layer[lid] = per_layer.get(lid, 0) + int(n)
+        # 与权重环的向量加载 ABI 一致，每个张量按 256 字节对齐。
+        packed_layers[lid] = packed_layers.get(lid, 0) + (int(n) + 255) // 256 * 256
     if per_layer:
         prof["n_layers"] = max(per_layer) + 1
         # **不放大。header 记录的字节就是显存里该占的字节。**
@@ -376,8 +379,6 @@ def model_profile(index: Any) -> dict:
         # 正确做法：header 字节就是答案。如果引擎实际占用更大（例如 kernel 需要
         # 额外 workspace），那应该由引擎把实测值回填给规划器（见 planner.calibrate），
         # 而不是在这里乘一个来路不明的系数。
-        avg = sum(per_layer.values()) / len(per_layer)
-        mx = max(per_layer.values())
         # Two different numbers, used for two different things:
         #   layer_bytes     -> average, for "how many layers fit" (resident * avg)
         #   max_layer_bytes -> worst case, for sizing one flat/prefetch buffer
@@ -389,7 +390,8 @@ def model_profile(index: Any) -> dict:
         # layer_bytes 走原始字节（常驻层在显存里就是这些 fp8 载荷，没有环的开销）；
         # max_layer_bytes 走放大后的值（streaming 环按最坏层开一块连续 buffer）。
         prof["layer_bytes"] = sum(per_layer.values()) / len(per_layer)
-        prof["max_layer_bytes"] = mx
+        prof["max_layer_bytes"] = max(packed_layers.values())
+        prof["layer_bytes_by_id"] = dict(packed_layers)
         # routing width: needed to size the expert pool / decide on coverage
         try:
             import json as _json
@@ -441,10 +443,13 @@ def model_profile(index: Any) -> dict:
         # 这个倍数由 dtype 决定，不是经验值 —— 所以从 header 里读 dtype，
         # 而不是写死 2。
         prof["engram_bytes"] = int(_materialise_ratio(header, wm, "engram") * float(eng))
-    try:
-        prof["expert_bytes"] = int(index.expert_blob_bytes())
-    except Exception:
-        pass
+    routed = next((name for name in wm if ".ffn.experts." in name), None)
+    if routed is None:
+        prof["expert_bytes"] = 0
+    else:
+        layer = _layer_of(routed)
+        expert = int(routed.split(".experts.", 1)[1].split(".", 1)[0])
+        prof["expert_bytes"] = int(index.expert_blob_bytes(layer, expert))
     # MTP / DSpark draft stages: three small decoders plus the markov head. Only
     # counted when the tier enables speculation, because they cost VRAM that the
     # resident layers would otherwise use.

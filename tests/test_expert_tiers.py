@@ -24,6 +24,11 @@ class FakeRam:
     def __init__(self):
         self.entries = {}
         self.lookups = 0
+        self.refs = {}
+
+    def lease(self, key, delta):
+        self.refs[key] = self.refs.get(key, 0) + delta
+        assert self.refs[key] >= 0
 
     def get(self, layer, expert, blocking=True, admit=True):
         self.lookups += 1
@@ -51,7 +56,7 @@ class FakeReader:
 
     def read_many(self, blobs):
         self.reads.extend(blobs)
-        return [bytes([b[1] & 0xFF]) * BLOB for b in blobs]
+        return [bytearray([b[1] & 0xFF]) * BLOB for b in blobs]
 
 
 class FakeStore:
@@ -85,7 +90,7 @@ def test_vram_hit_skips_ram_and_disk(tier):
 
 def test_ram_hit_skips_disk(tier):
     store, mgr = tier
-    store.ram.entries[(1, 5)] = bytes([5]) * BLOB
+    store.ram.entries[(1, 5)] = bytearray([5]) * BLOB
     reads = len(store.reader.reads)
     mgr.need(1, [5])
     assert len(store.reader.reads) == reads, "a RAM hit must not go to disk"
@@ -102,12 +107,15 @@ def test_disk_read_admits_into_ram(tier):
 def test_disk_read_happens_once(tier):
     store, mgr = tier
     mgr.need(3, [9])
+    mgr.commit(3)
+    lease = mgr.ready(3, [9])
     reads = len(store.reader.reads)
-    mgr.release(3, [9])
+    mgr.release(3, lease)
     # 换一个池子把这一格挤掉，再从内存命中
     store.slots.ensure(3, list(range(20, 36)),
-                       lambda lay, want: {e: bytes([e]) * BLOB for e in want})
-    mgr.release(3, list(range(20, 36)))
+                       lambda lay, want: {e: bytearray([e]) * BLOB for e in want})
+    lease = mgr.ready(3, list(range(20, 36)))
+    mgr.release(3, lease)
     mgr.need(3, [9])
     assert len(store.reader.reads) == reads, "RAM should have served the second use"
 

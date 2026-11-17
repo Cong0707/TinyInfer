@@ -38,6 +38,7 @@ topk、layer_bytes、expert_bytes 和实测带宽推出来。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import ceil
 
 GB = 1 << 30
 MB = 1 << 20
@@ -61,7 +62,12 @@ class Layout:
     # resident 是权威字段，engine 通过 gpu_layers 属性读它（同名不同叫法）。
     resident: int = 0
     slots: int = 0
+    weight_buffers: int = 0
+    weight_buffer_bytes: int = 0
     cache_bytes: int = 0
+    host_pool_bytes: int = 0
+    host_weight_bytes: int = 0
+    host_reserve_bytes: int = 0
     pin_ratio: float = 0.0
     embed_on_cpu: bool = False
     head_on_cpu: bool = False
@@ -150,7 +156,7 @@ class Planner:
         self.tied_head = bool(self.model.get("tied_head", False))
 
         caps = getattr(hw, "cards", None) or []
-        self.vram = sum(c.total_gb for c in caps) * GB if caps else 0.0
+        self.vram = float(self.cal["usable_vram_bytes"]) if "usable_vram_bytes" in self.cal else sum(c.free_gb for c in caps) * GB
         self.has_gpu = bool(caps) and self.vram > 0
 
         # ---- 训练器可调的三个量 ------------------------------------------
@@ -269,6 +275,37 @@ class Planner:
 
     # ---- 目标函数 ---------------------------------------------------------
 
+    def _layer_bytes(self) -> tuple[int, ...]:
+        sizes = self.model.get("layer_bytes_by_id")
+        if not isinstance(sizes, dict):
+            raise RuntimeError("planning requires per-layer byte sizes from checkpoint metadata")
+        try:
+            values = tuple(ceil(sizes[i] if i in sizes else sizes[str(i)])
+                           for i in range(self.n_layers))
+        except KeyError as exc:
+            raise RuntimeError("planning is missing a layer byte size") from exc
+        if any(size <= 0 for size in values):
+            raise ValueError("layer byte sizes must be positive")
+        return values
+
+    def _weight_stream_seconds(self, resident: int, buffers: int) -> float:
+        sizes = self._layer_bytes()[resident:]
+        if not sizes:
+            return 0.0
+        transfer = self._required("h2d_layer_s", float) / self.layer_b
+        compute = self.cal.get("compute_per_layer_s")
+        if compute is None or buffers <= 1:
+            return sum(sizes) * transfer
+        # 模拟串行复制流与计算流；同一环槽只能在上一使用者计算结束后复用。
+        released = [0.0] * buffers
+        copied = computed = 0.0
+        for step, size in enumerate(sizes):
+            slot = step % buffers
+            copied = max(copied, released[slot]) + size * transfer
+            computed = max(computed, copied) + float(compute)
+            released[slot] = computed
+        return computed - len(sizes) * float(compute)
+
     def cost(self, lay: Layout) -> Cost:
         """估算这份布局的一步耗时。**唯一的判据。**"""
         n = self.n_layers
@@ -286,8 +323,7 @@ class Planner:
         # 曾经写成 `layer_b / h2d * 2.1` —— 那个 2.1 是「连续 DMA 带宽」和
         # 「一层 30 多个张量各自 set_weight」之间的实测差距。它随模型结构变
         # （张量个数不同）、随驱动变，写死就是把一台机器的比值当定律。
-        _per_layer_s = self._required("h2d_layer_s", float)
-        stream_s = stream * float(_per_layer_s)
+        stream_s = self._weight_stream_seconds(lay.resident, lay.weight_buffers)
 
         # **一步要几个不同的 (layer, expert)，以及「下一步还要重搬多少」。**
         #
@@ -439,48 +475,17 @@ class Planner:
         #
         # 后果很直接：按 1.7 算，475MB/层变成 808MB/层，8GB 卡只给 4 层；
         # 按实际算能放 10 层。README 记录的历史成绩（1.26 tok/s）正是 10 层那档。
-        b += lay.resident * self.layer_b
+        if not 0 <= lay.resident <= self.n_layers:
+            raise ValueError("resident layer count is outside the model")
+        b += sum(self._layer_bytes()[:lay.resident])
         b += lay.slots * self.expert_b
         if not lay.embed_on_cpu:
             b += self.embed_b
         if not lay.head_on_cpu and not self.tied_head:
             b += self.head_b
-        # 层搬运的周转缓冲：同一时刻只有一层在搬，所以一块就够（不是两块）。
-        #
-        # **用 layer_b（每层真正的权重字节）而不是 max_layer_b。**
-        # max_layer_bytes 是「含全部 384 个专家的层总字节」（本机 474.8MB），
-        # 而流式层实际只有 174.0MB 权重（实测 30 个张量）。按 474.8 算，
-        # 40 层全常驻就变成 9.68GB（实际 6.96GB），规划器于是永远选不到全常驻
-        # —— 而全常驻是唯一能启用 CUDA graph 的布局。
-        if lay.resident < self.n_layers:
-            # **有流式层时，slab 环要占 3 块。**
-            #
-            # 图/流水线要的「固定地址」只有 slab 能给：整层权重一次 DMA 进
-            # 显存环，环只有 3 块（当前 / 预取中 / 刚 release 还没退）。
-            # 逐层 b.to() 每次换地址，图里固化的地址就失效 —— 那正是
-            # 「图捕获成功、replay 稳定、但 out 全是 NaN」的根因。
-            #
-            # 不把这块算进预算的后果是实测出来的：8GB 卡上按「槽位 242
-            # (4.55GB) + 常驻 10 层」解出来，跑到捕获时 host pool 在 layer 10
-            # 就耗尽（13.7/13.7GB），slab 那 1.4GB 永远拿不到，图这条路直接
-            # 作废。规划器必须和引擎共用同一本账。
-            _SLAB_RING = 3
-            # **环按「最坏一层」开，不乘任何比例。**
-            #
-            # 这里曾经是 max(layer_b, max_layer_b * 0.5) —— 那个 0.5 是
-            # 「按最坏层的一半开环」的估值。环必须装得下最坏的一层，所以就是
-            # max_layer_bytes，不多不少。
-            # **环深度 = 1（当前层）+ 预取提前量，不是外部参数。**
-            #
-            # 环的作用是「让第 k 层的计算和第 k+1 层的 DMA 重叠」。所以块数
-            # 恰好等于「同时在用的层数」：当前这一层 + 预取中的那几层。
-            #
-            # 预取提前量由目标函数里的搬运代价决定（盘越慢越值得提前），
-            # 但至少要 1 块给「当前层」、1 块给「下一层」—— 2 是下界。
-            # 上界由显存给：环太大就挤掉槽位和常驻层。
-            _prefetch_ahead = 1
-            _SLAB_RING = 1 + _prefetch_ahead
-            b += _SLAB_RING * self.max_layer_b
+        if lay.weight_buffers < 0 or lay.weight_buffer_bytes < 0:
+            raise ValueError("weight ring capacity cannot be negative")
+        b += lay.weight_buffers * lay.weight_buffer_bytes
         # **workspace 由引擎实测回填，规划器不猜。**
         #
         # 这里曾经是 `b += 0.20 * GB` —— 一个「cuBLAS handle + 分配器碎片大约
@@ -552,230 +557,102 @@ class Planner:
             if not lay.head_on_cpu and not self.tied_head:
                 _cand.append(self.head_b)
             _headroom = max(_cand)
+        streamed = self.n_layers - lay.resident
+        if streamed:
+            if not 1 <= lay.weight_buffers <= streamed:
+                return False
+            if lay.weight_buffer_bytes < max(self._layer_bytes()[lay.resident:]):
+                return False
+        elif lay.weight_buffers or lay.weight_buffer_bytes:
+            return False
         return (self.used_bytes(lay) + _headroom) <= self.usable_vram()
 
     def usable_vram(self) -> float:
-        """这句卡此刻真正能用的字节。问驱动，不用比例。
+        """本次规划的容量快照；求解过程中不读取另一台机器的 CUDA 状态。"""
+        return self.vram
 
-        规划器原来写的是 vram * 0.85。那是在一台机器上试出来的安全系数，
-        换卡换模型都不成立。正确的量只有一个来源：驱动。
-
-        但它有个先后问题 —— 引擎构建时会占掉一部分（层权重、槽位 arena、
-        workspace），规划器必须知道构建完成后还能用多少。那部分由引擎实测后
-        回填 calibrate（engine_reserved_bytes）。
-        """
-        if not self.has_gpu:
-            raise RuntimeError(
-                'Planner.usable_vram: no GPU detected, there is no VRAM to plan with')
-        try:
-            import torch
-            _cards = getattr(self.hw, 'cards', None) or []
-            _idx = int(_cards[0].index) if _cards else 0
-            free, _total = torch.cuda.mem_get_info(torch.device('cuda', _idx))
-        except Exception as exc:
-            raise RuntimeError(
-                'Planner.usable_vram: cannot query the driver for free VRAM '
-                f'({exc!r}). The planner has no fallback fraction.') from exc
-        # **上限是「物理总量」，不是「此刻 free」。**
-        #
-        # 我第一版写成 `free + engine_reserved_bytes`，那是在算「现在还能分配
-        # 多少」；但规划器要回答的是「这份布局总共要占多少，占完之后装不装得
-        # 下」。两者差一个「此刻已经占掉的部分」：
-        #
-        #   查询时刻：模型还没 build，free 很小（arena 已经分配了一部分）
-        #   free + reserved = 3.95GB，而物理是 8.52GB
-        #
-        # 于是规划器以为只有 3.95GB 可用，却解出 6.81GB 的布局 —— 它自己矛盾，
-        # 跑到 rope 表那里 OOM。
-        #
-        # 正确口径：物理总量。used_bytes 算的就是「整个布局占多少」，两者同一
-        # 口径才能比。
-        # **口径：物理总量里「这个进程能拿到的部分」。**
-        #
-        # 直接用 _total 会把驱动/桌面合成占掉的显存算进来（这台卡 8.52GB
-        # 里只有 7.93GB 对进程可见）。正确的量是 free + 本进程已分配 ——
-        # 那正是「总量减去别的东西占的」。
-        try:
-            import torch as _t3
-
-            _alloc = int(_t3.cuda.memory_allocated(torch.device("cuda", _idx)))
-        except Exception:
-            _alloc = 0
-        return float(free) + float(_alloc)
-    def _host_cache_bytes(self, *, n_stream=None, slots=None) -> int:
-        """RAM 缓存能给多少字节。**只取决于主机内存，与显存布局无关。**
-
-        专家的存储形态是磁盘上的原始 blob（本机 19.7MB/个），全部 40x384 个
-        一共 7.6GB。只要有内存就该全缓存 —— 命中率 100% 时每步的专家 IO 是零，
-        这正是「内层（显存）最快、中层（内存）作缓存、外层（磁盘）最全」的核心。
-
-        原来这个值一直是 0（声明了没赋值），于是 ExpertCache 只兜底 10 条，
-        每步重复读盘 2.0GB。
-        """
-        avail = float(getattr(self.hw, "ram_avail_gb", 0) or 0) * GB
-        if avail <= 0:
-            # 内存探测失败：不假装能缓存。给 0 让调用方走「全读盘」路径，
-            # 这样慢是慢，至少不会因为算错容量而在运行中 OOM。
-            return 0
-        # 留 25% 给 OS、页缓存、别的进程和 Python 自己。实测本机 33GB 可用时
-        # 缓存 12GB 稳定（docs 里记的 10.27GB 配置也在这一档）。
-        # **主机缓存的容量由可用内存减掉真实占用算，不乘比例。**
-        #
-        # 这里曾经是 `int(avail * 0.35)` —— 「留 65% 给 OS/页缓存/别的进程」的
-        # 经验值。它在本机看起来是对的，换一台内存更小的机器就会算错。
-        #
-        # 正确的量：物理可用内存 - 已经确定要用的（slab + 槽位）。两者都是
-        # 实实在在的字节数，不需要百分比。
-        _budget = int(avail)
-        # **扣掉层权重 slab 的份额。**
-        #
-        # slab 和专家缓存从同一个 pinned 主机池里取（_flat_setup 按 signature
-        # 分配 2 块 x 每层权重）。不扣的后果是实测出来的：缓存拿走 11.26GB、
-        # slab 只剩 3.13GB，slab 一层都建不起来（pool exhausted at layer 0），
-        # 于是退回逐 tensor H2D —— 那正是 CUDA graph 拿不到固定地址、
-        # replay 出 NaN 的根源。
-        #
-        # slab 需要多少：流式层按 signature 分组，每组 2 块 x 单层权重。
-        # 组数由模型结构决定（本机 4 组），所以总量 = 组数 x 2 x layer_b。
-        # 拿不到组数时按「全部流式层都各一块 x 2」上界估 —— 宁可缓存小一点，
-        # 也要保证 slab 能建起来，因为 slab 是图的前提。
-        # **slab 是「每层一块」，不是「每组 2 块」。**
-        #
-        # `_flat_setup` 里 slab_total = sum(sizes[i] for i in streamed)，也就是
-        # 每个流式层各占一块主机 pinned（本机 35 x 174MB = 6GB）。我上一版按
-        # 「4 组 x 2 块」扣，只扣了 1.4GB，剩下 4.6GB 的缺口全由缓存占走 ——
-        # 实测池里只剩 6.4GB，slab 只覆盖 11/35 层，其余 24 层退回逐 tensor
-        # 搬运，成绩锁在 0.48 tok/s。
-        #
-        # 按层扣之后缓存会小一些，但 slab 能覆盖全部流式层 —— 那才是图能成立
-        # 的前提，也是「一层一次 DMA」取代「一层几十次 copy_」的前提。
-        _n_stream = int(n_stream if n_stream is not None
-                        else max(0, self.n_layers
-                                 - int(getattr(self.cal, "resident", 0) or 0)))
-        if _n_stream <= 0:
-            _n_stream = 0
-        # slab 每个流式层各占一块主机 pinned（不是「每组 2 块」）：
-        # `_flat_setup` 里 slab_total = sum(sizes[i] for i in streamed)。
-        _slab_b = _n_stream * self.layer_b
-        # **槽位本身也在池里占地方。** 每个槽位在 host 侧对应一个 blob 的
-        # 载入来源（cache 里的条目），以及 VramSlotCache 的 arena 记账。
-        # 不扣这一项的后果是「槽位越多、缓存越大」同时成立，两家加起来
-        # 超过池子 —— 实测 245 槽位 + slab 23 层时显存直接 OOM。
-        _slots_b = int(slots) * self.expert_b if slots else 0
-        return max(0, _budget - int(_slab_b) - int(_slots_b))
+    def _plan_host_pool(self, lay: Layout) -> bool:
+        """从逐层字节和物理余量分配权重源、打包周转与专家缓存。"""
+        layer_bytes = self._layer_bytes()
+        # 规划只用这一个余量快照；引擎用同一快照分配，不会因再采样而拒绝。
+        available = int(self.model["host_available_bytes"])
+        if available <= 0:
+            return False
+        lay.host_weight_bytes = sum(layer_bytes[lay.resident:])
+        # 全局权重不从层池中分配；逐层构建只保留一个转换工作区。
+        globals_bytes = ceil(self.embed_b + (0 if self.tied_head else self.head_b))
+        workspace = ceil(self.max_layer_b)
+        lay.host_reserve_bytes = globals_bytes + workspace
+        # 打包当前层时，原始权重与目标 slab 会同时存在。
+        pool_required = lay.host_weight_bytes + workspace
+        cache_room = available - lay.host_reserve_bytes - pool_required
+        if cache_room < 0:
+            return False
+        cache_room -= cache_room % 256  # 下一个权重 slab 的 ABI 对齐。
+        if self.expert_b > 0:
+            total_experts = int(self.model["n_experts"]) * self.n_layers
+            entries = min(total_experts, int(cache_room // self.expert_b))
+            lay.cache_bytes = int(entries * self.expert_b)
+        else:
+            lay.cache_bytes = 0
+        lay.host_pool_bytes = pool_required + (lay.cache_bytes + 255) // 256 * 256
+        return True
 
     # ---- 求解 -------------------------------------------------------------
 
     def solve(self) -> Layout:
-        """在资源约束下最小化 T。穷举 + 剪枝（维度只有 2，够用）。"""
+        """共同求解常驻层、专家槽位和权重环，不允许引擎另定容量。"""
         if not self.has_gpu:
-            lay = Layout(resident=0, slots=0, embed_on_cpu=True, head_on_cpu=True)
-            lay.reason = "no GPU: everything streams from host"
-            return lay
-
+            return Layout(resident=0, slots=0, stream_layers=self.n_layers,
+                          embed_on_cpu=True, head_on_cpu=True,
+                          reason="no GPU: weights stay on host")
         best = None
-        # 常驻层从多到少试（多的先试，早剪枝）
+        capacity = self.usable_vram()
         for resident in range(self.n_layers, -1, -1):
-            # 给定 resident，槽位取「刚好装下的最大值」—— T 对 slots 单调递减
-            for embed_cpu, head_cpu in ((False, False), (True, False), (True, True)):
-                probe = Layout(resident=resident, slots=0,
-                               embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
-                # **算槽位用的余量和 fits() 的判据必须一致。**
-                # 原来这里用 *0.94、fits() 用 *0.85，于是「按 0.94 挤出
-                # 来的最大槽位数」永远通不过 fits -- 14/60 算出 used=6.79GB
-                # < 7.45GB(0.94) 但 > 6.74GB(0.85)，直接被拒，求解器一路
-                # 退到 resident=0 slots=0，引擎于是拿不到 expert_store，
-                # 报 "arena unusable: 0 blocks"。
-                free = self.usable_vram() - self.used_bytes(probe)
-                if free < 0:
-                    continue
-                _max_slots = (int(free // max(1.0, self.expert_b))
-                              if self.expert_b > 0 else 0)
-                # **槽位在显存和主机预算上都要付费，所以不能只取最大值。**
-                #
-                # 原来这里是 slots = 最大能装下的数量，等价于假设「专家装载
-                # 零成本」。可槽位每多一个：显存多 expert_b（挤掉常驻层），
-                # 主机预算也多 expert_b（挤掉专家缓存）—— 实测 245 个槽位把
-                # 缓存压到 0.19GB，命中率掉到接近 0，专家全走磁盘，T=1.879s。
-                #
-                # 所以对每个 resident 扫一遍槽位档位，让目标函数自己在
-                # 「少搬专家」和「缓存装得下」之间找平衡。
-                _step = max(8, _max_slots // 8) if _max_slots > 0 else 8
-                _slot_choices = sorted(set(
-                    [0, _max_slots]
-                    + list(range(_step, _max_slots, _step))))
-                for slots in _slot_choices:
-                    lay = Layout(resident=resident, slots=slots,
-                                     embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
-                    # **RAM 缓存容量：这是主机侧的事，和显存约束无关。**
-                    #
-                    # 它原来是 0 —— Layout.cache_bytes 声明了但从来没赋过值。
-                    # 后果不是「少缓一点」而是「几乎不缓」：ExpertCache 的
-                    # capacity_entries = cache_bytes // blob_bytes，0 退到兜底
-                    # 10 条（0.18GB），于是每一步的专家缺失全部读盘。实测每步读
-                    # 2.0GB，而 240 个专家本来只有 4.7GB、槽位已经覆盖 98.8%，
-                    # 那 2GB 完全是重复读。
-                    #
-                    # 容量 = 主机可用内存 - 已经给 pin 留的 - 保守余量。
-                    # 这台机器 47GB RAM、可用 33GB，缓存 40x384 个专家需要 7.6GB，
-                    # 全放得下 —— 命中率应该接近 100%，这才是「内存作为缓存」的本意。
-                    # **主机侧和显存侧一起解。**
-                    #
-                    # 原来 cache_bytes 由 _host_cache_bytes() 单独算（按主机可用内存
-                    # 的 35%，再扣一块固定的 slab 份额），和显存侧的 resident/slots
-                    # 是两个互不相干的调用。后果是两本账各算各的，谁都不知道对方
-                    # 拿了多少 —— 实测缓存拿 11.26GB、slab 只剩 3.13GB 一层都建不
-                    # 起来；反过来的配置又能把 slab 撑满却让缓存命中率掉到 30%。
-                    #
-                    # 现在按同一份预算同时解：
-                    #   显存: resident*layer_b + slots*expert_b + ring*layer_b
-                    #   主机: slab(流式层数*layer_b) + cache(slots 个热点专家)
-                    # 两者共享 host 可用内存这一个上限，且 slab 与 cache 此消彼长。
-                    # 目标函数里 expert_s 同时依赖两边：slots 多则少搬专家，cache
-                    # 大则命中的那部分不读盘 —— 所以让求解器自己找平衡点，而不是
-                    # 让两个常数分别在两处拍板。
-                    _stream_n = max(0, self.n_layers - resident)
-                    lay.cache_bytes = self._host_cache_bytes(n_stream=_stream_n,
-                                                            slots=slots)
-                    if not self.fits(lay):
-                        continue
-                    c = self.cost(lay)
-                    if best is None or c.total_s < best[0].total_s:
-                        best = (c, lay)
-            # 剪枝：resident 继续减，stream_s 只会单调增（搬更多层），而 expert_s
-            # 最多降到 0（槽位覆盖全部）。所以「已经确定的下界」是
-            #
-            #   lb = 未来最少的搬运 + 0（专家全命中）+ compute
-            #
-            # 一旦 lb >= 当前最优，后面的 resident 不可能更好，可以停。
-            #
-            # 原来的剪枝写的是 `lb > best * 2`，两倍太松 —— 实测会漏掉更优解
-            # （4层/246槽位 被选为最优，而 8层/240槽位 更便宜）。
-            if best is not None:
-                lb = (self.n_layers - resident) * self.layer_b / max(1.0, self.h2d)
-                # 剪枝用的下界：compute 项对所有布局是同一个常数，缺了就不加
-                # （下界更松，只影响剪枝效率，不影响解的 correctness）。
-                try:
-                    lb += float(self._required("compute_per_layer_s", float)) * self.n_layers
-                except RuntimeError:
-                    pass
-                if lb >= best[0].total_s:
+            streamed = self.n_layers - resident
+            stream_sizes = self._layer_bytes()[resident:]
+            buffer_counts = range(1, streamed + 1) if streamed else (0,)
+            uniform_sizes = len(set(stream_sizes)) <= 1
+            previous_stall = None
+            for buffers in buffer_counts:
+                stall = self._weight_stream_seconds(resident, buffers)
+                # 相同流水线代价下，更多环槽只增加内存需求，候选严格被支配。
+                if uniform_sizes and previous_stall is not None and stall == previous_stall:
                     break
-
+                previous_stall = stall
+                buffer_bytes = max(stream_sizes) if buffers else 0
+                for embed_cpu, head_cpu in ((False, False), (True, False), (True, True)):
+                    probe = Layout(resident=resident, slots=0,
+                                   weight_buffers=buffers, weight_buffer_bytes=buffer_bytes,
+                                   embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
+                    free = capacity - self.used_bytes(probe)
+                    if free < 0:
+                        continue
+                    if self.expert_b > 0:
+                        # 纯 GPU MoE 至少容纳一次真实路由；多余槽位不能创造复用。
+                        max_slots = min(int(free // self.expert_b), self.topk * self.n_layers)
+                        slot_counts = range(self.topk, max_slots + 1)
+                    else:
+                        slot_counts = (0,)
+                    for slots in slot_counts:
+                        lay = Layout(resident=resident, slots=slots,
+                                     weight_buffers=buffers, weight_buffer_bytes=buffer_bytes,
+                                     stream_layers=streamed,
+                                     embed_on_cpu=embed_cpu, head_on_cpu=head_cpu)
+                        if not self._plan_host_pool(lay):
+                            continue
+                        if not self.fits(lay):
+                            continue
+                        cost = self.cost(lay)
+                        rank = (cost.total_s, self.used_bytes(lay), buffers)
+                        if best is None or rank < best[0]:
+                            best = (rank, cost, lay)
         if best is None:
-            # 连「全部流式 + 零槽位」都装不下：这张卡放不下这个模型的骨架。
-            # 如实报告 fits=False，让引擎在启动时拒绝而不是跑到一半 OOM。
-            lay = Layout(resident=0, slots=0, embed_on_cpu=True, head_on_cpu=True,
-                         reason="card too small even for streaming skeleton")
-            lay.stream_layers = self.n_layers
-            lay.fits = self.used_bytes(lay) <= self.vram
-            return lay
-        c, lay = best
-        # 派生量必须在返回前填好：engine 读 stream_layers 来报「几层要流式搬」。
-        lay.stream_layers = self.n_layers - int(lay.resident)
-        lay.fits = self.used_bytes(lay) <= self.vram
-        lay.reason = ("T=%.3fs (stream %.3f + expert %.3f + compute %.3f)"
-                      % (c.total_s, c.stream_s, c.expert_s, c.compute_s))
+            raise RuntimeError("no feasible layout for the measured memory budget")
+        _, cost, lay = best
+        lay.reason = ("T=%.3fs (stream %.3f + expert %.3f + compute %.3f); weight ring %dx%d bytes"
+                      % (cost.total_s, cost.stream_s, cost.expert_s, cost.compute_s,
+                         lay.weight_buffers, lay.weight_buffer_bytes))
         return lay
 
     # ---- 运行中调整 -------------------------------------------------------

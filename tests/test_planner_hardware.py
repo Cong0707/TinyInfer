@@ -27,6 +27,8 @@ MODEL = {
     "n_layers": 40,
     "topk": 6,
     "n_experts": 384,
+    "max_position_embeddings": 4096,
+    "rotary_dim": 64,
 }
 N = 40
 
@@ -42,7 +44,15 @@ def _hw(cards_gb, ram, avail, unified=False):
 
 def _solve(cards_gb, ram, avail, unified=False, model=None):
     hw = _hw(cards_gb, ram, avail, unified)
-    p = Planner(hw, model or MODEL, bandwidth=BW)
+    geometry = dict(model or MODEL)
+    geometry["layer_bytes_by_id"] = {i: geometry["layer_bytes"] for i in range(geometry["n_layers"])}
+    # RAM 余量同样是一次快照：规划与分配必须消费同一个数。
+    geometry["host_available_bytes"] = int(avail * GB)
+    # 合成硬件测试的显式输入，不读取执行测试机器上的 CUDA 容量。
+    calibration = {"runtime_overhead_bytes": 0, "h2d_layer_s": geometry["layer_bytes"] / BW["h2d_bps"],
+                   "h2d_expert_s": geometry["expert_bytes"] / BW["h2d_bps"],
+                   "compute_per_layer_s": 0.003, "route_reuse": 0.2}
+    p = Planner(hw, geometry, bandwidth=BW, calibrate=calibration)
     return p, p.solve()
 
 

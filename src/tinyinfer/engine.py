@@ -27,10 +27,6 @@ import torch
 import torch.nn.functional as F
 
 
-class _GraphCaptureUnavailable(RuntimeError):
-    """CUDA graph 捕获失败。**不是错误，只是这个进程内没有图可用。**"""
-
-
 class Engine:
     @classmethod
     def from_hf(cls, source: str | Path, **kwargs) -> "Engine":
@@ -77,6 +73,16 @@ class Engine:
             _mgr0 = getattr(_store0, "_tier_mgr", None)
             if _mgr0 is not None and hasattr(_mgr0, "stop_warm"):
                 _mgr0.stop_warm()
+
+        _store0 = getattr(self, "expert_store", None)
+        _mgr0 = getattr(_store0, "_tier_mgr", None)
+        if _mgr0 is not None:
+            _mgr0.close()
+        _slots0 = getattr(_store0, "slots", None)
+        if _slots0 is not None:
+            if any(_slots0._refs):
+                raise RuntimeError("cannot close engine while expert readers hold leases")
+            _slots0.synchronize()
 
         # 1) 再把所有指向池子的 Python 引用断干净。
         #
@@ -388,6 +394,10 @@ class Engine:
             # 会以为「全部动态装载最划算」，解出 resident=0。
             _geo = dict(_prof or {})
             _geo["n_layers"] = int(self.cfg.n_layers)
+            # 层字节必须来自引擎真正要搬的那批张量。header 里有同一个权重被量化成
+            # 多种副本的情况，按名字求和会把同一层算成两种大小（实测 40/40 层都与
+            # `_weight_paths()` 实际打包字节不同）。规划器只吃这一份实测值。
+            _geo["layer_bytes_by_id"] = self._measure_layer_bytes()
             # 字段名按 TinyConfig 的真实定义取（不是 HF 的 num_experts_per_tok）。
             # 取错会导致 topk=0 -> 目标函数里 expert_s 恒为 0 -> 求解器不给槽位，
             # 而它自己不会报错（0 是合法输入），只会解出 resident 拉满的解。
@@ -463,6 +473,18 @@ class Engine:
                     "Engine: cannot measure the runtime VRAM overhead ",
                     f"({_exc!r}). The planner needs it to decide whether a layout ",
                     "fits; there is no constant to fall back to.") from _exc
+            # 求解只使用这一份容量快照，不在候选枚举中反复询问驱动。
+            _cal["usable_vram_bytes"] = sum(
+                torch.cuda.mem_get_info(card.index)[0] + torch.cuda.memory_allocated(card.index)
+                for card in _hw.cards)
+            # 主机余量也只采样一次：规划出的池子必须能在同一快照下分配成功，
+            # 否则两次读数之间的系统抖动会让一个合法布局在分配时被拒绝。
+            from .budget import physical_available as _host_available
+
+            _geo["host_available_bytes"] = int(_host_available())
+            if self._model_prof is not None:
+                # 规划输入和分配入口共用同一个快照字段。
+                self._model_prof["host_available_bytes"] = _geo["host_available_bytes"]
             self._planner = _pm.Planner(_hw, _geo, bandwidth=_bw, calibrate=_cal)
             # hw_plan 直接就是 Layout —— 不再有第二种「规划结果」的形状。
             self.hw_plan = self._planner.solve()
@@ -484,401 +506,26 @@ class Engine:
                     f"not enough VRAM for this checkpoint: {self.hw_plan.reason}. "
                     "The engine needs a card that can hold at least the streaming ring "
                     "plus the tilelang workspace; see docs/README.md.")
-        if expert_store is None and self.tier.level >= OptLevel.BALANCED:
+        self.host_pool = self._allocate_host_pool() if self.hw_plan is not None else None
+        if (expert_store is None and self.cfg.n_routed_experts > 0
+                and self.hw_plan is not None and self.tier.level >= OptLevel.BALANCED):
             # production tiers own their ExpertStore (RAM cache + VRAM slots)
             try:
                 from .loading import ExpertStore
-                # elastic RAM budget: size the expert cache from what is actually free,
-                # so other agents/processes on the box do not cause MemoryError
-                try:
-                    import psutil
-                    avail = psutil.virtual_memory().available
-                    cache_budget = int(avail * 0.5)  # larger RAM cache = fewer disk misses in fetch
-                except Exception:
-                    cache_budget = int(self.tier.expert_cache_gb * (1 << 30))
-                hw = self.hw_plan
-                _slots = int(__import__("os").environ.get(
-                    "TI_SLOTS", hw.expert_slots if hw is not None else 96))
-                # A card with expert slots serves its decode experts through Marlin, whose
-                # repack is 43 us against a 20 us GEMV. Size the repack cache to the slot
-                # count so each expert is interleaved once instead of once per token.
-                # Zero slots (this 8 GB box) never reaches Marlin on decode, and the
-                # setter leaves the conservative default there.
-                if _slots > 0:
-                    try:
-                        from .deepseek.gemv_fp4_marlin import set_cache_capacity
-
-                        set_cache_capacity(_slots)
-                    except Exception:
-                        pass
-                from .budget import budget as _host_budget
-                _hb_room = _host_budget().room()
-                # 没有硬件计划时也不设绝对上限：按当前可用的宿主预算给，
-                # 60% 留给缓存（剩下的留给层 slab 和运行时）。16GB 这个数是
-                # 47GB 内存机器上的观察值，不该是所有机器的默认。
-                _plan_cache = (hw.cache_bytes if hw is not None
-                               else max(512 << 20, int(_hb_room * 0.6)))
-                # leave the majority of what is left to the pinned layer slab, which
-                # _flat_setup requests later: 45% here, the rest there
-                # The layer slab asks for its bytes AFTER this, so the cache may only
-                # take a minority of what is free or the box starts paging to C: and
-                # every read turns into a swap-in (observed: 9.3s/token).
-                # Size the host expert cache from what is genuinely free after the pinned
-                # layer slab, not from a flat fraction: the slab needs (n_layers -
-                # resident) * layer_b and is requested *after* this, so a fraction that is
-                # too large starves it (measured: 9.3s/token with a 15.3GB cache on this
-                # box). TI_CACHE_GB overrides for A/B.
-                # THE host pool: claim our whole share of physical RAM ONCE, as pinned
-                # (DMA-able) memory, and derive every buffer from what the OS actually
-                # handed over. The slab and the expert cache are both carved out of this
-                # one range. Sizing from an estimate and asking again later is what
-                # created a second pool and a CUDA OOM; the claimed amount is the only
-                # number that is true. Other programs may be pushed out of RAM -- that
-                # is the accepted trade -- but the model itself must never page, because
-                # a paged expert read costs 10x a hit.
-                _budget = _host_budget()
-                _avail = _budget.available()
-                # The headroom is not slack. It has to cover, simultaneously:
-                #   - the block build that runs right after this claim: every streamed
-                #     layer's host weights are read (~430MB/layer, ~13GB for 30 layers)
-                #     before the flat slab copies them into this pool and releases them;
-                #   - a fresh pinned staging block for pageable->GPU copies (engram,
-                #     embed), which fails with driver OOM once the pool has eaten the box;
-                #   - the OS and other applications.
-                # Measured failure: pool at avail-10GB (24GB) + 13GB of weights -> swap.
-                # Fill physical RAM: a full pool is the design goal (cache hits beat
-                # disk reads). The reserve only covers the start-up build (resident
-                # layers' host temporaries are freed as they move to VRAM) and OS slack.
-                # cudaHostAlloc succeeds up to ~29GB on this box; above that the driver
-                # refuses the whole request and the halving retry lands at 15GB (which
-                # halves the expert cache and doubles decode time). Cap it.
-                # Size the pool from what is free and let _commit() shrink it: that path
-                # already retries at half size when the driver refuses (pinned allocations
-                # have a ceiling well below physical RAM), and the caches are sized from
-                # the bytes actually handed over. Hand-tuning a cap here only traded
-                # hit rate for a guess.
-                # 上限原来写死 28GB（笔记本上 pin 池的实测天花板）。在 371GB 内存的
-                # 机器上等于把 300GB 闲置：池子只有 28GB，缓存再大也装不下，
-                # 每个 token 的专家读全靠这 28GB 兜。改成按可用内存取：
-                # 留 5GB 给进程自身，再留 25% 不动（给页缓存和内核），其余全给池。
-                # TI_HOST_POOL_GB 仍然可以硬指定。
-                # 用 total 而不是 available：available 已经把页缓存扣掉了，而读模型
-                # 权重会在 page cache 里留下几百 GB —— 那些页是可回收的，池子要用的
-                # 时候内核会把它们让出来。按 available 算等于让模型自己的读缓存把
-                # 专家缓存挤掉（实测 371GB 的机器上池子只拿到 151GB）。
-                # 只保留 15% 的绝对余量给内核和其它进程。
-                # **池子上限必须同时受「物理总量」和「此刻真的能用」两条约束。**
-                #
-                # 只按物理总量算（total - 15%）会忽略桌面与其它进程已经占走的部分：
-                # 本机 47.2GB，桌面占 14GB，可用只剩 32.8GB，按 40.1GB 去 claim 的
-                # 缺口只能落到 pagefile —— 而 pinned 页落进 swap 意味着每次专家访问
-                # 变成 swap-in（比读盘还慢），大块上 cudaHostRegister 会直接失败
-                # （表面症状是 cuMemSetAccess OOM，而显存还有 2.6GB 空闲）。
-                #
-                # 也不能只用 available()：它对页缓存敏感，模型自己读权重留下的页缓存
-                # 会把 available 压得很低（另一台机器上实测只给出 151GB）。
-                # 取两者的小值：available 扣掉启动期必需余量，再和 total 的 85% 比。
-                # **池子的大小由规划器给，这里不再自己算第二套。**
-                #
-                # 原来是 _by_total（物理总量 -15%）和 _by_avail（可用 -6GB）取小，
-                # 两个常数都是「这台 47GB 笔记本」调出来的：换一台机器不是偏大
-                # （把 pagefile 当内存）就是偏小（明明有 300GB 只用 32GB）。
-                # resources.plan 现在按 hw.ram_avail_gb 推出 host_pool_bytes，
-                # 那个数只依赖这台机器此刻的真实可用内存。
-                #
-                # 仍然按 live 值再夹一次：plan 是启动瞬间的测量，之后别的进程
-                # 可能拿走内存，claim 失败还是得缩。
-                _planned_pool = int(getattr(hw, "host_pool_bytes", 0) or 0)
-                _live_free = int(_budget.available() or 0)
-                # **目标就是「此刻全部可用」，不减一个猜出来的余量。**
-                # claim() 拿不到会自己缩（cudaHostAlloc 失败后按比例重试），
-                # 缩到成功为止就是这台机器的真实上限。预先减一截只会让每台
-                # 机器都少用一块内存，而且看不出少了。
-                if _planned_pool <= 0:
-                    _planned_pool = _live_free
-                if _live_free > 0:
-                    # **必须留一份给运行时，否则 PyTorch allocator 会坏掉。**
-                    #
-                    # 「吃满可用内存」这个方向试过：池子拿到全部 free 之后，
-                    # forward 里那些**运行期才发生**的分配就没有空间了——KV 增长、
-                    # attention 临时张量、dequant_fp8_block 展开的 fp32 中间量。
-                    # 症状不是干净的 OOM，而是 c10 的
-                    # "!handles_.at(i) INTERNAL ASSERT FAILED"（分配器状态断言），
-                    # 崩在 h.unsqueeze / dequant 这些随机位置，而且一旦出现，
-                    # 后面所有分配都会失败。
-                    #
-                    # 0.8 是「运行时需要多少」的估计：本机可用 35GB 时池子 28GB、
-                    # 运行时分到 7GB，覆盖 KV + activation + dequant 中间量有余。
-                    # 它和「这台机器有多少内存」无关（那个才是要删的机器常数），
-                    # 描述的是「池子与运行时的比例」。
-                    # 0.6 而不是 0.8：实测 0.8（本机约 28GB）会让 CUDA 报
-                    # cuMemSetAccess OOM 和 !handles_ INTERNAL ASSERT，而
-                    # 18GB 左右稳定。pinned 内存每一块都要在 device 地址空间里
-                    # 建立映射，这个资源和显存容量是两回事，耗尽的症状不是
-                    # 干净的 OOM 而是分配器断言。留 40% 给运行时和映射开销。
-                    # 比例由训练器给（tuned.json 的 pool_ratio），没有就用 0.6。
-                    #
-                    # 0.6 是本机试出来的安全点：0.8（约 28GB）会撞 CUDA 的
-                    # device 映射资源耗尽（cuMemSetAccess OOM + !handles_ 断言），
-                    # 0.6（约 21GB）稳定。但这个"安全点"取决于卡型、驱动版本、
-                    # 显存大小和 pinned 的块数 —— 是训练器该扫的量，不是该写死的
-                    # 常数。tinyinfer.tune --layout 会把它一起扫进 tuned.json。
-                    # 优先级：TI_POOL_RATIO（训练器扫参时用）> tuned.json > 0.6
-                    _pr = 0.4
-                    try:
-                        _env_pr = __import__("os").environ.get("TI_POOL_RATIO")
-                        if _env_pr:
-                            _pr = max(0.1, min(0.95, float(_env_pr)))
-                    except (TypeError, ValueError):
-                        _pr = 0.4
-                    try:
-                        _cal = getattr(self, "_calib", None) or {}
-                        _cand = _cal.get("pool_ratio")
-                        if isinstance(_cand, (int, float)) and 0.1 <= float(_cand) <= 0.95:
-                            _pr = float(_cand)
-                    except Exception:
-                        _pr = 0.4
-                    # **池子大小必须稳定，否则每次启动的 slab 层数都在跳。**
-                    #
-                    # 只用「瞬时可用量 x 比例」时，连续三次运行得到 pool
-                    # 12.7 / 8.9 / 14GB，slab 12 / 3 / 10 层，step
-                    # 2992 / 5890 / 2083ms —— 看起来像性能退化，其实是同一个
-                    # 配置在不同宿主状态下算出了不同的池子。
-                    #
-                    # 所以同时受两条约束取小：
-                    #   - 物理总量 x 比例：这个数在一次开机内不变，保证稳定性
-                    #   - 瞬时可用 x 比例：避免真的把内存吃穿
-                    # 前者定基调，后者只在内存确实紧张时才收紧。
-                    # 物理总量用 budget 已经取好的值（_physical_ram()，一次开机内
-                    # 不变）。不要用 hw_plan —— Plan 里没有内存总量字段。
-                    _ram_total = float(getattr(_budget, "total", 0) or 0)
-                    _by_total = int(_ram_total * _pr) if _ram_total > 0 else 0
-                    _by_avail = int(_live_free * _pr)
-                    if _by_total > 0:
-                        _planned_pool = min(_planned_pool, _by_total)
-                    _planned_pool = min(_planned_pool, _by_avail)
-                    _planned_pool = max(192 << 20, _planned_pool)
-                _target = max(192 << 20, min(_budget.room(), _planned_pool))
-                _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
-                if _pov:
-                    try:
-                        _target = min(_budget.room(),
-                                      max(192 << 20, int(float(_pov) * (1 << 30))))
-                    except ValueError:
-                        pass
-                # **claim 到失败为止，然后用一次显存试探确认「真的还能用」。**
-                #
-                # pinned 内存（cudaHostAlloc）锁定物理页，占满之后 CUDA context
-                # 和显存分配会失败 —— 实测本机池子给满 32GB 时，Engine 起来后
-                # 第一次 forward 就 cudaErrorMemoryAllocation；给 16GB 正常。
-                # 而 16GB 这个数是这台机器上试出来的，不是推导出来的。
-                #
-                # 所以「尽可能占满」不能只看 claim 成功，还要看 claim 之后
-                # GPU 是否还能分配。做法：claim 成功就试探一小块显存，失败就把
-                # 池子缩一档重试 —— 这就是「试到失败」的完整形式，全程没有
-                # 任何关于「这台机器有多少内存」的常数。
-                _taken = 0
-                _try_pool = int(_target)
-                for _attempt in range(6):
-                    _taken = int(_budget.claim(_try_pool, real=True))
-                    if not _taken:
-                        break
-                    _probe_ok = True
-                    if self.device != "cpu":
-                        try:
-                            import torch as _pt
-
-                            _probe = _pt.empty(64 << 20, dtype=_pt.uint8,
-                                               device=self.device)
-                            del _probe
-                        except Exception:
-                            _probe_ok = False
-                    if _probe_ok:
-                        break
-                    print(f"[tinyinfer] host pool {_try_pool/2**30:.1f}GB: CUDA probe "
-                          f"failed, shrinking", flush=True)
-                    try:
-                        _budget.close()
-                    except Exception:
-                        pass
-                    _taken = 0
-                    _try_pool = int(_try_pool * 0.8)
-                    if _try_pool < (256 << 20):
-                        break
-                from .budget import HostPool
                 from .loading import BlobPool
 
-                _pool_view = getattr(_budget, "_claim_buf", None)
-                self.host_pool = (HostPool.from_claimed(_pool_view, _taken)
-                                  if _taken and _pool_view is not None else None)
-                # Reserve the slab's share first: _flat_setup runs on the first forward
-                # and carves its per-layer pinned blocks out of this same pool, so the
-                # cache must not eat bytes the slab is about to need.
-                # Size the slab reserve from the planner's own per-layer number: the weights
-                # are not loaded yet, so this is the only honest figure available, and the
-                # old flat 28% of RAM reserved 13.2GB for a 6.5GB slab, starving the cache.
-                # **每层 streaming 字节用规划器的实测值，不能写死 178MB。**
-                #
-                # 178MB 是 safetensors header 里记的 fp8 载荷，而一层真正要搬进
-                # 环形缓冲的是一块连续 buffer，按最坏层开 463MB（本机实测）。
-                # 32 层差 9GB，slab 预留不够 → flat slab 建不起来 → 退回逐张量
-                # pinned 拷贝 → 那批临时内存 + 专家缓存一起把宿主池吃穿，
-                # 首次 forward 直接 OOM（表面症状是 slot arena 的 !handles_ 断言）。
-                # **slab 预留按「每层实际字节」，不是「最坏层字节」。**
-                #
-                # 上一版用了 max_layer_bytes（最坏层 468MB），33 层 x 1.15 = 18.7GB 的
-                # 预留把整个池子吃光，缓存只剩 1.24GB（66 个专家，对每步 240 个需求
-                # 覆盖 27%）。而 slab 实际每层只吃 237MB —— 实测装完 33 层共 7.83GB。
-                # 两者差 2.4 倍：预留是按最坏层算的，装载是按实际字节算的。
-                #
-                # max_layer_bytes 的正确用途是「一个环形缓冲要开多大」（最坏层决定
-                # 单个 buffer 尺寸，必须按最坏的来），不是「所有层的总量」（那是
-                # 各层实际字节求和）。把这两个概念混在一起就是过度预留。
-                # 数值取 240MB：这是 33 个 streamed 层「实际字节求和 / 层数」的实测均值
-                # （slab 装完 33 层共 7.83GB），不是 header 报的 172MB 平均。
-                # 两者差 40%：header 的 layer_bytes 是各层 tensor 字节的平均，
-                # 而 slab 按 sizes[i]（每层实际 span）分配，含对齐和额外 buffer。
-                # 按 172MB 预留时 slab 差 2GB 建不起来，池子被 cache 独占
-                # （实测 pool used=21.57/21.57, free=0.00）。
-                _per_layer = 240e6
-                try:
-                    _lb = float((_prof or {}).get("layer_bytes", 0) or 0)
-                    if _lb > 0:
-                        _per_layer = max(_lb, float((_prof or {}).get("max_layer_bytes", 0) or 0) * 0.5)
-                except Exception:
-                    _per_layer = 240e6
-                # **slab 需要的是「双缓冲环的几块」，不是「每个流式层一块」。**
-                #
-                # 原来写的是 (n_layers - gpu_layers) * per_layer：30 个流式层
-                # x 387MB = 11.6GB。但那 30 层是**依次**算完再被下一层覆盖的，
-                # 同一时刻只活着 2~3 块（当前 + 预取的下一层 + 上一块还没退的）。
-                #
-                # 这个错误直接吃掉了整个专家缓存：_slab_reserve 按 11.6GB*1.15
-                # 算出 13.13GB，而 host_pool 一共才 13.3GB，于是 _pool_avail
-                # 只剩 192MB 兜底 —— ExpertCache 的 capacity_entries 变成 10 条
-                # （0.19GB），每一步的专家缺失全部读盘 2.0GB。实测 decode 2.5s。
-                #
-                # 环的大小：_flat_state 用的是 BUF_COUNT 块，预取最多提前一层，
-                # 所以 3 块够（当前 / 预取中 / 刚 release 完还没退）。
-                _SLAB_RING = 3
-                _n_stream_layers = (self.cfg.n_layers
-                                    - (hw.gpu_layers if hw is not None else 0))
-                # **slab 的 pinned 源是「每层一块」，不是「3 块的环」。**
-                #
-                # 我上一版把这里写成 min(n_stream, 3) * per_layer，理由是想的是
-                # GPU 侧那个环（_flat_setup 的 bufs 确实是 3 块）。但 pinned 源
-                # 是另一回事：_flat_setup 里 slab_total = sum(sizes[i] for i in
-                # streamed)，也就是**每个流式层各占一块主机 pinned**（本机 35 层
-                # x 174MB = 6GB）。
-                #
-                # 预留算成 3 块（0.5GB）而实际要 6GB，差额就被专家缓存吃掉了：
-                # 实测 pool 13.59GB、缓存计划 10.46GB、slab 到 layer 5 就耗尽
-                # （12.9/12.9GB）。slab 起不来 -> 图拿不到固定地址 -> 只能回
-                # 逐 tensor H2D。
-                #
-                # 所以按每层一块预留。装不下就是装不下，由 pool 的真实余量决定
-                # 能覆盖几层，而不是被一个偏小的预留值掩盖。
-                _slab_need = _n_stream_layers * _per_layer
-                _slab_reserve = 0
-                _flat_flag = __import__("os").environ.get("TI_FLAT")
-                if self.host_pool is not None and not (_flat_flag is not None
-                                                       and _flat_flag != "1"):
-                    # only reserve slab room when flat streaming may use it; with
-                    # TI_FLAT=0 the slab never runs and the bytes belong to the cache
-                    # The slab itself is exactly sum(streamed layer bytes) (5.3GB here);
-                    # the rest of the reserve is the build window (a layer is read on the
-                    # host, copied into the pool, then released) plus slack. 3.5x reserved
-                    # 18.7GB and left the expert cache with 9-13GB, which holds ~600 of the
-                    # 1439 experts ten decode steps touch -- that is why the hit rate was
-                    # 50%. 1.6x leaves the cache ~19GB while still covering the build.
-                    # 1.1x: the slab is exactly sum(streamed layer bytes); the extra 10%
-                    # covers the build window. 1.6x left the pool too short for the slab
-                    # itself (measured "slab unavailable" -> the per-tensor fallback, which
-                    # then needed a bigger prefill workspace and OOM'd).
-                    # Reserve what the slab actually needs, not as much as the pool will
-                    # give: the old upper bound was (free - 192MB), so on a pool that is
-                    # both cache and slab the two reservations together could exceed it --
-                    # observed as cache 15.6GB + reserve 6.7GB against a 20.8GB pool, which
-                    # left the slab 0 bytes and pushed all 30 streamed layers onto the
-                    # per-tensor copy path (1167 DMAs per decode step, 458ms of GPU time).
-                    _slab_reserve = min(int(_slab_need * 1.15) + (1 << 30),
-                                        max(0, self.host_pool.free - 192 * (1 << 20)))
-                    # whatever the cache does not claim must stay free for the slab
-                    if self.host_pool is not None:
-                        _slab_reserve = min(_slab_reserve,
-                                            max(0, self.host_pool.free - (192 << 20)))
+                hw = self.hw_plan
+                _slots = hw.slots
+                _cache_bytes = hw.cache_bytes
                 _cache_pool = None
-                _cache_bytes = max(192 << 20, int(_plan_cache))
-                _ov = __import__("os").environ.get("TI_CACHE_GB")
-                _ov_bytes = None
-                if _ov:
-                    try:
-                        _ov_bytes = int(float(_ov) * (1 << 30))
-                    except ValueError:
-                        _ov_bytes = None
-                if _ov_bytes is not None:
-                    _cache_bytes = _ov_bytes
-                if self.host_pool is not None:
-                    _pool_avail = max(192 << 20, self.host_pool.free - _slab_reserve)
-                    # the override may not exceed what the pool can actually guarantee:
-                    # capacity larger than the backing slab makes every take() fail and the
-                    # read path silently falls back (measured: TI_CACHE_GB=14 with a 6GB
-                    # slab -> 555 fallbacks, decode 1.1s -> 1.9s)
-                    # Hard ceiling on the host cache. Two costs trade here: a bigger cache
-                    # keeps decode off the SSD (40 layers x top-6 = 240 experts/token, so
-                    # a small claim spills and the direct reader showed ~180ms/token),
-                    # while a smaller one leaves the pool enough for the full 30-layer
-                    # slab (5.3GB) -- below that the slab comes back partial and the
-                    # remaining layers pay 30 per-tensor copy_ calls per token.
-                    # Measured at the decode step: 12GB cache + slab 30/30 = 1.58 tok/s,
-                    # 16GB cache + slab 10/30 = 1.61 tok/s. Cache wins by a hair.
-                    # Cache vs slab: they share the pinned pool and are built in this
-                    # order, so whatever the cache claims here is unavailable to the slab
-                    # below. The slab is worth more per GB -- a slab layer replaces its
-                    # 178MB of per-tensor H2D every token, while a cache slot only avoids
-                    # a read when the same expert is reused. Measured: 16GB cache leaves
-                    # the slab 8 of 30 layers and decode sits at 519ms/step with 88% hit;
-                    # 12GB lets the slab cover every streamed layer. TI_CACHE_CAP_GB
-                    # exposes the split.
-                    # 12, not 16. Measured sweep on this box (8GB VRAM, 47GB RAM):
-                    #   cap=16  814 ms   0/30 layers on the slab
-                    #   cap=12  784 ms   4/30
-                    #   cap=10  785 ms  14/30
-                    #   cap= 8  825 ms  24/30   (cache starts missing too often)
-                    #   cap= 6 1059 ms    all
-                    #   cap= 4 1222 ms    all
-                    # The slab ends the per-tensor copy path (1167 DMAs -> one per layer
-                    # per step) but the cache prevents reads, so there is an interior
-                    # optimum; 12 and 10 tie, and 12 leaves more of the pool free for the
-                    # layer weights the build has not read yet.
-                    # 缓存上限不再写死 12GB：那是 8GB 显存 + 47GB 内存的笔记本上扫出来的
-                    # 内部最优（缓存和层 slab 争同一块 pin 池），搬到 371GB 内存的机器上
-                    # 等于把 300GB 内存闲置，每个 token 的专家读全靠 12GB 的缓存兜。
-                    # 改成按宿主预算自适应：不给显式覆盖时，上限 = 预算里除 slab 之外
-                    # 能拿到的全部（_pool_avail 已经扣掉了 slab_reserve），再留 25% 余量
-                    # 给尚未加载的层权重。TI_CACHE_CAP_GB 仍然可以硬指定。
-                    _cap_env = __import__("os").environ.get("TI_CACHE_CAP_GB")
-                    if _cap_env is None:
-                        # 0.75 的余量是给「还没加载的 streamed 层权重」留的。
-                        # 当**所有层都常驻**（L20 的 40/40）时根本不存在这件事，
-                        # 那 25% 就是白留：实测 L20 上池子只拿到 231GB，
-                        # 而模型全部 15360 个专家要 268.9GB —— 差 14%，预热永远装不完，
-                        # decode 每步还得读 13-25 次盘。
-                        # 所以：没有 streamed 层时只留 6% 给分配器抖动。
-                        _n_stream = 0
-                        try:
-                            _n_stream = int(len(self._stream_layers()))
-                        except Exception:
-                            _n_stream = 0
-                        _frac = 0.94 if _n_stream == 0 else 0.75
-                        _cap_bytes = max(192 << 20, int(_pool_avail * _frac))
-                    else:
-                        _cap_bytes = max(192 << 20, int(float(_cap_env) * (1 << 30)))
-                    _pool_avail = min(_pool_avail, _cap_bytes)
-                    _cache_bytes = min(_ov_bytes, _pool_avail) if _ov_bytes else _pool_avail
-                    _slot = self.host_pool.alloc(_cache_bytes)
-                    if _slot is not None:
-                        _cache_pool = BlobPool(_slot, _cache_bytes)
+                if _cache_bytes:
+                    _slot = self.host_pool.alloc(_cache_bytes, align=1)
+                    if _slot is None:
+                        raise MemoryError("planned expert cache does not fit the host pool")
+                    _cache_pool = BlobPool(_slot, _cache_bytes)
+                if _slots:
+                    from .deepseek.gemv_fp4_marlin import set_cache_capacity
+                    set_cache_capacity(_slots)
                 self.expert_store = ExpertStore.from_store(
                     self.store,
                     slot_arena=bool(getattr(self.tier, "slot_arena", False)),
@@ -888,6 +535,7 @@ class Engine:
                     # 决定并行度），不再写死 16 的上限。
                     reader_threads=int(__import__("os").environ.get("TI_READERS", "0")) or 0,
                     cache_bytes=_cache_bytes,
+                    max_pinned_bytes=0,  # 池本身已锁页，不能再重复领取 pin 预算。
                     pool=_cache_pool,
                     # LRU, not ARC. Measured on this model's real routing over three
                     # runs: lru 0.789/0.789/0.788 hit and 30.9-31.3 GB read, arc
@@ -947,8 +595,7 @@ class Engine:
                         print(f"[tinyinfer] expert multi-device skipped ({_de!r})",
                               flush=True)
             except Exception as e:
-                print(f"[tinyinfer] ExpertStore disabled: {e}")
-                self.expert_store = expert_store
+                raise RuntimeError("cannot allocate the planned expert storage") from e
         else:
             self.expert_store = expert_store
         # The VRAM slot pool is faster but not bit-reproducible yet (a slot can be
@@ -1180,10 +827,8 @@ class Engine:
         self.embed_on_cpu = (not _plan_embed_gpu)
         if __import__("os").environ.get("TI_EMBED_GPU") == "1":
             self.embed_on_cpu = False
-        # embed / head / norm are 100MB-1.3GB allocations: route them through the
-        # claimed pool too, so no large buffer ever appears outside it.
-        if getattr(self, "host_pool", None) is not None:
-            self.store.build_pool = self.host_pool
+        # 全局权重占用规划器单列的主机保留区，不侵占层权重池。
+        self.store.build_pool = None
         # names come from the adapter: a checkpoint decides what it calls these (DeepSeek
         # keeps embed/norm/head at the top level, Qwen nests them under
         # model.language_model and ties the head to the embedding)
@@ -1269,6 +914,25 @@ class Engine:
         # which fills inside the pool.
         self._prebuild()
 
+    def _allocate_host_pool(self):
+        """只分配规划器批准的字节；实时容量不足时拒绝，不重写配额。"""
+        from .budget import HostPool, budget
+
+        plan = self.hw_plan
+        allocator = budget()
+        required = plan.host_pool_bytes
+        planned_available = int(self._model_prof["host_available_bytes"])
+        if required <= 0:
+            raise RuntimeError("host pool has no planned capacity")
+        if required + plan.host_reserve_bytes > planned_available:
+            raise RuntimeError("host pool exceeds the capacity it was planned against")
+        # 额度就是规划用的那一份快照：申请与求解不会再看第二个读数。
+        allocator.set_limit(planned_available)
+        taken = allocator.claim(required)
+        if taken != required or allocator._claim_buf is None:
+            raise RuntimeError("host allocator did not fulfill the exact planned capacity")
+        return HostPool.from_claimed(allocator._claim_buf, taken)
+
     # -- start-up build ----------------------------------------------------
     def _prebuild(self) -> None:
         """Build every block and the pinned slab NOW, not on the first forward.
@@ -1305,58 +969,18 @@ class Engine:
                 # happens INSIDE the claimed pool, so Task Manager shows the pool's one
                 # jump and nothing after it
                 self.store.build_pool = pool
-            # 逐层串行构建 = 启动时单核 100%（实测 64 核机器上只有 C0 在动）。
-            # 每层是独立的：读自己的分片 + 建自己的子模块，互不依赖，所以按 CPU 数
-            # 并发构建。self.block() 内部写 self._blocks，加锁保护那一次写入即可。
-            _build = [i for i in layers if i not in streamed_set]
-            if len(_build) > 1:
-                import os as _os2
-                from concurrent.futures import ThreadPoolExecutor as _TPE2
-                # dict 写的是不同 key，CPython 下由 GIL 保证原子，不需要额外锁
-                _nw = max(2, min(len(_build), (_os2.cpu_count() or 4)))
-
-                def _mk(i):
-                    b = self.block(i)
-                    # 常驻层整轮都住在显存里，host 副本只服务于一个永远不会发生的
-                    # to("cpu")。丢引用之外还要把那段字节还给池子 —— 池子是 bump
-                    # 分配器，光丢引用只是让它们变成顶部的高水位，别的分配拿不到
-                    # （实测启动后 1246 次分配共 9.53GB 躺在那里，占池子 39%）。
-                    _rel = []
-                    for key, t in list(getattr(b, "_cpu_refs", {}).items() or []):
-                        _o = getattr(t, "_tiny_pool_off", -1)
-                        _n = getattr(t, "_tiny_pool_len", 0)
-                        if isinstance(_o, int) and _o >= 0 and _n:
-                            _rel.append((_o, _n))
-                    b._cpu_refs = None
-                    _pool = getattr(self, "host_pool", None)
-                    _rel_fn = getattr(_pool, "release", None) if _pool is not None else None
-                    if callable(_rel_fn) and _rel:
-                        for _o, _n in _rel:
-                            try:
-                                _rel_fn(_o, _n)
-                            except Exception:
-                                pass
-                    return b
-
-                with _TPE2(max_workers=_nw, thread_name_prefix="tinyinfer-build") as _ex2:
-                    list(_ex2.map(_mk, _build))
-            else:
-                for i in _build:
-                    b = self.block(i)
-                    b._cpu_refs = None
-            # flat streaming builds each streamed block and copies its weights into the
-            # pinned slab -- all inside the same pool
-            #
-            # **在这里就把 TI_FLAT 打开。** 不打开的话 _flat_enabled() 走
-            # `flag is None or flag != "1"` 那条分支，把 _flat_state 置成 "off"，
-            # 之后无论谁再设环境变量都不会重建（off 是终态）。
-            # 而 slab 不是可选加速：它是「整层一次 DMA + 地址固定」的唯一来源，
-            # 也是 CUDA graph 能 replay 的前提。留成可选就等于永远拿不到图。
-            try:
-                __import__("os").environ.setdefault("TI_FLAT", "1")
-                self._flat_enabled()
-            except Exception as exc:
-                print(f"[tinyinfer] flat setup at start-up failed: {exc!r}", flush=True)
+            # 主机周转区容纳一个待构建层，不能按 CPU 数并发占用多份。
+            for layer in (i for i in layers if i not in streamed_set):
+                block = self.block(layer)
+                torch.cuda.synchronize(self.device)
+                releases = {(tensor._tiny_pool_off, tensor._tiny_pool_len)
+                            for tensor in (block._cpu_refs or {}).values()
+                            if hasattr(tensor, "_tiny_pool_off") and tensor._tiny_pool_off >= 0}
+                block._cpu_refs = None
+                for offset, length in releases:
+                    pool.release(offset, length)
+            # 权重环是规划结果，分配失败不能换用未记账的另一条路径。
+            self._flat_enabled()
         finally:
             self.store.build_pool = None
             if self.device != "cpu":
@@ -1632,6 +1256,26 @@ class Engine:
     def expert_device(self, layer_id: int, expert_id: int) -> int:
         """Which card an expert is planned on (0 when single-GPU or unplanned)."""
         return getattr(self, "_expert_dev", {}).get((int(layer_id), int(expert_id)), 0)
+
+    def _measure_layer_bytes(self) -> dict[int, int]:
+        """每层真实打包字节：引擎要搬的张量按 256 字节对齐逐个累加。
+
+        规划器的环容量和主机权重额度都按这个数算。它不能拿 header 的名字求和
+        代替 —— 同一个权重在 checkpoint 里可能有几份不同精度的副本，只有
+        `_weight_paths()` 知道这次实际加载的是哪一份。
+        """
+        alignment = 256
+        sizes = {}
+        for layer in range(int(self.cfg.n_layers)):
+            block = Block(self.store, layer, self.cfg)
+            total = 0
+            for _, _, tensor in block._weight_paths():
+                total += (int(tensor.numel()) * tensor.element_size() + alignment - 1) // alignment * alignment
+            sizes[layer] = total
+            del block
+        if not sizes or min(sizes.values()) <= 0:
+            raise RuntimeError("layer weight measurement produced an empty layer set")
+        return sizes
 
     def block(self, layer_id: int) -> Block:
         if not self._expert_dev:
@@ -2184,70 +1828,7 @@ class Engine:
         self.restore(_t.load(path, map_location="cpu", weights_only=False))
         return True
 
-    # -- double-buffered streaming -----------------------------------------
-    def _ensure_stream_buffers(self, layer_id: int):
-        """Two flat device buffers per EXACT weight signature (v5).
-
-        v4 grouped by (ratio>0, compressor, indexer) and broke at the L20 boundary
-        (ratio=1 kv_source has a different weight count than the ratio=1 consumers).
-        v5 keys the cache by the full (name, shape) signature, so layers that can
-        share a flat buffer are exactly the ones whose weight list is identical.
-        """
-        b = self.block(layer_id)
-        paths = b._weight_paths()
-        sig = tuple((name, tuple(t.shape)) for (_, name, t) in paths)
-        cache = getattr(self, "_stream_buffer_cache", None)
-        if cache is None:
-            self._stream_buffer_cache = cache = {}
-        ent = cache.get(sig)
-        if ent is None and len(cache) >= 6:
-            # **不再限制只有一组。**
-            #
-            # 原来这里是 len(cache) >= 1 就返回 None，理由是「一组 2 块 x 190MB
-            # = 380MB，再多会吃光显存」。但那个判断是在「用 b.to() 逐层分配」的
-            # 旧架构下做的 —— 那时每层本来就有一块 132MB 的常驻 device 权重
-            # （30 层 = 3.97GB），再叠轮转 buffer 当然放不下。
-            #
-            # 现在要反过来：**让所有流式层都改用轮转 buffer，从而释放掉那
-            # 3.97GB 的逐层常驻**。30 层按 signature 大概分 2~3 组，每组 2 块
-            # x 132MB = 264MB，总共不到 1GB，比 3.97GB 少得多。
-            #
-            # 这不只是省显存：地址固定是 CUDA graph 能 replay 的前提。逐层
-            # b.to() 每次换地址，图里固化的地址就失效 —— 那正是「图捕获成功、
-            # replay 稳定、但 out 全是 NaN」的根因。
-            return None, None
-        if ent is None:
-            layout = []
-            off = 0
-            for owner, name, t in paths:
-                n = t.numel() * t.element_size()
-                off = (off + 255) // 256 * 256
-                layout.append((owner, name, None, off, n))
-                off += n
-            bufs = [torch.empty(off, dtype=torch.uint8, device=self.device) for _ in range(2)]
-            ent = cache[sig] = (layout, bufs)
-        return ent
-
-    def _stream_copy_sync(self, layer_id: int) -> None:
-        """Copy a streamed layer's weights into its rotating buffer on the compute stream."""
-        (layout, bufs) = self._ensure_stream_buffers(layer_id)
-        b = self.block(layer_id)
-        paths = b._weight_paths()
-        buf = bufs[layer_id % 2]
-        for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
-            buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape).copy_(t)
-            set_weight(owner, name, buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape))
-        if getattr(b, "engram", None) is not None:
-            b.engram.to(self.device)
-        b._device = self.device
-
-    # -- flat streaming (v6) -----------------------------------------------
-    # Every streamed layer reuses ONE pair of device buffers sized to the largest
-    # layer, and every layer's host weights are packed once into a pinned flat
-    # buffer. A decode step then issues one 442MB pinned H2D per layer (16ms at
-    # pinned bandwidth) instead of ~31 pageable per-tensor copies that each cost a
-    # host round-trip; the next layer is copied on a side stream while the current
-    # one computes, so the transfer hides behind the GPU.
+    # -- planned weight-ring streaming -------------------------------------
     def _release_flat_state(self) -> None:
         """丢掉当前 slab 并把它占的 pool 切片还回去。
 
@@ -2276,40 +1857,12 @@ class Engine:
         self._flat_slot_owner = {}
 
     def _flat_enabled(self) -> bool:
-        st = getattr(self, "_flat_state", None)
-        if st == "off":
+        if self.device == "cpu" or not self._stream_layers():
             return False
-        if st is None:
-            import os as _os
-
-            flag = _os.environ.get("TI_FLAT")
-            # **默认关闭。**
-            #
-            # slab 路径会把整层权重一次 DMA 进显存环（比逐 tensor 快，实测
-            # 2086ms vs 2893ms），但它目前会以约 50% 的概率产出 NaN。
-            #
-            # 定位到的事实（见 docs/未解决-不确定性.md）：
-            #   - TI_FLAT=0（关闭 slab）：4/4 全部 finite
-            #   - slab 开 + 直接 DMA 关：1/3 NaN
-            #   - slab 关 + 直接 DMA 开：4/4 全部 finite
-            # 所以问题在 slab 这条路径里，不在 DMA 的异步语义。已经排除了
-            # 环复用竞态（每层同步仍 NaN）和 slab 数据损坏（内容逐层检查干净）。
-            #
-            # 在查清之前，正确性优先：默认走逐 tensor 的整层搬运。要实验重新打开
-            # 用 TI_FLAT=1，但那份输出不可信。
-            if flag is None or flag != "1":
-                self._flat_state = "off"
-                return False
-            if self.gpu_layers >= self.max_layers:
-                # every layer is resident: there is nothing to stream
-                self._flat_state = "off"
-                return False
-            try:
-                self._flat_setup()
-            except Exception as exc:  # pinned-pool exhaustion, OOM: stay on the old path
-                print(f"[tinyinfer] flat streaming off: {exc!r}", flush=True)
-                self._flat_state = "off"
-                return False
+        if getattr(self, "_flat_state", None) is None:
+            self._flat_setup()
+        if not isinstance(self._flat_state, tuple):
+            raise RuntimeError("planned weight ring is not available")
         return True
 
     def _warm_weights(self, layers) -> None:
@@ -2353,574 +1906,155 @@ class Engine:
         print(f"[tinyinfer] prewarm {total/1e9:.1f}GB of layer weights in {dt:.1f}s "
               f"= {total/1e9/max(dt,1e-6):.1f}GB/s", flush=True)
 
-    def _flat_setup(self) -> None:
-        import os
+    def _allocate_weight_ring(self, layer_sizes: dict[int, int]):
+        """只兑现规划器的容量，实际层放不下时拒绝分配而不是偷偷扩容。"""
+        plan = self.hw_plan
+        if not layer_sizes or not 1 <= plan.weight_buffers <= len(layer_sizes):
+            raise RuntimeError("weight ring has no valid planned buffer count")
+        required = max(layer_sizes.values())
+        if required > plan.weight_buffer_bytes:
+            raise RuntimeError(
+                f"weight ring needs {required} bytes per buffer, "
+                f"but planner reserved {plan.weight_buffer_bytes}")
+        return [torch.empty(plan.weight_buffer_bytes, dtype=torch.uint8, device=self.device)
+                for _ in range(plan.weight_buffers)]
 
+    def _flat_setup(self) -> None:
+        """逐层构建并打包，不能先积攒整模型的私有转换副本。"""
         streamed = sorted(self._stream_layers())
         if not streamed:
             raise RuntimeError("no streamed layers")
-        lay: dict[int, tuple[list[tuple[int, int]], int]] = {}
-        sizes: dict[int, int] = {}
-        # Layers already lying flat in the pool. Weights are read straight into pool
-        # slices, so a layer's tensors are often one contiguous region already; those
-        # layers can be streamed from their own bytes and never get a second copy.
-        zero_copy: set[int] = set()
-        _pool = getattr(self, "host_pool", None)
-        _pool_base = getattr(_pool, "_base", None) if _pool is not None else None
-        for i in streamed:
-            paths = self.block(i)._weight_paths()
-            # Only layers whose weights ALL live in the host pool can be streamed from
-            # their own bytes: wqkv.weight is a device copy that stays resident, and its
-            # data_ptr() is a GPU address, which would make the span arithmetic nonsense.
-            if _pool_base is not None and paths and all(
-                    t.device.type == "cpu" for (_, _, t) in paths):
-                try:
-                    actual = [(int(t.data_ptr()) - _pool_base,
-                               t.numel() * t.element_size()) for (_, _, t) in paths]
-                except Exception:
-                    actual = None
-                if actual and all(o >= 0 for o, _ in actual):
-                    pos = sorted((o, o + n) for o, n in actual)
-                    no_overlap = all(pos[k][1] <= pos[k + 1][0]
-                                     for k in range(len(pos) - 1))
-                    span = max(e for _, e in pos)
-                    total_b = sum(n for _, n in actual)
-                    # 4096-byte allocation alignment leaves padding; bound it so a
-                    # pathological layout falls back to the packed copy instead
-                    if __import__("os").environ.get("TI_FLAT_DBG"):
-                        print(f"[zc] L{i} base={_pool_base} n={len(actual)} span={span} "
-                              f"data={total_b} slack={span - total_b} "
-                              f"no_overlap={no_overlap}", flush=True)
-                    # The zero-copy path is opt-in: cudaHostAlloc's host address and the address
-                    # torch.frombuffer reports for the same slice do not agree on Windows
-                    # (measured: base 8.67e9 vs data_ptr 5.3e12), so the span arithmetic
-                    # cannot be trusted until the loader lays weights out for it directly.
-                    # See docs/模型结构.md; TI_ZC=1 turns the experiment on.
-                    if (no_overlap and span <= total_b + 65536 * len(actual)
-                            and __import__("os").environ.get("TI_ZC") == "1"):
-                        lay[i] = (actual, span)
-                        sizes[i] = span
-                        zero_copy.add(i)
-                        continue
-            offs: list[tuple[int, int]] = []
-            off = 0
-            for (_, _, t) in paths:
-                n = t.numel() * t.element_size()
-                off = (off + 255) // 256 * 256
-                offs.append((off, n))
-                off += n
-            lay[i] = (offs, off)
-            sizes[i] = off
-        # No second host copy: Block.to() already keeps a pinned ref for every weight
-        # (_cpu_refs, 15.5GB on this checkpoint). A packed flat copy on top of that is
-        # another 15.5GB, which pushed the box into paging (rss 21.6GB vs 14.6GB
-        # available). Instead the per-tensor pinned copies go straight into the shared
-        # pair: still async, still one H2D per layer, no extra host memory.
-        keep: list[int] = []
-        mx = max(sizes.values())
-        # Three rotating buffers. With two, the H2D for layer k+1 starts only when
-        # layer k begins, and a 719MB transfer (27ms) is slower than one layer of
-        # compute (~15ms), so it can never hide. Three let layer k compute while
-        # k+1 and k+2 stream in.
-        # ring depth is measurable: 3 hides one H2D behind compute, 2 frees a layer-sized
-        # buffer (463MB here) for one more resident layer on a card this tight.
-        # Re-measured after the fp4 experts moved to vLLM's Marlin (the experts got 4.8x
-        # faster, so the layer H2D is now a larger share of the step): depth 3 =
-        # 0.935-1.19s/token = 0.968 tok/s, depth 4 = 1.03-1.40s/token = 0.864,
-        # depth 2 = 1.04-1.27s/token = 0.867. Deeper is not free -- each extra ring slot
-        # costs 463MB of the 6.9GB card -- so 3 is the measured optimum, not a maximum.
-        # **环深度的下限由「一步之内不重复」决定，不是调出来的数字。**
-        #
-        # 38 个流式层共用这个环。深度 3 时第 4 层就复用第 1 层的槽，
-        # 而第 1 层的 kernel 未必退休 —— 实测 step1/step2 正常、step3 起
-        # NaN（到第 3 步环才完整转完一轮，之前的残留恰好是合法数据）。
-        #
-        # 真正安全的环深度 = 预取提前量 + 1。预取不开启时 2 就够，开启时
-        # 要覆盖「当前 + 预取中的那几层」。取 4 是本机显存允许的上限
-        # （4 x 463MB = 1.85GB），再大就挤掉槽位了。
-        _ring_n = max(2, int(__import__("os").environ.get("TI_RING", "4")))
-        bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(_ring_n)]
-        pinned_gb = 0.0
-        # Pinned budget. Pinning all 17.9GB of streamed weights starved the expert
-        # cache: pinned sources are the only ones that can use async DMA, and the
-        # pinned pool also has to hold the expert blobs.
-        from .budget import budget as _host_budget
-
-        _hb = _host_budget()
-        # Per-tensor fallback only: pin as much as the budget has left, one tensor at
-        # a time, and let the ones that do not fit stay pageable.
-        pin_budget = int(float(__import__("os").environ.get("TI_FLAT_PIN_GB", "0")) * (1 << 30))
-        if pin_budget <= 0:
-            pin_budget = min(_hb.room(), int(_hb.total * 0.36))
-        # One pinned slab for every streamed layer, laid out exactly like the device
-        # buffers, so a layer costs ONE flat H2D instead of 15-30 small copy_ calls.
-        # cProfile: the per-tensor path issued 1469 copy_ calls and burned 1.01s of a
-        # 3.45s decode step in host-side dispatch, while the pinned bytes were already
-        # resident (the slab replaces them, it does not add to them).
-        slab_total = sum(sizes[i] for i in streamed) + 512
-        # Pinning every streamed layer is not the goal; it is only worth what it saves.
-        # On a box where the weights alone are half of RAM, pin at most half of the
-        # remaining room so the page cache (and the experts) still have memory.
-        # Cap the pinned set at a share of PHYSICAL RAM, not of the volatile "room":
-        # the slab plus the expert cache plus the 17GB of streamed weights must leave
-        # the page cache alive, or the SSD drops from 4.6 to 3.1GB/s and every fetch
-        # doubles (measured: full-RAM slab -> 2.29s fetch, capped slab -> 1.47s).
-        # Fixed share of PHYSICAL RAM, not of the volatile room: the room shrinks as the
-        # model weights load, so a room-derived cap collapsed to 6.7GB and left 21 of 35
-        # layers on the slow per-tensor path. The invariant that matters is
-        # weights(17GB) + slab + expert cache <= RAM - OS, and the planner already sized
-        # the cache from the same budget, so the slab takes its share of the total.
-        # The slab and the expert cache are carved from the same pinned pool, and at
-        # decode it is the cache that pays: a larger slab means more streamed layers get
-        # their weights pre-staged, while a larger cache means fewer 18.8MB expert reads
-        # per token. Measured steady-state decode (0.66 -> 0.75 hit rate takes the step
-        # from 574ms to 519ms), so the cache is worth more than the slab. TI_SLAB_FRAC
-        # lets the split be measured instead of argued.
-        # **不再按「物理内存的 28%」硬切 slab 上限。**
-        #
-        # 那个 0.28 没有任何推导，也没有实测记录 —— 它和规划器的 cache_bytes
-        # 是两套互不相干的账：规划器按 host_avail*0.35 给缓存，engine 又在这里
-        # 切 28% 给 slab，两边各算各的，必然冲突（实测：缓存拿走 11.26GB，
-        # slab 只剩 3.13GB，一层都建不起来）。
-        #
-        # 正确的账只有一本：规划器算 used_bytes 时已经把 slab 环算进去了，
-        # 也把 cache_bytes 扣掉了 slab 份额。所以这里直接用 slab_total
-        # （= 所有流式层的扁平布局总和），由 pool 的实际余量决定能装几层。
-        # 装不满就装不满 —— 那是显存/内存不够的真实结论，不是被一个常数
-        # 提前砍掉的。
-        _slab_cap = int(slab_total)
-        if slab_total > _slab_cap:
-            slab_total = _slab_cap
-        if __import__("os").environ.get("TI_FLAT_DBG"):
-            _f = sizes[streamed[0]] if streamed else 0
-            print(f"[slabdbg] n={len(streamed)} slab_total={slab_total/2**30:.2f}GB "
-                  f"cap={_slab_cap/2**30:.2f}GB hb_total={_hb.total/2**30:.1f}GB "
-                  f"room={_hb.room()/2**30:.1f}GB first={_f/2**20:.0f}MB", flush=True)
-        host_slab = None
-        # Ask the host budget, which re-reads what the machine actually has left right
-        # now. No flag, no per-machine constant: on a small box the grant comes back
-        # short and we fall back to per-tensor pinned copies, on a big one we get the
-        # whole slab. The slab REPLACES those copies, so the freed memory is available
-        # to the next request automatically (available() is re-read every time).
-        # One pinned block PER LAYER rather than one giant block: a single 15GB
-        # cudaHostAlloc is refused by the driver on some Windows configurations (the
-        # per-tensor fallback below pinned the same 14.9GB in small pieces), while a
-        # 468MB block always succeeds. Each block is still laid out exactly like the
-        # device buffer, so a layer is one flat H2D, which is the whole point.
-        host_map: dict[int, torch.Tensor] = {}
-        _why = "ok"
-        host_slab: dict[int, torch.Tensor] | None = None
-        self._host_slab = None
-        # One layer at a time: allocate its block, copy the weights in, point the layer
-        # at the block, then let the old pageable copy go. Allocating all blocks first
-        # holds both copies at once (+18GB) and that is what pushed this box into swap.
-        _slab_used = 0
-        _pool = getattr(self, "host_pool", None)
-        if _pool is not None:
-            # The slab is built from pool slices (build_pool put the weights there), so
-            # both the source and the slab live inside the claimed pool; nothing here
-            # touches private host memory.
-            if __import__("os").environ.get("TI_FLAT_DBG"):
-                print(f"[flatdbg] pool total={_pool.total / 2**30:.2f}GB used="
-                      f"{_pool.used / 2**30:.2f}GB free={_pool.free / 2**30:.2f}GB "
-                      f"slab_total={slab_total / 2**30:.2f}GB", flush=True)
-            # **不要用启动瞬间的 _pool.free 定死上限。**
-            #
-            # 原来这里是 slab_total = min(slab_total, _pool.free)。而 pool.free
-            # 取决于那一刻宿主机上还剩多少内存（别的进程、页缓存都会影响），
-            # 于是同一份配置、同一台机器，连续三次运行分别得到 slab 10 / 6 / 7 层，
-            # step 2083 / 4060 / 3671ms —— **波动 2 倍，而且看起来像性能退化**。
-            #
-            # 改成用 pool 的**总容量**按份额给：这个数在 claim 之后就固定了，
-            # 不随瞬时状态跳。份额就是 slab 自己那份（_slab_cap 已经算过），
-            # 再和「所有层都装下需要多少」取小。
-            _quota = slab_total
-            if _pool is not None:
-                _quota = min(slab_total, int(_pool.total))
-            slab_total = _quota
-        if slab_total <= 0 and _pool is not None:
-            _why = "pool-backed"
-        for i in streamed:
-            need = sizes[i]
-            if i in zero_copy and _pool is not None:
-                # Already flat in the pool: reuse the bytes in place. Copying them into
-                # a slab block is what made the slab run out of room (5/30 layers) and
-                # dropped the disk to 1.4GB/s.
-                b = self.block(i)
-                base_off = min(o for o, _ in lay[i][0])
-                mv = _pool.slice_at(base_off, need)
-                if mv is not None:
-                    blk = torch.frombuffer(mv, dtype=torch.uint8)
-                    blk._tiny_pool_mv = mv
-                    refs = {}
-                    for (owner, name, t), (o, n) in zip(b._weight_paths(), lay[i][0]):
-                        refs[Block._wkey(owner, name)] = blk[o:o + n].view(t.dtype).view(t.shape)
-                    b._cpu_refs = refs
-                    b._device = "cpu"
-                    host_map[i] = blk
-                    keep.append(i)
-                    continue
-            if _slab_used + need > slab_total:
-                if _pool is None:
-                    _why = (f"reached the pinned cap {slab_total/2**30:.1f}GB "
-                            f"({len(host_map)}/{len(streamed)} layers)")
-                break
-            if _pool is not None:
-                blk = _pool.tensor(need)
-                if blk is None:
-                    _why = (f"pool exhausted at layer {i} "
-                            f"({_pool.used/2**30:.1f}/{_pool.total/2**30:.1f}GB used)")
-                    break
-            else:
-                got = _hb.grant(need)
-                if got < need:
-                    _why = f"budget: wanted {need/2**20:.0f}MB got {got/2**20:.0f}MB ({_hb.stats()})"
-                    break
-                try:
-                    blk = torch.empty(need, dtype=torch.uint8, pin_memory=True)
-                except Exception as exc:
-                    _hb.release(need)
-                    _why = f"pinned alloc failed at layer {i}: {exc!r}"
-                    break
-            _slab_used += need
-            self._slab_granted = getattr(self, "_slab_granted", 0) + need
-            b = self.block(i)
-            paths = b._weight_paths()
-            offs = lay[i][0]
-            # 先记下这些权重在 pool 里的位置：拷进 slab 之后要把它们还回去。
-            # build_pool 是 "读到哪算哪" 的 bump 分配器，权重读进来占了约
-            # 6.5GB，而 slab 块是从同一块 pool 里另切的 —— 不释放的话池子被
-            # 两倍占用，slab 只装得下 14/33 层（实测 slab_total=7.29GB 却只
-            # 用到 3.36GB 就停了，日志是 "partial slab 14/33"）。
-            _rel_after = []
-            for (owner, name, t) in paths:
-                _o = getattr(t, "_tiny_pool_off", -1)
-                _n = getattr(t, "_tiny_pool_len", 0)
-                if isinstance(_o, int) and _o >= 0 and _n:
-                    _rel_after.append((_o, int(_n)))
-            for (owner, name, t), (o, n) in zip(paths, offs):
-                dst = blk[o:o + n].view(t.dtype).view(t.shape)
-                try:
-                    dst.copy_(t)
-                except Exception:
-                    pass
-                set_weight(owner, name, dst)
-            _refs = {}
-            for (owner, name, t), (o, n) in zip(paths, offs):
-                _refs[Block._wkey(owner, name)] = blk[o:o + n].view(t.dtype).view(t.shape)
-            b._cpu_refs = _refs
-            # **换完引用再还内存。** 顺序反了就是悬空：b._cpu_refs 还指着旧 tensor
-            # （在 pool 里）的时候 release 掉那块，之后的 any 访问都是野指针。
-            if _rel_after:
-                _pool_rel = getattr(self, "host_pool", None)
-                _rel_fn = getattr(_pool_rel, "release", None) if _pool_rel is not None else None
-                if callable(_rel_fn):
-                    for _o, _n in _rel_after:
-                        try:
-                            _rel_fn(_o, _n)
-                        except Exception:
-                            pass
-                _rel_after = []
-            b._device = "cpu"
-            host_map[i] = blk
-            del paths, offs
-            keep.append(i)
-        if len(host_map) == len(streamed):
-            pinned_gb = sum(int(v.numel()) for v in host_map.values()) / 2 ** 30
-            self._flat_state = (lay, bufs, host_map)
-            self._host_slab = host_map
-        elif host_map:
-            # Partial slab: the layers that got a block keep the one-copy fast path, the
-            # rest fall back to per-tensor pinned copies. All-or-nothing wasted the RAM
-            # that WAS available and left every layer on the slow path.
-            print(f"[tinyinfer] partial slab {len(host_map)}/{len(streamed)} layers ({_why})",
-                  flush=True)
-            pinned_gb = sum(int(v.numel()) for v in host_map.values()) / 2 ** 30
-            # the slab already consumed its share of the pinned budget; counting from
-            # zero here pinned a second full budget and took the box to its page file
-            pinned_used = int(pinned_gb * 2 ** 30)
-            for i in streamed:
-                if i in host_map:
-                    continue
-                b = self.block(i)
-                paths = b._weight_paths()
-                refs = []
-                for (_, _, t) in paths:
-                    nbytes = t.numel() * t.element_size()
-                    if (t.is_cpu and not t.is_pinned() and pinned_used + nbytes <= pin_budget):
-                        try:
-                            t = t.pin_memory()
-                            pinned_used += nbytes
-                        except Exception:
-                            pass
-                    refs.append(t)
-                # keyed the same way Block.to() keys its map, so the two stay in sync
-                b._cpu_refs = {Block._wkey(o, n): t for (o, n, _), t in zip(paths, refs)}
-                for (owner, name, _), t in zip(paths, refs):
-                    set_weight(owner, name, t)
-                b._device = "cpu"
-                pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
-                keep.append(i)
-            self._flat_state = (lay, bufs, host_map)
-            self._host_slab = host_map
-        else:
-            print(f"[tinyinfer] slab unavailable ({_why}); falling back to per-tensor pinned",
-                  flush=True)
-            pinned_used = 0
-            for i in streamed:
-                b = self.block(i)
-                paths = b._weight_paths()
-                refs = []
-                for (_, _, t) in paths:
-                    nbytes = t.numel() * t.element_size()
-                    if (t.is_cpu and not t.is_pinned() and pinned_used + nbytes <= pin_budget):
-                        try:
-                            t = t.pin_memory()
-                            pinned_used += nbytes
-                        except Exception:
-                            pass
-                    refs.append(t)
-                b._cpu_refs = {Block._wkey(o, n): t for (o, n, _), t in zip(paths, refs)}
-                # repoint the layer at the pinned copies so the pageable originals can be
-                # freed: keeping both meant 15.9GB + 15.9GB resident, and under that pressure
-                # the pinned H2D fell from 30GB/s to 6.5GB/s (measured T=1 vs T=2)
-                for (owner, name, _), t in zip(paths, refs):
-                    set_weight(owner, name, t)
-                b._device = "cpu"
-                pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
-                keep.append(i)
-            self._flat_state = (lay, bufs, None)
+        pool = self.host_pool
+        if pool is None:
+            raise RuntimeError("streaming weights require a planned host pool")
+        layouts, sizes, host = {}, {}, {}
+        required = 0
+        alignment = 256  # 权重视图的向量加载 ABI
+        for layer in streamed:
+            block = self.block(layer)
+            paths = block._weight_paths()
+            offsets, total = [], 0
+            for _, _, tensor in paths:
+                if tensor.device.type != "cpu":
+                    raise RuntimeError(f"layer {layer}: weight source is not on the host")
+                total = (total + alignment - 1) // alignment * alignment
+                size = tensor.numel() * tensor.element_size()
+                offsets.append((total, size))
+                total += size
+            if not offsets:
+                raise RuntimeError(f"layer {layer}: no weight tensors to pack")
+            total = (total + alignment - 1) // alignment * alignment
+            required += total
+            if required > self.hw_plan.host_weight_bytes:
+                raise RuntimeError(
+                    f"host weights need {required} bytes; planner reserved {self.hw_plan.host_weight_bytes}")
+            if total > self.hw_plan.weight_buffer_bytes:
+                raise RuntimeError(f"layer {layer}: weight layout exceeds planned ring capacity")
+            layouts[layer] = (offsets, total)
+            sizes[layer] = total
+            slab = pool.tensor(total, align=alignment)
+            if slab is None:
+                raise MemoryError(f"planned host pool cannot pack layer {layer}")
+            releases = {(tensor._tiny_pool_off, tensor._tiny_pool_len)
+                        for _, _, tensor in paths if hasattr(tensor, "_tiny_pool_off")
+                        and tensor._tiny_pool_off >= 0}
+            views = [slab[offset:offset + length].view(tensor.dtype).view(tensor.shape)
+                     for (_, _, tensor), (offset, length) in zip(paths, offsets)]
+            try:
+                for (_, _, source), view in zip(paths, views):
+                    view.copy_(source)
+            except Exception:
+                pool.release(slab._tiny_pool_off, slab._tiny_pool_len)
+                raise
+            refs = {}
+            for (owner, name, _), view in zip(paths, views):
+                set_weight(owner, name, view)
+                refs[Block._wkey(owner, name)] = view
+            block._cpu_refs = refs
+            block._device = "cpu"
+            host[layer] = slab
+            del paths, source, tensor, _
+            for offset, length in releases:
+                pool.release(offset, length)
+        buffers = self._allocate_weight_ring(sizes)
+        self._flat_state = (layouts, buffers, host)
+        self._host_slab = host
         self._flat_ev = {}
+        self._flat_done = {}
+        self._flat_slot_owner = {}
         self._copy_stream = torch.cuda.Stream(device=self.device)
-        print(f"[tinyinfer] flat streaming: {len(keep)} layers, {mx/2**20:.0f}MBx3 VRAM, "
-              f"{pinned_gb:.1f}GB {'slab' if self._host_slab else 'per-tensor'} pinned source",
-              flush=True)
+        self._copy_stream.wait_stream(torch.cuda.current_stream(device=self.device))
+        print(f"[tinyinfer] flat streaming: {len(host)} layers, "
+              f"{self.hw_plan.weight_buffer_bytes / 2**20:.0f}MBx{len(buffers)} VRAM, "
+              f"{required / 2**30:.1f}GB host source", flush=True)
 
-    def _flat_apply(self, layer: int, buf_idx: int, stream=None) -> None:
-        """把一层权重搬进环块。**流必须显式传入，绝不读 current_stream。**
+    def _flat_apply(self, layer: int, buf_idx: int, *, stream) -> None:
+        """在指定流上搬运权重；完成事件必须记录在同一条流上。"""
+        from .loading import _async_h2d
 
-        实测（一次 forward 内采样 current_stream）：
-            {0: 1, 2710229284720: 37}
-        37 次跑在第三个流上，而 forward 主体在默认流（0）上 —— 那 37 次 DMA
-        与消费它的 kernel **不在同一条流**，driver 层没有任何顺序保证，于是
-        kernel 读到的是尚未落地的字节。这是 slab 路径 NaN 的真正根因，也解释
-        了为什么 TI_FLAT_SYNC=1（全设备同步）能掩盖它。
-
-        current_stream 会漂移的原因：_flat_prefetch 用
-        `with torch.cuda.stream(self._copy_stream)` 包住 _flat_apply，任何提前
-        return / 异常路径都可能让上下文栈与直觉不一致；prefetch 之后主路径再
-        调 apply 时，栈可能还停在 copy stream 上。
-
-        所以这里不再相信隐式状态：调用方显式给 stream，否则用默认流。
-        """
-        self._flat_applies = getattr(self, "_flat_applies", 0) + 1
-        _tgt_stream = stream if stream is not None else torch.cuda.default_stream()
-        self._flat_tgt_stream = _tgt_stream
         lay, bufs, host = self._flat_state
+        if host is None or layer not in host:
+            raise RuntimeError(f"layer {layer}: no planned host slab")
         b = self.block(layer)
         offs, total = lay[layer]
-        # 诊断：TI_FLAT_PERLAYER=1 时给每层分配独立 buffer，不复用环形缓冲。
-        # 用来区分「多个层共享同一块 device storage」是不是 NaN 的来源。
-        if __import__("os").environ.get("TI_FLAT_PERLAYER") == "1":
-            if getattr(self, "_perlayer_bufs", None) is None:
-                self._perlayer_bufs = {}
-            _key = (layer, buf_idx)
-            buf = self._perlayer_bufs.get(_key)
-            if buf is None or buf.numel() < lay[layer][1]:
-                buf = torch.empty(lay[layer][1], dtype=torch.uint8, device=self.device)
-                self._perlayer_bufs[_key] = buf
-        else:
-            buf = bufs[buf_idx]
-        if __import__("os").environ.get("TI_DEBUG_FLAT"):
-            print(f"[flat] layer {layer} buf {buf_idx} slab={host is not None and layer in host}",
-                  flush=True)
-        if host is None or layer not in host:
-            # Per-tensor copies from the pinned refs Block already holds (a partial slab
-            # leaves most layers on this path). The refs ARE pinned host memory, so issue
-            # the DMA straight at it: tensor.copy_() costs ~84us of CPU dispatch per call
-            # (measured in the decode trace: 2849 calls per step, 239ms of the step) and
-            # the step is CPU bound -- the GPU kernels are only ~91ms of it.
-            from .loading import _async_h2d
+        buf = bufs[buf_idx]
+        paths = b._weight_paths()
+        if len(paths) != len(offs) or total > buf.numel():
+            raise RuntimeError(f"layer {layer}: weight layout does not fit ring slot {buf_idx}")
+        views = []
+        for (owner, name, tensor), (offset, size) in zip(paths, offs):
+            if size != tensor.numel() * tensor.element_size() or offset + size > total:
+                raise RuntimeError(f"layer {layer}: invalid layout for {name}")
+            views.append(buf[offset:offset + size].view(tensor.dtype).view(tensor.shape))
 
-            # 逐 tensor 提交 DMA：每层几十个，每次 copy_ 约 84us 的 CPU dispatch，
-            # 全局每步 2849 次调用 -> 239ms，而 GPU kernel 只有 ~91ms —— 拷贝提交
-            # 本身就是瓶颈。这里把手上的 (dst, src, n) 一次收齐再提交，让驱动按批
-            # 入队而不是每个都走一遍 Python + dispatch。
-            _pairs = []
-            for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
-                src = b._cpu_refs[Block._wkey(owner, name)]
-                dst = buf[o:o + n].view(t.dtype).view(t.shape)
-                _pairs.append((dst, src, n))
-            _queued = False
-            if _pairs:
-                _batch = getattr(b, "_h2d_batch", None)
-                if _batch is not None:
-                    _queued = _batch(_pairs)
-            if not _queued:
-                for dst, src, n in _pairs:
-                    if not _async_h2d(dst, src, n):
-                        dst.copy_(src, non_blocking=True)
-        else:
-            # **层的 H2D 也要走 _async_h2d，不能用 copy_。**
-            #
-            # 这和槽位装载是同一个坑：host[layer] 是 pool 的切片（cudaHostAlloc
-            # 得来），但 torch 不认它是 pinned，copy_ 会先做一次 pageable memcpy
-            # 到内部 staging 再发 DMA。
-            #
-            # 实测：按层量 GPU 时间，40 层合计 3220ms，每层 20~126ms（平均 80ms），
-            # 而同样一层如果权重已在显存里只要 2.35ms。80ms 传 463MB，折合
-            # 5.8GB/s —— 正好是 pageable 的量级，不是 PCIe 的 26GB/s。
-            # 整个 step 的 2200ms 里绝大部分就是它。
-            _ok = False
-            # 诊断开关：TI_FLAT_SYNC=1 时把这一层的 DMA 做成同步，
-            # 用来区分「异步/环复用竞态」和「数据本身不对」。
-            _sync = __import__("os").environ.get("TI_FLAT_SYNC") == "1"
-            try:
-                from .loading import _async_h2d as _ah2d
-
-                _ok = bool(_ah2d(buf, host[layer], int(total),
-                                 stream=_tgt_stream))
-            except Exception:
-                _ok = False
-            if not _ok:
-                buf[:total].copy_(host[layer], non_blocking=True)
-            if _sync:
-                torch.cuda.synchronize()
-            # **记录「这块环槽的 DMA 完成了」。**
-            #
-            # _async_h2d 是 ctypes 直调 cudaMemcpyAsync，torch 的流依赖
-            # 树完全不知道这次传输。同流有序只在 driver 层成立，而环槽
-            # 是被**多个层轮流复用**的：下一次写同一块槽时，谁也不能保证
-            # 上一次的 DMA 已经落地。
-            #
-            # 这里 record 一个 event 存进 _flat_dma_ev，由 _flat_slot_guard
-            # 在覆盖之前 wait —— 主机侧不等，只是把依赖显式交给 driver。
-            try:
-                _dev_ev = torch.cuda.Event()
-                _dev_ev.record(_tgt_stream)
-                if getattr(self, "_flat_dma_ev", None) is None:
-                    self._flat_dma_ev = {}
-                self._flat_dma_ev[layer] = _dev_ev
-            except Exception:
-                pass
-            # 诊断：TI_FLAT_VERIFY=1 时把刚搬进来的内容和源逐字节比一次。
-            # 这是判断「slab 数据流对不对」最直接的办法 —— 比只看最终 logits 精确。
-            if __import__("os").environ.get("TI_FLAT_VERIFY") == "1":
-                _n = getattr(self, "_flat_verify_n", 0)
-                if _n < 40:
-                    self._flat_verify_n = _n + 1
-                    torch.cuda.synchronize()
-                    _a = host[layer][:total].cpu().view(torch.uint8)
-                    _b = buf[:total].cpu().view(torch.uint8)
-                    _bad = int((_a != _b).sum())
-                    if _bad:
-                        print("[flatverify] L%d bad=%d/%d" % (layer, _bad, total),
-                              flush=True)
-        # 诊断：TI_FLAT_VIS=1 时在 set_weight 之前同步一次，验证「内核看不到
-        # 外部 DMA 写入」这个可见性假设。
-        if __import__("os").environ.get("TI_FLAT_VIS") == "1":
-            torch.cuda.synchronize()
-        # **把 DMA 与消费它的 kernel 显式串起来。**
-        #
-        # set_weight 只是改 Python 侧的指针，kernel 拿的是裸地址。
-        # _async_h2d 走 ctypes 直调 cudaMemcpyAsync，torch 的流依赖树看不见
-        # 这次传输 —— 同流有序是 driver 层的性质，但**权重被重新指向之后
-        # 提交的 kernel 排在哪个流上不受这里控制**（attention/moe 有自己的
-        # stream 用法）。实测：TI_FLAT_SYNC=1 全对、异步时 step3 就 NaN，
-        # 是典型的「数据尚未落地就被读」。
-        #
-        # 在 compute stream 上 record 一个 event，再让它自己 wait —— 同流上
-        # 这是 no-op，但会把这次 DMA 显式编进依赖链，下面任何流等待它都能看到。
-        _vis_ev = None
-        try:
-            _vis_ev = torch.cuda.Event()
-            _vis_ev.record(_tgt_stream)
-        except Exception:
-            _vis_ev = None
-        for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
-            set_weight(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
-        if _vis_ev is not None:
-            self._flat_vis_ev = _vis_ev
+        if host[layer].numel() * host[layer].element_size() < total:
+            raise RuntimeError(f"layer {layer}: planned host slab is too small")
+        if not _async_h2d(buf, host[layer], total, stream=stream):
+            raise RuntimeError(f"layer {layer}: slab H2D submission failed")
+        for (owner, name, _), view in zip(paths, views):
+            set_weight(owner, name, view)
         if getattr(b, "engram", None) is not None:
             b.engram.to(self.device)
         b._device = self.device
-    def _flat_slot_guard(self, layer: int, buf_idx: int) -> None:
-        """Stop the copy stream from refilling a ring slot the GPU may still be reading.
+        self._flat_applies = getattr(self, "_flat_applies", 0) + 1
 
-        With a three-deep ring and two layers prefetched ahead, layer i+3 lands in the
-        same slot as layer i. The copy stream is independent of the compute stream, so
-        without this the DMA could overwrite layer i's weights while its kernels were
-        still running -- and since the reused memory held a *previous* run's bytes, the
-        damage decayed instead of failing outright: four back-to-back runs of the same
-        prompt produced '<eos>', then gibberish, then nearly right, then the correct
-        answer.
-        """
+    def _flat_slot_guard(self, layer: int, buf_idx: int) -> None:
+        """环槽只在上一位使用者的计算结束后才能覆盖。"""
         if getattr(self, "_flat_slot_owner", None) is None:
             self._flat_slot_owner = {}
             self._flat_done = {}
         prev = self._flat_slot_owner.get(buf_idx)
-        # **不 pop 事件。** 原来这里是 `_flat_done.pop(prev, None)`，取出即删。
-        # 而一个槽位在一次 forward 里可能被反复占用（主路径 + 预取交替），
-        # 第二次需要等同一层时事件已经被 pop 掉了，于是这次覆盖无人守护 ——
-        # 实测就是「关掉预取 finite=True、开预取 finite=False」。
-        # 事件对象本身很小，留着到最后统一清理，换掉一类难查的竞态。
-        if prev is not None and prev != layer:
-            # 1) 等上一层**算完**（它的 kernel 还在读这块槽）
-            done = self._flat_done.get(prev)
-            if done is not None:
-                self._copy_stream.wait_event(done)
-            # 2) 等上一层**的 DMA 落地**
-            #
-            # _async_h2d 是 ctypes 直调 cudaMemcpyAsync，torch 的流依赖树
-            # 看不见它。如果只等 kernel 不等 DMA，就会出现「上一层的拷贝还
-            # 在飞、这一层的拷贝已经覆盖同一块槽」——实测 step1-3 正常、
-            # step4 起 NaN，正是状态攒够之后才暴露的竞态指纹。
-            _dev_ev = (getattr(self, "_flat_dma_ev", None) or {}).get(prev)
-            if _dev_ev is not None:
-                self._copy_stream.wait_event(_dev_ev)
+        if prev is not None:
+            done = self._flat_done.pop(prev, None)
+            if done is None:
+                raise RuntimeError(
+                    f"ring slot {buf_idx}: layer {prev} has not finished before layer {layer}")
+            self._copy_stream.wait_event(done)
         self._flat_slot_owner[buf_idx] = layer
 
     def _flat_prefetch(self, layer: int, buf_idx: int) -> None:
-        if layer not in self._flat_state[0]:
-            return
+        if layer in self._flat_ev:
+            raise RuntimeError(f"layer {layer}: duplicate weight prefetch")
         self._flat_slot_guard(layer, buf_idx)
         ev = torch.cuda.Event()
         with torch.cuda.stream(self._copy_stream):
-            self._flat_apply(layer, buf_idx)
-            # DMA 也发在 copy stream 上（_flat_apply 用 current_stream），
-            # 所以这一个 event 同时覆盖「拷贝完成」和「提交完成」。
+            self._flat_apply(layer, buf_idx, stream=self._copy_stream)
             ev.record(self._copy_stream)
-        self._flat_ev[layer] = ev
+        self._flat_ev[layer] = (buf_idx, ev)
 
     def _flat_wait(self, layer: int, buf_idx: int) -> None:
         import time as _t
         t0 = _t.perf_counter()
         try:
-            if layer not in self._flat_state[0]:
-                self.block(layer).to(self.device)
-                return
-            # **捕获期不能等外部事件。**
-            #
-            # copy stream 上那个 event 是在图外 record 的，捕获期的计算流
-            # wait 它会直接报
-            #   CUDA error: dependency created on uncaptured work in another stream
-            #   Capturing stream can only wait on captured events
-            # 而捕获只需要图里 kernel 的序列：权重在捕获前已经由 _flat_apply
-            # 搬进环里，replay 时那些地址不变。搬运本身在图外重新做。
+            # 捕获只记录计算，权重搬运由图外调度完成。
             if torch.cuda.is_current_stream_capturing():
-                self._flat_slot_guard(layer, buf_idx)
                 return
-            ev = self._flat_ev.pop(layer, None)
-            if ev is not None:
-                # **不 pop DMA 落地事件，两个都等。**
-                #
-                # ev 是 copy stream 上「_flat_apply 提交完毕」的记录，它只
-                # 保证队列里排好了；而 _async_h2d 走 ctypes，torch 的依赖树
-                # 看不见那次传输。两个都 wait 才能保证「权重真的到显存了」。
-                torch.cuda.current_stream().wait_event(ev)
-            else:
-                self._flat_slot_guard(layer, buf_idx)
-                self._flat_apply(layer, buf_idx)
+            if layer not in self._flat_ev:
+                self._flat_prefetch(layer, buf_idx)
+            loaded_idx, ev = self._flat_ev.pop(layer)
+            if loaded_idx != buf_idx or self._flat_slot_owner[buf_idx] != layer:
+                raise RuntimeError(f"layer {layer}: prefetched ring slot no longer matches")
+            torch.cuda.current_stream().wait_event(ev)
         finally:
             self._h2d_wait_ms = getattr(self, "_h2d_wait_ms", 0.0) + (_t.perf_counter() - t0) * 1e3
 
@@ -2940,144 +2074,6 @@ class Engine:
                 self._stream_set = set(range(min(int(self.gpu_layers), self.max_layers),
                                              self.max_layers))
         return self._stream_set
-
-    def _layer_prefetch(self, layer_id: int):
-        """把一层 streamed 权重发到 copy stream，返回要等的 event。**不阻塞。**
-
-        _layer_ev 用的是「事件记录在 copy stream 上」这个标准做法：调用方随后
-        用 current_stream().wait_event(ev)，GPU 侧自然形成「拷贝 -> 计算」的依赖，
-        主机侧一行都不等。这样第 i 层的计算和第 i+1 层的搬运在时间上重叠。
-        """
-        ev = torch.cuda.Event()
-        cs = getattr(self, "_copy_stream", None)
-        if cs is None:
-            cs = self._copy_stream = torch.cuda.Stream(device=self.device)
-        b = self.block(layer_id)
-        paths = b._weight_paths()
-        # 源必须 pin 过：pinned 源走 pinned 带宽（6.1GB/s），pageable 会被
-        # 驱动先在主机侧分块暂存一遍（实测慢 3 倍）。
-        refs = getattr(b, "_cpu_refs", None)
-        if not refs:
-            refs = {}
-            for (owner, name, t) in paths:
-                k = b._wkey(owner, name)
-                refs[k] = t.pin_memory() if (t.is_cpu and t.device.type == "cpu"
-                                             and not t.is_pinned()) else t
-            b._cpu_refs = refs
-        if b._device == self.device:
-            # 已经在显存里（上一轮搬过），不用再发。
-            return ev.record_on(cs) if hasattr(ev, "record_on") else ev
-        need = 0
-        for (_, _, t) in paths:
-            need = (need + 255) // 256 * 256
-            need += t.numel() * t.element_size()
-        need = (need + 255) // 256 * 256
-        # **每层独立一块，不能用共享 staging。**
-        #
-        # set_weight 让这一层的权重指向这块 buffer，于是层持有它。用共享 staging
-        # 的话，下一层的预取会覆盖上一层的字节 —— 而上一层的 kernel 可能还在
-        # 异步执行。实测症状就是 finite=False（数值垃圾，不报错）。
-        #
-        # 显存账：同时最多两块（当前层 + 预取的下一层），而常驻层拿走了大头。
-        # 规划器按「常驻层 + 槽位 + 一块周转」算的，这里正好对上。
-        _prev = getattr(self, "_layer_buf", None)
-        buf = _prev.get(layer_id)
-        if buf is None or buf.numel() < int(need):
-            if _prev is None:
-                _prev = {}
-                self._layer_buf = _prev
-            buf = torch.empty(int(need), dtype=torch.uint8, device=self.device)
-            _prev[layer_id] = buf
-        with torch.cuda.stream(cs):
-            off = 0
-            for (owner, name, t) in paths:
-                off = (off + 255) // 256 * 256
-                n = t.numel() * t.element_size()
-                src = refs.get(b._wkey(owner, name))
-                if src is None:
-                    off += n
-                    continue
-                dst = buf[off:off + n]
-                # 直接对 pool 地址发 DMA（torch 不认 frombuffer 出来的 pinned）。
-                done = False
-                try:
-                    from .loading import _async_h2d
-
-                    done = bool(_async_h2d(dst, src, n, stream=cs))
-                except Exception:
-                    done = False
-                if not done:
-                    dst.copy_(src.reshape(-1).view(torch.uint8), non_blocking=True)
-                set_weight(owner, name, dst.view(t.dtype).view(t.shape))
-                off += n
-            ev.record(cs)
-        b._device = self.device
-        return ev
-
-    def _stream_prefetch(self, layer_id: int, stream):
-        """Async-copy a streamed layer's weights into its rotating buffer (copy stream).
-
-        v5: the buffer is keyed by the exact weight signature, so layout and the
-        current layer always agree (L20 has its own buffers). Pinned CPU refs make
-        the H2D run at pinned bandwidth. Returns the CUDA event to wait on before
-        the layer computes.
-        """
-        (layout, bufs) = self._ensure_stream_buffers(layer_id)
-        b = self.block(layer_id)
-        paths = b._weight_paths()
-        if b._cpu_refs is None:
-            b._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
-                           for (_, _, t) in paths]
-        if len(paths) != len(layout):
-            raise RuntimeError(f"L{layer_id}: {len(paths)} weights vs layout {len(layout)}")
-        buf = bufs[layer_id % 2]
-        ev = torch.cuda.Event()
-        with torch.cuda.stream(stream):
-            for (owner, name, t), cpu, (_, _, _, off, n) in zip(paths, b._cpu_refs, layout):
-                buf[off:off + n].view(t.dtype).view(t.shape).copy_(cpu, non_blocking=True)
-            ev.record(stream)
-        for (owner, name, t), (_, _, _, off, n) in zip(paths, layout):
-            set_weight(owner, name, buf[off:off + n].view(t.dtype).view(t.shape))
-        if getattr(b, "engram", None) is not None:
-            b.engram.to(self.device)
-        return ev
-
-    # -- streaming slots ---------------------------------------------------
-    def _ensure_slots(self):
-        if getattr(self, "_stream_slots", None) is None:
-            self._stream_slots = {}
-        return self._stream_slots
-
-    def _slot_for(self, layer_id: int):
-        """Two rotating device slots per attention kind; a streamed layer copies its
-        weights into one, so the H2D is reused instead of allocating per token."""
-        slots = self._ensure_slots()
-        b = self.block(layer_id)
-        # a slot must match the exact weight layout: compress ratios plus whether the
-        # layer owns a compressor / indexer (source layers carry them, consumers don't)
-        kind = (self.cfg.compress_ratios[layer_id] > 0,
-                getattr(b.attn, "compressor", None) is not None,
-                getattr(b.attn, "indexer", None) is not None)
-        pair = slots.get(kind)
-        if pair is None:
-            pair = slots[kind] = []
-        while len(pair) < 2:
-            blk = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
-                        quant=self.tier.keep_weights_quantized, hashes=None,
-                        expert_topk=self.tier.expert_topk, kv_quant=self._kv_quant,
-                        rt=self._rt_for(layer_id))
-            blk.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
-            blk.to(self.device)
-            pair.append(blk)
-        return pair[layer_id % 2]
-
-    def _stream_into_slot(self, block_i: Block, slot: Block) -> None:
-        if block_i._cpu_refs is None:
-            block_i._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
-                                 for (_, _, t) in block_i._weight_paths()]
-        dst = slot._weight_paths()
-        for (owner, name, t), cpu in zip(dst, block_i._cpu_refs):
-            t.copy_(cpu, non_blocking=True)
 
     def _prefetch_layer(self, layer_id: int, experts) -> None:
         """Stage the experts for a later layer: one disk read, straight into a VRAM slot.
@@ -3172,14 +2168,6 @@ class Engine:
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
         self._target_layers = set(self.cfg.dspark_target_layer_ids)
         self._target_hidden: dict[int, torch.Tensor] = {}
-        # v5 streamed-layer double buffering state (lazily initialised; at most two
-        # signature groups get flat buffers, the rest fall back to the sync copy).
-        if not hasattr(self, "_v5_enabled"):
-            # 8GB card: even two signature groups of flat buffers push VRAM past the
-            # physical limit (measured 9330MB peak -> WDDM paging), so keep it off.
-            self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
-            self._v5_stream = None
-            self._v5_pending: dict[int, object] = {}
         if self.layer_ids is not None:
             layer_seq = self.layer_ids
             if self.allow_missing_layers:
@@ -3249,23 +2237,7 @@ class Engine:
                         self._prefetch_layer(layer_i, source[layer_i])
         self._timings = []
         events = []
-        if self._v5_enabled and self._v5_stream is None:
-            self._v5_stream = torch.cuda.Stream(device=self.device)
-        # 流式层的双缓冲预取状态：(layer -> 已发出的 CUDA event)。
-        self._layer_ev = {}
-        # 本步内「下一个流式层」的映射：i -> 下一个流式层的 layer_id。
-        self._nxt_streamed = {}
-        _sq = [j for j in layer_seq if j in self._stream_layers()]
-        for _a, _b2 in zip(_sq, _sq[1:]):
-            self._nxt_streamed[_a] = _b2
-        if _sq and not torch.cuda.is_current_stream_capturing():
-            # 第一个流式层在本步开始前就发出去（捕获期跳过，理由同上）
-            try:
-                self._layer_ev[_sq[0]] = self._layer_prefetch(_sq[0])
-            except Exception:
-                pass
-        use_flat = self.device != "cpu" and not self._v5_enabled and self._flat_enabled()
-        streamed_seq = [i for i in layer_seq if i in self._stream_layers()] if self._v5_enabled else []
+        use_flat = self.device != "cpu" and self._flat_enabled()
         flat_seq = [i for i in layer_seq if i in self._stream_layers()] if use_flat else []
         flat_pos = {j: k for k, j in enumerate(flat_seq)}
         for pos_i, i in enumerate(layer_seq):
@@ -3274,86 +2246,29 @@ class Engine:
             b = self.block(i)
             streamed = i in self._stream_layers()
             if streamed and self.device != "cpu":
-                if use_flat:
-                    k = flat_pos[i]
-                    # ring size is dynamic: an OOM shed may have shrunk it, so wrap by
-                    # the live length instead of a hard-coded 3
-                    _ring = len(self._flat_state[1]) if isinstance(self._flat_state, tuple) else 1
-                    _ring = max(1, _ring)
-                    self._flat_wait(i, k % _ring)
-                    if __import__("os").environ.get("TI_NO_FLAT_PREFETCH") != "1":
-                        for d in range(1, _ring):
-                            if k + d < len(flat_seq):
-                                nxt = flat_seq[k + d]
-                                if nxt not in self._flat_ev:
-                                    self._flat_prefetch(nxt, (k + d) % _ring)
-                    # 提前几层由 PID 控制器给，不再写死 2。
-                    #
-                    # 2 是一个静态折中：提前太少，这层的专家还没读到就已经要算；
-                    # 提前太多，预取的专家把缓存里正在用的挤掉。最优点随盘速、
-                    # 预热进度和路由分布漂移，所以它应该被实时调，不该被写死。
-                    # autotune.PrefetchController 用「每步 IO 时间占比」做反馈。
-                    _adv = int(getattr(self, "_prefetch_depth", 2) or 0)
-                    if _adv > 0 and k + _adv < len(flat_seq) and self.enable_prefetch:
-                        ahead = flat_seq[k + _adv]
-                        r = self._last_routing.get(ahead)
-                        if r:
-                            self._prefetch_layer(ahead, r)
-                elif self._v5_enabled and streamed_seq:
-                    try:
-                        ev = self._v5_pending.pop(i, None)
-                        if ev is not None:
-                            torch.cuda.current_stream().wait_event(ev)
-                        else:
-                            if self._ensure_stream_buffers(i)[0] is None:
-                                raise RuntimeError("buffer budget exceeded")  # sync fallback
-                            self._stream_copy_sync(i)
-                        # prefetch the next streamed layer into the other parity buffer
-                        if i in streamed_seq:
-                            k = streamed_seq.index(i)
-                            if k + 1 < len(streamed_seq):
-                                nxt = streamed_seq[k + 1]
-                                if (nxt % 2) != (i % 2) and nxt not in self._v5_pending:
-                                    self._v5_pending[nxt] = self._stream_prefetch(nxt, self._v5_stream)
-                    except Exception:
-                        self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
-                        b.to(self.device, streamed=True)
-                else:
-                    # **流式层：上一层已经把本层的权重发到 copy stream 上了。**
-                    #
-                    # 原来是「轮到第 i 层才开始搬第 i 层」——同步 H2D，GPU 在
-                    # 搬运期间完全空转。实测 decode 单步 CUDA 汇总 3585ms，其中
-                    # Memcpy HtoD 829+534ms、fp8_gemv 813ms、bt_gemv 747ms，
-                    # 而单独测这些 kernel 都只要 59~164us —— 差 90 倍不是 kernel
-                    # 慢，是 kernel 在等权重到位。
-                    #
-                    # 现在：第 i-1 层算完之后，立刻把第 i 层发到 copy stream；
-                    # 轮到第 i 层时只等一个已经发出的事件。搬运和计算重叠。
-                    # **捕获期不搬权重。** 捕获前已经把全部流式层搬到位了，
-                    # 图里每个 kernel 绑的是那些地址；捕获期再 `b.to()` 就是那次
-                    # 被禁止的 CPU<->CUDA 拷贝。
-                    if torch.cuda.is_current_stream_capturing():
-                        pass
-                    else:
-                        _ev = self._layer_ev.pop(i, None)
-                        if _ev is not None:
-                            torch.cuda.current_stream().wait_event(_ev)
-                        else:
-                            b.to(self.device, streamed=True)
-                    # 立刻把下一个流式层发出去（不等它完成）。
-                    # **捕获期不发预取。** 图里固化的是每个 kernel 读的**地址**，
-                    # 而捕获时 torch 禁止任何 CPU<->CUDA 拷贝（会抛
-                    # "Cannot copy between CPU and CUDA tensors during CUDA graph
-                    # capture"）。捕获只需要权重的地址是确定的 —— 而 `b.to()` 在
-                    # 第一次调用时就已经把权重放到固定 buffer 上了，之后的 replay
-                    # 不需要再搬。
-                    if not torch.cuda.is_current_stream_capturing():
-                        _nxt_i = self._nxt_streamed.get(i)
-                        if _nxt_i is not None and _nxt_i not in self._layer_ev:
-                            try:
-                                self._layer_ev[_nxt_i] = self._layer_prefetch(_nxt_i)
-                            except Exception:
-                                pass
+                if not use_flat:
+                    raise RuntimeError("streamed layer has no planned weight ring")
+                k = flat_pos[i]
+                _ring = len(self._flat_state[1])
+                self._flat_wait(i, k % _ring)
+                if not torch.cuda.is_current_stream_capturing():
+                    for d in range(1, _ring):
+                        if k + d < len(flat_seq):
+                            nxt = flat_seq[k + d]
+                            if nxt not in self._flat_ev:
+                                self._flat_prefetch(nxt, (k + d) % _ring)
+                # 提前几层由 PID 控制器给，不再写死 2。
+                #
+                # 2 是一个静态折中：提前太少，这层的专家还没读到就已经要算；
+                # 提前太多，预取的专家把缓存里正在用的挤掉。最优点随盘速、
+                # 预热进度和路由分布漂移，所以它应该被实时调，不该被写死。
+                # autotune.PrefetchController 用「每步 IO 时间占比」做反馈。
+                _adv = int(getattr(self, "_prefetch_depth", 2) or 0)
+                if _adv > 0 and k + _adv < len(flat_seq) and self.enable_prefetch:
+                    ahead = flat_seq[k + _adv]
+                    r = self._last_routing.get(ahead)
+                    if r:
+                        self._prefetch_layer(ahead, r)
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
@@ -3491,8 +2406,6 @@ class Engine:
                       f"streamed={streamed} use_flat={use_flat}", flush=True)
             if b.ffn._last_ids:
                 self._last_routing[i] = b.ffn._last_ids
-            if streamed and self.device != "cpu" and not use_flat:
-                b.to("cpu")  # free VRAM for the next streamed layer
         # **统计相邻两步的路由重合度 —— 这是「槽位值不值那几 GB」的唯一依据。**
         #
         # 规划器解布局时还没跑过前向，所以拿不到它（按 0 处理，等于认为槽位
@@ -3579,8 +2492,6 @@ class Engine:
             self._rt_cache = {}
 
     def _prefill_layer_major_impl(self, ids, T: int, step: int):
-        if not hasattr(self, "_v5_enabled"):
-            self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
         # layer sequence identical to _forward_chunk
         if self.layer_ids is not None:
             layer_seq = self.layer_ids
@@ -3654,37 +2565,6 @@ class Engine:
         return self._head_logits(h)
 
     # -- VRAM pressure + CUDA graph + prefix checkpoints ---------------------
-    def _shed_vram(self) -> None:
-        """Give memory back after an OOM: shrink the streaming ring, drop the slot pool."""
-        st = getattr(self, "_flat_state", None)
-        if st is not None and st != "off":
-            ring = list(st[1])
-            if len(ring) > 2:
-                # keep the two buffers decode needs and actually release the rest: a
-                # shorter list alone does not give the VRAM back
-                keep = ring[:2]
-                dropped = ring[2:]
-                self._flat_state = (st[0], keep, st[2])
-                for buf in dropped:
-                    del buf
-                print(f"[tinyinfer] CUDA OOM: streaming ring 3 -> {len(keep)} buffers "
-                      f"(released {len(dropped)})", flush=True)
-        # **不碰槽位池。**
-        #
-        # 槽位的规则是：启动时一次建成，之后只做替换/覆写，直到进程结束。
-        # 清空它再重建有两个代价，都比省下来的显存贵：
-        #   1) 重建要重新分配 arena 并重新提交槽位表，这段窗口里每个专家都是
-        #      磁盘读（实测 drop 之后 loads 立刻飙到每步两百多）；
-        #   2) _ensure() 在显存紧张时有失败路径，重建失败就等于把引擎降级成
-        #      per-tensor 拷贝，而且再也回不去。
-        # OOM 的正确解法是规划阶段就把显存算准（resources.plan 统一给），
-        # 而不是运行时靠丢东西补救 —— 运行时丢掉的每一块，后面都要重新付一次
-        # 分配和填充的成本。
-        # 这里只收缩 streaming ring（那是可以少几个环的无状态缓冲），
-        # 槽位池保持原样。
-        if self.device != "cpu":
-            torch.cuda.empty_cache()
-
     def _graph_capture_shape(self, ids: torch.Tensor, start_pos: int) -> bool:
         # 不用 CUDA graph。tier 里虽然还留着一个 cuda_graph 标志，但引擎这边
         # graph 由 tier.cuda_graph 控制；引擎这边不再无条件关死。
@@ -4005,11 +2885,24 @@ class Engine:
                         _sub._active_layer = int(_lid)
 
     def _graph_try_capture(self, ids: torch.Tensor, start_pos: int) -> None:
-        if getattr(self, "_graph", None) is not None or getattr(self, "_graph_failed", False):
+        if getattr(self, "_graph", None) is not None:
             return
+        if getattr(self, "_graph_failed", False):
+            raise RuntimeError("previous CUDA graph capture failed") from self._graph_error
         if not self._graph_capture_shape(ids, start_pos):
             return
         try:
+            # 整段图没有层间 H2D 调度点，不能把多层权重绑定到同一环槽。
+            # 在实现显式图段衔接之前，拒绝这种布局，不能捕获后再走另一条前向。
+            streamed = self._stream_layers()
+            if streamed:
+                state = getattr(self, "_flat_state", None)
+                if not isinstance(state, tuple):
+                    raise RuntimeError("streamed CUDA graph requires a planned weight ring")
+                if len(streamed) > len(state[1]):
+                    raise RuntimeError(
+                        f"CUDA graph needs weight-lifetime segments: {len(streamed)} streamed "
+                        f"layers share {len(state[1])} ring buffers; whole-model capture is invalid")
             # 捕获期不能新建 tensor：window_idxs_ring 用的全局位置 buffer 先建好。
             try:
                 from . import nn as _nn
@@ -4047,27 +2940,6 @@ class Engine:
                 in_buf = ids.clone()
                 self._forward_impl(in_buf, start_pos, None)
                 torch.cuda.synchronize()
-                # **warmup 之前必须把所有层的权重都搬上 device。**
-                #
-                # 量化路径下 wq_a / wkv 这类小矩阵是懒搬的（QuantLinear 在
-                # forward 里做 .to(device)）。那意味着捕获期第一次搬运会新建一块
-                # 显存，其地址被写进图中的 kernel 参数；捕获结束后那块临时内存
-                # 被 allocator 回收，replay 时读到的就是别人的字节 —— 实测 L1
-                # 输出 absmax 2.36e37，正是 bf16 把任意 16 位当数值解释的量级。
-                #
-                # eager 每步都重新搬一次，所以永远看不出问题；layers=[0,0] 也是
-                # 对的（同一个 Block，第二次已经是热权重）。只有「不同层 + graph」
-                # 这个组合才暴露。
-                _moved = []
-                for _b in self._blocks.values():
-                    try:
-                        _r = _b.to(self.device)
-                        if _r is not None:
-                            _moved.append(_b)
-                    except Exception:
-                        pass
-                if _moved:
-                    torch.cuda.synchronize()
                 # **warmup 这次带 miss 扫描跑，把本步真实需要的专家装进槽位、写进表。**
                 #
                 # 图里的 MoE 只认 tab[layer][expert] 查到的槽位号直通 kernel，而
@@ -4148,320 +3020,9 @@ class Engine:
                     }
                 except Exception:
                     _keep_rt = None
-                # 分块捕获：每 TI_GRAPH_CHUNK 层一张图，所有图共享同一个 graph pool。
-                # 块与块之间的 h/pre_mix 都在 pool 内、地址固定，replay 时依次执行。
-                # **默认整段捕获，不再每 4 层切一块。**
-                #
-                # 分块捕获要求每块图能从上一块的中间状态接着算，但 _forward_impl
-                # 每次都从 embed 开始：第 2 块跳过 L0-3 之后，h 拿到的仍是
-                # embedding 输出而不是 L3 的输出，于是整条链从第 5 层起就
-                # 算的是错的东西 —— 实测逐块 replay 时第 0 块就已经是 NaN。
-                #
-                # 要真正分块，得让块与块之间显式传递 h/pre_mix（各存一块固定
-                # buffer，块内只写它们）。在那之前，一块图跑完全部 40 层是唯一
-                # 正确的做法：捕获一次，replay 一次。
-                _env_chunk = int(__import__("os").environ.get("TI_GRAPH_CHUNK", "0") or 0)
-                if _env_chunk <= 0 or _env_chunk >= self.max_layers:
-                    _chunk = int(self.max_layers)
-                else:
-                    _chunk = _env_chunk
-                # **捕获前把每个流式层的权重都搬到位。**
-                #
-                # 图里禁止任何 CPU<->CUDA 拷贝，而 `_forward_impl` 遇到
-                # `b._device != self.device` 就会 `b.to()` —— 那是一次 H2D，
-                # 捕获直接抛 "Cannot copy between CPU and CUDA tensors during
-                # CUDA graph capture"。
-                #
-                # 所以捕获之前先跑一遍「把全部 streamed 层搬到显存」。图里每个
-                # kernel 绑的是这些权重现在的**地址**，之后 replay 直接读那些地址，
-                # 不再需要任何拷贝。
-                #
-                # 显存代价：30 个流式层 x 174MB = 5.2GB。放得下（8GB 卡上常驻 10
-                # 层只用 2GB，槽位 4.7GB，周转缓冲已经算在规划器里）。放不下时会
-                # OOM，那时 _graph_try_capture 的调用方会走 OOM 分支 —— 但更可能是
-                # 规划器本来就该解出更少的流式层。
-                # **流式层用固定轮转 buffer，不逐层分配。**
-                #
-                # 8GB 卡上 30 层 x 174MB = 5.2GB，加上常驻层和槽位必然 OOM
-                # （实测 alloc 冲到 12.03GB / 物理 8.52GB，free=0，随后在
-                # dequant_fp8_block 里 !handles_ INTERNAL ASSERT）。
-                #
-                # 而图真正需要的只是「kernel 读的地址在 replay 时不变」——
-                # 满足它的最小结构就是轮转 buffer：几块固定显存，每层算之前把
-                # 自己的字节搬进去，地址永远是那几块。这也正是 eager 现在做的事
-                # （_flat_wait / _flat_apply 那套），区别只在于要让 buffer 在
-                # 捕获之前就分配好、且捕获期不再重新分配。
-                #
-                # 这里先把轮转 buffer 建出来（捕获期分配会落进 graph pool，
-                # 那样块地址就不稳定了）。
-                # **捕获前让 slab 路径先就位。**
-                #
-                # slab 是唯一能给 CUDA graph 提供「固定地址」的结构：整层权重
-                # 一次 DMA 进显存环，环只有 3 块，地址永恒不变。逐层 b.to()
-                # 每次换地址，图里固化的地址就失效 —— 那正是「图捕获成功、
-                # replay 稳定、但 out 全是 NaN」的根因。
-                #
-                # 这里先把它建起来（_flat_enabled 会分配那 3 块环并 pack 主机源）。
-                # 建不起来就说明显存不够，图这条路在这个配置上走不通，直接
-                # 报清楚而不是硬跑出一堆 NaN。
-                # **先把显存腾出来。**
-                #
-                # 走到这里时已经跑过十几步 eager，那些 b.to() 逐层分配的 device
-                # 权重（30 x 132MB = 3.97GB）和 _STAGE 缓冲（0.49GB）都还挂着。
-                # slab 要 3 块 x 463MB = 1.4GB，在 4.5GB 槽位 + 3.97GB 逐层权重
-                # 之上拿不出来 —— 实测 _flat_setup 直接抛 !handles_ INTERNAL
-                # ASSERT。
-                #
-                # 把它们放回主机侧：流式层本来就该「算完就走」，只是在
-                # eager 路径下没人催它走。捕获完成后 slab 会接手搬运。
-                for _lid in list(self._stream_layers()):
-                    try:
-                        _blk0 = self.block(_lid)
-                        if getattr(_blk0, "_device", None) == self.device:
-                            _blk0.to("cpu")
-                    except Exception:
-                        pass
-                try:
-                    import tinyinfer.deepseek.model as _mdl0
-
-                    _st0 = getattr(_mdl0, "_STAGE", None)
-                    if isinstance(_st0, dict):
-                        _st0.clear()
-                except Exception:
-                    pass
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                torch.cuda.synchronize()
-                # **捕获前把所有 QuantLinear 的权重/scale 搬到 device。**
-                #
-                # linear.py 里那条 `weight.to(x.device)` 是 H2D，捕获期做会让
-                # 整个捕获失败（cudaErrorStreamCaptureUnsupported）。而它之所以
-                # 存在，是因为 flat streaming 换权重时只改 .weight/.data，
-                # 够不到 parts 元组 —— 那条路径绕开了它，所以捕获期才发现权重
-                # 还在主机上。
-                #
-                # 这里提前就位：图里 kernel 拿到的就是这块长期存活的地址。
-                _prewarmed = 0
-                _seen_mod = set()
-
-                # **slab 必须先占住那 3 块环（1.4GB），prewarm 排在它后面。**
-                #
-                # 顺序反了就会：prewarm 把一百多个 QuantLinear 搬到显存，
-                # 吃掉 1~2GB，slab 再要 1.4GB 就 OOM，整个图路径作废。
-                # 而 slab 是图能成立的前提（固定地址），prewarm 只是补漏。
-                _flat_ok = False
-                try:
-                    _eo0 = __import__("os")
-                    _eo0.environ["TI_FLAT"] = "1"
-                    # **已经有 slab 就复用，不要拆了重建。**
-                    #
-                    # 拆掉再建会丢两层账：(a) release 让 _flat_state 变 None，
-                    # 若重建失败，主路径的 _flat_enabled 也回到 off，整步退回
-                    # 逐 tensor；(b) 重建要从同一个 host_pool 重新切 7.6GB，
-                    # 而池子已经被上一轮的切片占着 —— 实测第二次只剩 2.19GB，
-                    # slab 从 35 层掉到 9 层。
-                    # 图需要的是「地址固定」，已经建好的 slab 本来就满足。
-                    if isinstance(getattr(self, "_flat_state", None), tuple):
-                        _flat_ok = True
-                    else:
-                        _flat_ok = bool(self._flat_enabled())
-                except Exception as _e0:
-                    print(f"[tinyinfer] slab for graph unavailable: {_e0!r}",
-                          flush=True)
-                    _flat_ok = False
-                if not _flat_ok:
-                    print("[tinyinfer] CUDA graph needs the slab ring for stable "
-                          "weight addresses; slab is off, so capture is skipped. "
-                          "Eager decode still runs.", flush=True)
-                    self._graph_disabled = True
-                    return
-
-                def _prewarm_one(_mod):
-                    """把这个模块自身的 QuantLinear 权重搬到 device。"""
-                    nonlocal _prewarmed
-                    if id(_mod) in _seen_mod:
-                        return
-                    _seen_mod.add(id(_mod))
-                    _w = getattr(_mod, "weight", None)
-                    _s = getattr(_mod, "scale", None)
-                    if _w is None or _s is None or not hasattr(_mod, "parts"):
-                        return
-                    try:
-                        if getattr(_w, "device", None) is not None and _w.device.type != "cuda":
-                            _mod.weight = _w.to(self.device)
-                            _mod.scale = _s.to(self.device)
-                            _mod.parts = [(_mod.weight.device, _mod.weight, _mod.scale)]
-                            _prewarmed += 1
-                    except Exception:
-                        pass
-
-                try:
-                    # 三层遍历：engine.modules()（nn.Module 树）覆盖不到那些不在
-                    # nn.Module 注册体系里的容器（compressor/indexer 的裸属性、
-                    # Block 上的 _rt 之类），所以再补一遍 _blocks 的 __dict__ 深度扫。
-                    for _mod in self.modules():
-                        _prewarm_one(_mod)
-                    _stack = [self]
-                    _seen_obj = set()
-                    while _stack:
-                        _cur = _stack.pop()
-                        if id(_cur) in _seen_obj:
-                            continue
-                        _seen_obj.add(id(_cur))
-                        if hasattr(_cur, "parts") and hasattr(_cur, "weight"):
-                            _prewarm_one(_cur)
-                        _d = getattr(_cur, "__dict__", None)
-                        if not isinstance(_d, dict):
-                            continue
-                        for _v in _d.values():
-                            if isinstance(_v, (list, tuple)):
-                                for _it in _v:
-                                    if hasattr(_it, "__dict__"):
-                                        _stack.append(_it)
-                            elif hasattr(_v, "__dict__") and not isinstance(
-                                    _v, (str, bytes, int, float, type)):
-                                _stack.append(_v)
-                except Exception:
-                    pass
-                # **按名字枚举，不靠遍历。**
-                #
-                # 调用栈已经把这组权重定位到 compressed_attention 的 `_lin`：
-                #   compressed_attention.py:421 -> w.forward(x_)
-                # 形状 (32768, 1280) 是 out-projection（wo_a）。它挂在 Block.attn
-                # 上，而 attn 不是 nn.Module（self.modules() 遍历不到它），
-                # __dict__ 深度扫也会被闭包/别名绕开。
-                #
-                # 所以改成按已知属性名直接枚举：每一层把 attn 上那批 QuantLinear
-                # 逐个 prewarm。名字来自 _weight_paths / 构造处，是确定的。
-                _attn_attrs = ("wqkv", "wq_a", "wkv", "wq_b", "wo_a", "wo_b",
-                               "w1", "w2", "w3", "gate", "shared")
-                try:
-                    _bl = getattr(self, "_blocks", None)
-                    for _bidx in range(int(self.max_layers)):
-                        _bb = _bl.get(_bidx) if isinstance(_bl, dict) else None
-                        if _bb is None:
-                            continue
-                        for _holder in (getattr(_bb, "attn", None),
-                                        getattr(_bb, "ffn", None)):
-                            if _holder is None:
-                                continue
-                            for _nm in _attn_attrs:
-                                _sub = getattr(_holder, _nm, None)
-                                if _sub is None:
-                                    continue
-                                if hasattr(_sub, "weight") and hasattr(_sub, "parts"):
-                                    _prewarm_one(_sub)
-                                for _nm2 in ("w1", "w2", "w3"):
-                                    _sub2 = getattr(_sub, _nm2, None)
-                                    if _sub2 is not None:
-                                        _prewarm_one(_sub2)
-                            _cmp0 = getattr(_holder, "compressor", None)
-                            _ix0 = getattr(_holder, "indexer", None)
-                            for _mm in (_cmp0, _ix0):
-                                if _mm is None:
-                                    continue
-                                for _nm in _attn_attrs:
-                                    _sub = getattr(_mm, _nm, None)
-                                    if _sub is not None:
-                                        _prewarm_one(_sub)
-                except Exception:
-                    pass
-                if _prewarmed:
-                    print(f"[tinyinfer] prewarmed {_prewarmed} quant linears for graph",
-                          flush=True)
-                torch.cuda.synchronize()
-                _flat_ok = False
-                try:
-                    _env_os = __import__("os")
-                    _env_os.environ["TI_FLAT"] = "1"
-                    # **已经有 slab 就复用，不要拆了重建。**
-                    #
-                    # 拆掉再建会丢两层账：(a) release 让 _flat_state 变 None，
-                    # 若重建失败，主路径的 _flat_enabled 也回到 off，整步退回
-                    # 逐 tensor；(b) 重建要从同一个 host_pool 重新切 7.6GB，
-                    # 而池子已经被上一轮的切片占着 —— 实测第二次只剩 2.19GB，
-                    # slab 从 35 层掉到 9 层。
-                    # 图需要的是「地址固定」，已经建好的 slab 本来就满足。
-                    if isinstance(getattr(self, "_flat_state", None), tuple):
-                        _flat_ok = True
-                    else:
-                        _flat_ok = bool(self._flat_enabled())
-                except Exception as _exc:
-                    print(f"[tinyinfer] slab for graph unavailable: {_exc!r}",
-                          flush=True)
-                    _flat_ok = False
-                if not _flat_ok:
-                    print("[tinyinfer] CUDA graph needs the slab ring for stable "
-                          "weight addresses; slab is off, so capture is skipped. "
-                          "Eager decode still runs.", flush=True)
-                    self._graph_disabled = True
-                    return
-                # **slab 起来之后再补 prewarm。**
-                #
-                # 顺序要紧：slab 要 3 块 463MB 的环（1.4GB），而 prewarm 会把
-                # 129 个 QuantLinear 的权重搬到显存（1~2GB）。prewarm 先跑就会
-                # 把环的空间吃掉，slab 起不来 —— 而 slab 是图能成立的前提。
-                # 所以先让 slab 占好，再把剩下没就位的权重补上去。
-                _prewarmed2 = 0
-                _seen2 = set()
-
-                def _prewarm_again(_mod):
-                    nonlocal _prewarmed2
-                    if id(_mod) in _seen2:
-                        return
-                    _seen2.add(id(_mod))
-                    _w = getattr(_mod, "weight", None)
-                    _s = getattr(_mod, "scale", None)
-                    if _w is None or _s is None or not hasattr(_mod, "parts"):
-                        return
-                    try:
-                        if _w.device.type != "cuda":
-                            _mod.weight = _w.to(self.device)
-                            _mod.scale = _s.to(self.device)
-                            _mod.parts = [(_mod.weight.device, _mod.weight, _mod.scale)]
-                            _prewarmed2 += 1
-                    except Exception:
-                        pass
-
-                try:
-                    _bl2 = getattr(self, "_blocks", None)
-                    for _bi in range(int(self.max_layers)):
-                        _bb2 = _bl2.get(_bi) if isinstance(_bl2, dict) else None
-                        if _bb2 is None:
-                            continue
-                        for _hd in (getattr(_bb2, "attn", None),
-                                    getattr(_bb2, "ffn", None)):
-                            if _hd is None:
-                                continue
-                            for _nm in ("wqkv", "wq_a", "wkv", "wq_b", "wo_a",
-                                        "wo_b", "w1", "w2", "w3", "gate", "shared"):
-                                _s1 = getattr(_hd, _nm, None)
-                                if _s1 is None:
-                                    continue
-                                if hasattr(_s1, "weight") and hasattr(_s1, "parts"):
-                                    _prewarm_again(_s1)
-                                for _nm2 in ("w1", "w2", "w3"):
-                                    _s2 = getattr(_s1, _nm2, None)
-                                    if _s2 is not None:
-                                        _prewarm_again(_s2)
-                            for _mm in (getattr(_hd, "compressor", None),
-                                        getattr(_hd, "indexer", None)):
-                                if _mm is None:
-                                    continue
-                                for _nm in ("wqkv", "wq_a", "wkv", "wq_b", "wo_a",
-                                            "wo_b", "w1", "w2", "w3"):
-                                    _s3 = getattr(_mm, _nm, None)
-                                    if _s3 is not None:
-                                        _prewarm_again(_s3)
-                except Exception:
-                    pass
-                if _prewarmed2:
-                    print(f"[tinyinfer] prewarmed {_prewarmed2} more quant linears "
-                          f"after slab", flush=True)
-                torch.cuda.synchronize()
-                torch.cuda.synchronize()
+                # 预热已把所有会被图引用的权重放在固定地址。
+                # 不再逐层迁回 CPU，再把部分 QuantLinear 单独复制上 GPU。
+                _chunk = self.max_layers
                 # 主机侧算好 embedding，得到一块 device 上的 h（图从这里开始）。
                 _hidden_dev = None
                 try:
@@ -4556,23 +3117,9 @@ class Engine:
                 except Exception:
                     pass
             self._graph_failed = True
+            self._graph_error = exc
             self._graph = None
-            # **捕获失败必须炸，不能静默降级。**
-            # 以前这里只置 _graph_failed=True，然后 forward() 回落到 eager，
-            # 于是「graph 从来没成功过」这件事只能靠翻代码发现 —— 实测在 L20
-            # 上跑了整轮才看出来。一条路径要么成立，要么明确失败。
-            import traceback as _tb
-            _tb.print_exc()
-            # **捕获失败不致命，退回 eager。**
-            #
-            # 原来这里是 raise（"there is no eager fallback"）。但捕获的前置条件
-            # 依赖运行时状态（槽位表、图池、缓冲地址），任何一条不满足就让整个
-            # 引擎不可用 —— 而 eager 只是慢，不是不能跑。正确性优先于速度：
-            # 捕获失败就把 graph 永久关掉，这一进程内不再尝试。
-            self._graph_disabled = True
-            print(f"[tinyinfer] CUDA graph capture failed, sticking to eager: {exc!r}",
-                  flush=True)
-            raise _GraphCaptureUnavailable(exc) from exc
+            raise RuntimeError(f"CUDA graph capture failed: {exc}") from exc
 
 
     def warm_graph_catalog(self) -> None:
@@ -4647,8 +3194,11 @@ class Engine:
         _reader = getattr(getattr(getattr(self, "expert_store", None), "reader", None),
                           "read_seconds", None)
         _io0 = float(_reader) if _reader is not None else 0.0
+        _completed = False
         try:
-            return self._forward_inner(ids, start_pos, chunk=chunk, positions=positions)
+            result = self._forward_inner(ids, start_pos, chunk=chunk, positions=positions)
+            _completed = True
+            return result
         finally:
             try:
                 _step_ms = (_tt.perf_counter() - _t0) * 1e3
@@ -4681,7 +3231,7 @@ class Engine:
                 # 要重建槽位池、搬层权重，代价是秒到分钟级。对离散高代价的决策
                 # 用 PID 是方法论错误。
                 _pl = getattr(self, "_planner", None)
-                if _pl is not None and not getattr(self, "_observed_first", False):
+                if _completed and _pl is not None and not getattr(self, "_observed_first", False):
                     self._observed_first = True
                     try:
                         import torch as _t
@@ -4703,84 +3253,24 @@ class Engine:
 
     def _forward_inner(self, ids: torch.Tensor, start_pos: int = 0,
                        chunk: int | None = None, positions=None):
-        """Decode/prefill entry point: CUDA graph replay when captured, else the OOM ladder.
-
-        positions: optional [b] per-row absolute position of each row's last token. A
-        batched call mixing a fresh prompt with already-decoding sequences needs it --
-        one shared start_pos would put every row at the same RoPE depth and the same
-        compressed group. None (the default) is exactly the previous behaviour, and the
-        CUDA-graph path only accepts the single-position form.
-        """
-        for attempt in range(3):
-            try:
-                # **图只覆盖「一次一个 token」的解码步。**
-                #
-                # prefill（ids.shape[1] > 1）走的是一批 token 的矩阵乘、窗口还没满、
-                # kv_source 的压缩机也要凑够一整组才产出 index_k —— 这些都和图里
-                # 固化的那份形状/地址不是一回事。以前这里没有按 seqlen 分流，prefill
-                # 也会进来调 _graph_try_capture：它内部 _graph_capture_shape 直接
-                # 返回 False，于是紧接着的 raise 把一次正常 prefill 判成致命错误。
-                #
-                # 实测：warmup 建好图之后，换一个 7 token 的 prompt 立刻抛
-                #   RuntimeError: slot table ready but decode graph missing
-                #   (ids=(1, 7) start_pos=0)
-                # 也就是「同一进程里问第二句话就挂」。
-                _graph_ok = ids.shape[1] == 1
-                if start_pos >= 0 and chunk is None and _graph_ok:
-                    hit = self._graph_run(ids, start_pos)
-                    if hit is not None:
-                        return hit
-                    # **启动期：槽位表还没建，图不可能存在。**
-                    #
-                    # 捕获的前置条件之一是 device 侧的 [n_layers, n_experts] 槽位表，
-                    # 而它由 pin_hot_experts() 建立；pin 又需要先跑过一次 forward 才
-                    # 知道热点。于是「跑 forward 建表」和「建表才能捕获图」互为前提。
-                    #
-                    # 破法：**只有表还没建的那几次 forward 走直接路径**。这批调用是
-                    # 启动期的探测（server.warmup 的两次 forward + pin），它们本来就不
-                    # 是用户请求。表建好之后一律走 graph，没有任何回落。
-                    # **「表就绪」的判据是「表存在」，不是「pin 跑过」。**
-                    #
-                    # 原来这里读 `_slot_tab_ready`，而它只在 pin_hot_experts()
-                    # 末尾置 True —— 那个方法是 server.warmup 调的。命令行基准、
-                    # 直接 Engine.from_hf 的用法都不经过 server，于是这个标志永远
-                    # 是 False，每一次 forward 都走 `_forward_impl` 直接路径，**CUDA
-                    # graph 从来没被捕获过**：`_graph_capture_shape()` 返回 True（所
-                    # 有前置条件都满足），但代码根本走不到 `_graph_try_capture`。
-                    #
-                    # 这正是 CPU 比 GPU 慢的根因：层内 Python 24.6ms vs GPU 18ms，
-                    # GPU 每层都在等主机喂 kernel。
-                    _sl_tab = getattr(getattr(getattr(self, "expert_store", None),
-                                              "slots", None), "_slot_tab", None)
-                    if _sl_tab is None:
-                        return self._forward_impl(ids, start_pos, chunk, positions=positions)
-                    try:
-                        self._graph_try_capture(ids, start_pos)
-                    except _GraphCaptureUnavailable:
-                        return self._forward_impl(ids, start_pos, chunk,
-                                                  positions=positions)
-                    hit = self._graph_run(ids, start_pos)
-                    if hit is not None:
-                        return hit
-                    # 表已就绪却还没有图：如果之前捕获失败过，退回 eager。
-                    # 只有「从没尝试过捕获」才是真错误。
-                    if getattr(self, "_graph_disabled", False):
-                        return self._forward_impl(ids, start_pos, chunk,
-                                                  positions=positions)
-                    raise RuntimeError(
-                        f"slot table ready but decode graph missing "
-                        f"(ids={tuple(ids.shape)} start_pos={start_pos} "
-                        f"gpu_layers={self.gpu_layers}/{self.max_layers})")
+        """预填充与解码分别调度；捕获或显存分配失败直接上抛。"""
+        if start_pos >= 0 and chunk is None and ids.shape[1] == 1:
+            hit = self._graph_run(ids, start_pos)
+            if hit is not None:
+                return hit
+            # 初始前向负责建立路由槽位表，不是捕获失败后的替代执行。
+            slots = getattr(getattr(self, "expert_store", None), "slots", None)
+            if getattr(slots, "_slot_tab", None) is None:
                 return self._forward_impl(ids, start_pos, chunk, positions=positions)
-            except Exception as exc:
-                # torch raises OutOfMemoryError, while some CUDA paths surface a plain
-                # RuntimeError whose text says "out of memory"; both are handled the same
-                oom = isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(exc).lower()
-                if attempt == 2 or not oom:
-                    raise
-                print(f"[tinyinfer] CUDA OOM: shedding VRAM (attempt {attempt + 1})", flush=True)
-                self._shed_vram()
-        raise RuntimeError("unreachable")
+            self._graph_try_capture(ids, start_pos)
+            hit = self._graph_run(ids, start_pos)
+            if hit is not None:
+                return hit
+            raise RuntimeError(
+                f"slot table ready but decode graph missing "
+                f"(ids={tuple(ids.shape)} start_pos={start_pos} "
+                f"gpu_layers={self.gpu_layers}/{self.max_layers})")
+        return self._forward_impl(ids, start_pos, chunk, positions=positions)
 
     def _forward_from_hidden(self, hidden: torch.Tensor, start_pos: int = 0):
         """从已经算好的 h 开始跑完全部层。**仅供 CUDA graph 捕获/重放用。**

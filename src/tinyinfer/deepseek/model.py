@@ -233,7 +233,8 @@ class Block(HCBlockMixin):
                     out.append((comp, name, t))
         idx = getattr(a, "indexer", None)
         if idx is not None:
-            for name in ("wq_b", "weights_proj", "wk", "k_norm", "freqs_cis"):
+            # indexer 与 attention 共用位置表，不能把表打包进逐层权重。
+            for name in ("wq_b", "weights_proj", "wk", "k_norm"):
                 t = getattr(idx, name, None)
                 if isinstance(t, torch.Tensor):
                     out.append((idx, name, t))

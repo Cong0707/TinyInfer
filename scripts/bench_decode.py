@@ -1,30 +1,13 @@
-"""decode 基准：一个 token 一个 token 地测，参数和真实推理一致。
+"""单进程连续解码基准：真实 prompt、递增位置、逐步 finite 校验。
 
-## 为什么需要这个脚本
-
-我一直用 `torch.tensor([[100,200,300,400,500]])` 测 decode —— 那是 prefill
-形状。M=5 时 MoE 层的 indices 是 5x6，去重后每层 `_last_ids` 有 12~28 个
-专家，于是 `need()` 每层请求 30 个（真实 decode 只要 6 个），槽位每步被
-装 784 次、驱逐 784 次，读 14.7GB。测出来的 0.079 tok/s 是这么来的。
-
-真实 decode：`_last_ids` 精确是 6，40 层全是 6，槽位每步只装约 30 个，
-成绩是 0.326 tok/s —— **差 4 倍**。
-
-所以基准必须：
-  1. 单 token 输入，逐 token 生成
-  2. 先预热到稳定（判据：连续 3 步 step 时间变化 < 10%）
-  3. 取样在 reset 后，含 KV cache 的真实增长
-  4. 报中位数和极差，不只报一个数
-
-## 用法
-
-    python scripts/bench_decode.py --model <checkpoint>
-    python scripts/bench_decode.py --model <ckpt> --tokens 32 --json
+仅初始化一次引擎。预填充与预热单独记录，不混入 decode 吞吐。
+测量期不 reset，不反复输入同一个 token，不修改任何引擎调优参数。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -34,83 +17,108 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 
-def bench(model_dir, *, tokens=16, warmup=6, reset_each=True):
+def measure_decode(eng, ids, *, tokens, warmup, synchronize, emit):
+    """可用小型假引擎测试的位置/采样契约；模型只由外层创建一次。"""
     import torch
+    from tinyinfer.loading import _async_h2d_stats
+
+    if tokens <= 0 or warmup < 0:
+        raise ValueError("tokens must be positive and warmup must be nonnegative")
+    if ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] == 0:
+        raise ValueError("benchmark needs one nonempty prompt")
+    rows = []
+
+    def step(inputs, position, phase):
+        synchronize()
+        before = _async_h2d_stats()
+        copies = getattr(eng, "_flat_applies", 0)
+        started = time.perf_counter()
+        logits = eng.forward(inputs, position)
+        next_ids = logits[:, -1].argmax(dim=-1, keepdim=True)
+        synchronize()
+        elapsed = (time.perf_counter() - started) * 1000
+        after = _async_h2d_stats()
+        finite = bool(torch.isfinite(logits).all())
+        row = {
+            "phase": phase, "position": position, "input_tokens": inputs.shape[1],
+            "ms": elapsed, "finite": finite, "next_token": int(next_ids.item()),
+            "flat_copies": getattr(eng, "_flat_applies", 0) - copies,
+            "h2d_bytes": after["ok_bytes"] - before["ok_bytes"],
+            "h2d_calls": after["ok_calls"] - before["ok_calls"],
+            "h2d_failed": after["rc_fail"] - before["rc_fail"],
+        }
+        rows.append(row)
+        emit(row)
+        if not finite:
+            raise FloatingPointError(f"nonfinite logits: {phase} at position {position}")
+        return next_ids
+
+    with torch.inference_mode():
+        next_ids = step(ids, 0, "prefill")
+        position = ids.shape[1]
+        for phase, count in (("warmup", warmup), ("decode", tokens)):
+            for _ in range(count):
+                next_ids = step(next_ids, position, phase)
+                position += 1
+    times = [row["ms"] for row in rows if row["phase"] == "decode"]
+    median = statistics.median(times)
+    return {
+        "finite": True, "n": len(times), "warmup_steps": warmup,
+        "median_ms": median, "min_ms": min(times), "max_ms": max(times),
+        "spread": (max(times) - min(times)) / median,
+        "tok_per_s": len(times) * 1000 / sum(times),
+        "median_tok_per_s": 1000 / median, "steps": rows,
+    }
+
+
+def bench(model_dir, *, tokens=16, warmup=6):
+    import torch
+    from transformers import AutoTokenizer
     from tinyinfer.engine import Engine
 
-    eng = Engine.from_hf(str(model_dir), device="cuda", allow_missing_layers=True)
-    p = eng.hw_plan
-    out = {
-        "resident": int(getattr(p, "resident", 0)),
-        "slots": int(getattr(p, "slots", 0)),
-        "stream_layers": int(getattr(p, "stream_layers", 0)),
-    }
-    # 单 token —— 这是 decode 的真实形状
-    ids = torch.tensor([[100]], dtype=torch.long, device="cuda")
-    ts: list[float] = []
-    with torch.inference_mode():
-        eng.forward(ids, 0)
-        torch.cuda.synchronize()
-
-        # 预热到稳定：连续 3 步变化 < 10%
-        prev, stable = None, 0
-        for _ in range(24):
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            eng.forward(ids, 0)
-            torch.cuda.synchronize()
-            dt = (time.perf_counter() - t0) * 1e3
-            if prev is not None and prev > 0 and abs(dt - prev) < prev * 0.10:
-                stable += 1
-                if stable >= 3:
-                    break
-            else:
-                stable = 0
-            prev = dt
-
-        for _ in range(max(1, tokens)):
-            if reset_each and hasattr(eng, "reset"):
-                eng.reset()
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            logits = eng.forward(ids, 0)
-            torch.cuda.synchronize()
-            ts.append((time.perf_counter() - t0) * 1e3)
-
-        out["finite"] = bool(torch.isfinite(logits).all())
-    eng.close()
-
-    ts_sorted = sorted(ts)
-    med = statistics.median(ts)
-    out.update({
-        "median_ms": round(med, 1),
-        "min_ms": round(ts_sorted[0], 1),
-        "max_ms": round(ts_sorted[-1], 1),
-        "spread": round((ts_sorted[-1] - ts_sorted[0]) / max(1.0, med), 3),
-        "n": len(ts),
-        "tok_per_s": round(1000.0 / med, 4) if med > 0 else None,
-    })
-    return out
+    # 正文续写负载，不假设 checkpoint 提供聊天模板。
+    prompt = "推理引擎加载模型权重的过程如下：\n"
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
+    ids = tokenizer(prompt, add_special_tokens=True, return_tensors="pt")["input_ids"].to("cuda")
+    eng = Engine.from_hf(str(model_dir), device="cuda", tokenizer=tokenizer)
+    try:
+        result = measure_decode(
+            eng, ids, tokens=tokens, warmup=warmup,
+            synchronize=torch.cuda.synchronize,
+            emit=lambda row: print("[step] " + json.dumps(row, ensure_ascii=False), flush=True),
+        )
+        layout = eng.hw_plan
+        state = getattr(eng, "_flat_state", None)
+        result.update({
+            "model": str(model_dir), "prompt": prompt,
+            "prompt_tokens": ids.shape[1], "resident": layout.resident,
+            "slots": layout.slots, "stream_layers": len(eng._stream_layers()),
+            "ring_buffers": len(state[1]) if isinstance(state, tuple) else None,
+            "slab_layers": len(state[2]) if isinstance(state, tuple) and state[2] is not None else None,
+            "overrides": {k: v for k, v in os.environ.items() if k.startswith("TI_")},
+            "generated_text": tokenizer.decode([row["next_token"] for row in result["steps"]]),
+        })
+        return result
+    finally:
+        eng.close()
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--tokens", type=int, default=16)
-    ap.add_argument("--json", action="store_true")
-    a = ap.parse_args(argv)
-
-    out = bench(a.model, tokens=a.tokens)
-    if a.json:
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--tokens", type=int, default=16)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    if args.tokens <= 0:
+        parser.error("--tokens must be positive")
+    result = bench(args.model, tokens=args.tokens)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print("layout   %d 层常驻 / %d 层流式 / %d 槽位" % (
-            out["resident"], out["stream_layers"], out["slots"]))
-        print("decode   %.1fms 中位数（%.1f~%.1f，极差 %.0f%%）" % (
-            out["median_ms"], out["min_ms"], out["max_ms"], 100 * out["spread"]))
-        print("吞吐     %.4f tok/s" % (out["tok_per_s"] or 0))
-        print("正确性   finite=%s" % out["finite"])
-    return 0 if out.get("finite") else 1
+        print("decode %.1f ms 中位数，%.1f~%.1f ms" % (
+            result["median_ms"], result["min_ms"], result["max_ms"]))
+        print("吞吐 %.4f tok/s，finite=%s" % (result["tok_per_s"], result["finite"]))
+    return 0
 
 
 if __name__ == "__main__":
